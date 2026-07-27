@@ -42,10 +42,9 @@ impl GhciStdout {
         // These include diagnostics, which modules were compiled, and a compilation summary.
         let stderr_data = {
             let (sender, receiver) = oneshot::channel();
-            let _ = self
-                .stderr_sender
+            self.stderr_sender
                 .send(StderrEvent::GetBuffer { sender })
-                .await;
+                .await?;
             receiver.await?
         };
         log.extend(parse_ghc_messages(data).wrap_err("Failed to parse compiler output")?);
@@ -79,7 +78,11 @@ impl GhciStdout {
 
     #[instrument(skip_all, level = "debug")]
     pub async fn prompt(&mut self, find: FindAt, log: &mut CompilationLog) -> eyre::Result<()> {
-        self.stderr_sender.send(StderrEvent::ClearBuffer).await?;
+        let (sender, receiver) = oneshot::channel();
+        self.stderr_sender
+            .send(StderrEvent::ClearBuffer { sender })
+            .await?;
+        receiver.await?;
 
         let data = self
             .reader

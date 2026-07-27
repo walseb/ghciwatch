@@ -30,6 +30,7 @@ mod hooks;
 mod ignore;
 mod incremental_reader;
 mod maybe_async_command;
+mod my;
 mod normal_path;
 mod shutdown;
 mod string_case;

@@ -114,8 +114,12 @@ pub async fn run_ghci(
         }
     }
 
+    let ghci = Arc::new(Mutex::new(ghci));
+    let eval_barrier = crate::my::EvalBarrier::new();
+    crate::my::spawn(ghci.clone(), eval_barrier.clone()).await?;
     let manager = GhciManager {
-        ghci: Arc::new(Mutex::new(ghci)),
+        ghci,
+        eval_barrier,
         handle,
         watcher_receiver,
         exited_receiver,
@@ -166,6 +170,7 @@ async fn should_interrupt(reload_receiver: oneshot::Receiver<GhciReloadKind>) ->
 /// Manages the main event loop for a running ghci session.
 struct GhciManager {
     ghci: Arc<Mutex<Ghci>>,
+    eval_barrier: Arc<crate::my::EvalBarrier>,
     handle: ShutdownHandle,
     watcher_receiver: mpsc::Receiver<WatcherEvent>,
     exited_receiver: mpsc::Receiver<ExitStatus>,
@@ -266,6 +271,7 @@ impl GhciManager {
     /// non-interruptible dispatch are accumulated into `pending_event` and returned as
     /// `Interrupted` for retry.
     async fn handle_event(&mut self, mut event: WatcherEvent) -> eyre::Result<HandleResult> {
+        let _eval_reload_guard = self.eval_barrier.begin_reload();
         let (reload_sender, reload_receiver) = oneshot::channel();
         let mut task = Box::pin(tokio::task::spawn(dispatch(
             self.ghci.clone(),

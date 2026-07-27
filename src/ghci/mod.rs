@@ -39,6 +39,7 @@ mod stdout;
 use stdout::GhciStdout;
 
 mod stderr;
+pub(crate) use stderr::StderrEvent;
 use stderr::GhciStderr;
 
 mod process;
@@ -249,9 +250,9 @@ pub struct Ghci {
     /// This is used to send the process `Ctrl-C` (`SIGINT`) to cancel reloads or other actions.
     process_group_id: Pid,
     /// The stdin writer.
-    stdin: GhciStdin,
+    pub(crate) stdin: GhciStdin,
     /// The stdout reader.
-    stdout: GhciStdout,
+    pub(crate) stdout: GhciStdout,
     /// Sender for notifying the process watching job ([`GhciProcess`]) that we're shutting down
     /// the `ghci` session on purpose. If the process watcher sees `ghci` exit, usually it will
     /// trigger a shutdown of the entire program. This is bad if we're restarting `ghci` on

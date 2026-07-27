@@ -19,8 +19,8 @@ use super::writer::GhciWriter;
 /// An event sent to a `ghci` session's stderr channel.
 #[derive(Debug)]
 pub enum StderrEvent {
-    /// Clear the buffer contents.
-    ClearBuffer,
+    /// Clear the buffer contents and acknowledge when it has been cleared.
+    ClearBuffer { sender: oneshot::Sender<()> },
 
     /// Get the buffer contents since the last `ClearBuffer` event.
     GetBuffer { sender: oneshot::Sender<String> },
@@ -81,8 +81,9 @@ impl GhciStderr {
 
     async fn dispatch(&mut self, event: StderrEvent) -> eyre::Result<()> {
         match event {
-            StderrEvent::ClearBuffer => {
+            StderrEvent::ClearBuffer { sender } => {
                 self.clear_buffer().await;
+                let _ = sender.send(());
             }
             StderrEvent::GetBuffer { sender } => {
                 self.get_buffer(sender).await?;
