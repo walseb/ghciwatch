@@ -927,7 +927,7 @@ impl Ghci {
     /// as a session-died event and route through the normal restart path
     /// rather than propagating it as fatal. See [`Ghci::sync_barrier`] for details.
     #[instrument(skip_all, level = "debug")]
-    async fn send_sigint(&mut self) -> eyre::Result<()> {
+    pub(crate) async fn send_sigint(&mut self) -> eyre::Result<()> {
         let start_instant = Instant::now();
 
         // Phase 1: Send SIGINT repeatedly until we find a clean, uninterrupted prompt.

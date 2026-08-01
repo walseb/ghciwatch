@@ -1,7 +1,7 @@
 use std::fs::{File, OpenOptions};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -11,56 +11,36 @@ use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::io::BufReader;
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{oneshot, Mutex, Notify};
+use tokio::sync::{oneshot, Mutex};
 
-use crate::ghci::{Ghci, StderrEvent};
+use crate::ghci::parse::{parse_ghc_messages, CompilationResult};
+use crate::ghci::{CompilationLog, Ghci, StderrEvent};
 use crate::incremental_reader::{FindAt, ReadOpts, WriteBehavior};
 
 const MAX_COMMAND_BYTES: u64 = 1024 * 1024;
 const COMMAND_TERMINATOR: &[u8] = "⋳".as_bytes();
+const EVAL_WARNING_AFTER: Duration = Duration::from_secs(30);
+const EVAL_TIMEOUT_AFTER_WARNING: Duration = Duration::from_secs(30);
+static EVAL_NONCE: AtomicU64 = AtomicU64::new(0);
 
-/// Prevents socket commands from entering GHCi while a reload is pending or active.
+/// Serializes eval commands and reloads before either one acquires the GHCi mutex.
 ///
-/// The flag is set before the reload task starts and remains set while an interrupted
-/// reload is cleaned up. Socket commands recheck it after acquiring the GHCi mutex,
-/// closing the race between observing an idle state and entering GHCi.
+/// Tokio's mutex is FIFO, so once a reload is queued, later eval requests cannot
+/// continually jump ahead of it. Holding the permit for the complete operation also
+/// makes cancellation safe: dropping the operation releases the permit automatically.
 pub(crate) struct EvalBarrier {
-    reload_active: AtomicBool,
-    idle: Notify,
+    gate: Arc<Mutex<()>>,
 }
 
 impl EvalBarrier {
     pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self {
-            reload_active: AtomicBool::new(false),
-            idle: Notify::new(),
+            gate: Arc::new(Mutex::new(())),
         })
     }
 
-    pub(crate) fn begin_reload(self: &Arc<Self>) -> ReloadGuard {
-        let was_active = self.reload_active.swap(true, Ordering::AcqRel);
-        debug_assert!(!was_active, "reloads must be serialized by GhciManager");
-        ReloadGuard(self.clone())
-    }
-
-    async fn wait_until_idle(&self) {
-        loop {
-            // Register before checking so a transition to idle cannot be missed.
-            let notified = self.idle.notified();
-            if !self.reload_active.load(Ordering::Acquire) {
-                return;
-            }
-            notified.await;
-        }
-    }
-}
-
-pub(crate) struct ReloadGuard(Arc<EvalBarrier>);
-
-impl Drop for ReloadGuard {
-    fn drop(&mut self) {
-        self.0.reload_active.store(false, Ordering::Release);
-        self.0.idle.notify_waiters();
+    pub(crate) async fn begin_operation(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        self.gate.clone().lock_owned().await
     }
 }
 
@@ -175,21 +155,18 @@ async fn handle_connection(
     let command = std::str::from_utf8(&request).wrap_err("Eval socket command is not UTF-8")?;
     eyre::ensure!(!command.is_empty(), "Eval socket command is empty");
 
-    let output = loop {
-        barrier.wait_until_idle().await;
-        let mut ghci = ghci.lock().await;
-
-        // A reload may have become pending after wait_until_idle but before this
-        // task acquired the mutex. Yield the mutex to the reload in that case.
-        if barrier.reload_active.load(Ordering::Acquire) {
-            drop(ghci);
-            continue;
-        }
-
-        break eval_socket_command(&mut ghci, command)
-            .await
-            .wrap_err("Failed to evaluate socket command")?;
-    };
+    // Take the operation permit before the GHCi mutex. Reloads use the same
+    // ordering, so an eval arriving during a reload sleeps without touching any
+    // of GHCi's pipes and a reload arriving during an eval waits for it to finish.
+    let operation_guard = barrier.begin_operation().await;
+    let mut ghci = ghci.lock().await;
+    let output = eval_socket_command(&mut ghci, command)
+        .await
+        .wrap_err("Failed to evaluate socket command")?;
+    // The client may be slow or disappear. GHCi is free as soon as evaluation is
+    // complete; socket delivery must not delay a queued reload or another eval.
+    drop(ghci);
+    drop(operation_guard);
     socket
         .write_all(output.as_bytes())
         .await
@@ -201,6 +178,44 @@ async fn handle_connection(
 }
 
 async fn eval_socket_command(ghci: &mut Ghci, command: &str) -> eyre::Result<String> {
+    let command = command.trim_end();
+    eyre::ensure!(!command.is_empty(), "Eval socket command is empty");
+
+    // Time the complete pipe protocol, not only the main stdout read. A wedged
+    // stderr clear/barrier is just as capable of blocking reloads indefinitely.
+    let mut evaluation = Box::pin(eval_socket_command_inner(ghci, command));
+    match tokio::time::timeout(EVAL_WARNING_AFTER, &mut evaluation).await {
+        Ok(result) => result,
+        Err(_) => {
+            tracing::error!(
+                "Ghciwatch executable eval error: Command \"{command}\" has taken more than 30 seconds! Waiting 30 more then I will attempt to interrupt it."
+            );
+            match tokio::time::timeout(EVAL_TIMEOUT_AFTER_WARNING, &mut evaluation).await {
+                Ok(result) => result,
+                Err(_) => {
+                    tracing::error!(
+                        "Ghciwatch executable eval error: Command \"{command}\" has taken more than 60 seconds! Killing eval."
+                    );
+                    // Cancel every pending pipe/channel operation first. In particular,
+                    // this closes the stderr marker response channel so that its task
+                    // stops waiting for a marker which may never be emitted.
+                    drop(evaluation);
+                    ghci.send_sigint()
+                        .await
+                        .wrap_err("Failed to restore GHCi after timed-out executable eval")?;
+                    tracing::info!(
+                        "Ghciwatch executable eval: Successfully interrupted command \"{command}\" and restored the underlying ghciwatch GHCi session."
+                    );
+                    Err(eyre::eyre!(
+                        "Executable eval command timed out after 60 seconds: {command}"
+                    ))
+                }
+            }
+        }
+    }
+}
+
+async fn eval_socket_command_inner(ghci: &mut Ghci, command: &str) -> eyre::Result<String> {
     // Synchronize the clear before writing: otherwise a fast syntax error could
     // be buffered and then erased by a delayed clear event.
     let (sender, receiver) = oneshot::channel();
@@ -210,15 +225,16 @@ async fn eval_socket_command(ghci: &mut Ghci, command: &str) -> eyre::Result<Str
         .await?;
     receiver.await?;
 
-    let command = command.trim_end();
-    ghci.stdin
-        .stdin
-        .write_all(format!("{command}\n").as_bytes())
-        .await?;
-
-    // GHCi emits a prompt for every input line, including continuation prompts.
+    // Submit and synchronize one line at a time. Writing the complete command and
+    // merely counting prompts is not safe: a parse/type error can terminate a
+    // continuation early, leaving prompts buffered and desynchronizing every later
+    // operation on this GHCi session.
     let mut output = String::new();
-    for _ in 0..command.lines().count() {
+    for line in command.lines() {
+        ghci.stdin
+            .stdin
+            .write_all(format!("{line}\n").as_bytes())
+            .await?;
         output.push_str(
             &ghci
                 .stdout
@@ -231,13 +247,69 @@ async fn eval_socket_command(ghci: &mut Ghci, command: &str) -> eyre::Result<Str
                 })
                 .await?,
         );
+
+        // A failed `:module` means later imports and expressions can only add
+        // misleading "not in scope" errors. Synchronize stderr now and stop the
+        // request at the primary load failure instead.
+        if matches!(line.split_whitespace().next(), Some(":m" | ":module")) {
+            let stderr = stderr_through_marker(ghci).await?;
+            let mut log = CompilationLog::default();
+            log.extend(parse_ghc_messages(&stderr)?);
+            log.fill_empty_summary();
+            let module_failed = log.result() == Some(CompilationResult::Err);
+            output.push_str(&stderr);
+            if module_failed {
+                return Ok(output);
+            }
+
+            // The synchronized output has already been copied into the response.
+            // Start a fresh stderr segment for the remaining request lines.
+            let (sender, receiver) = oneshot::channel();
+            ghci.stdout
+                .stderr_sender
+                .send(StderrEvent::ClearBuffer { sender })
+                .await?;
+            receiver.await?;
+        }
     }
 
+    output.push_str(&stderr_through_marker(ghci).await?);
+    Ok(output)
+}
+
+/// Drain stderr through a marker emitted after all preceding GHCi work.
+async fn stderr_through_marker(ghci: &mut Ghci) -> eyre::Result<String> {
+    // stdout and stderr are independent pipes. Seeing the prompt on stdout does
+    // not prove that the stderr task has consumed the diagnostic yet.
+    let nonce = EVAL_NONCE.fetch_add(1, Ordering::Relaxed);
+    let marker = format!("__GHCIWATCH_EVAL_END_{}_{}__", std::process::id(), nonce);
+    let (ready_sender, ready_receiver) = oneshot::channel();
     let (sender, receiver) = oneshot::channel();
     ghci.stdout
         .stderr_sender
-        .send(StderrEvent::GetBuffer { sender })
+        .send(StderrEvent::GetBufferThrough {
+            marker: marker.clone(),
+            ready: ready_sender,
+            sender,
+        })
         .await?;
-    output.push_str(&receiver.await?);
-    Ok(output)
+    // Do not emit the marker until the stderr task is definitely waiting for it.
+    ready_receiver.await?;
+
+    ghci.stdin
+        .stdin
+        .write_all(format!(":! printf '%s\\n' '{marker}' >&2\n").as_bytes())
+        .await?;
+    // Consume the marker command's stdout prompt as well as its stderr marker.
+    let _ = ghci
+        .stdout
+        .reader
+        .read_until(&mut ReadOpts {
+            end_marker: &ghci.stdout.prompt_patterns,
+            find: FindAt::LineStart,
+            writing: WriteBehavior::NoFinalLine,
+            buffer: &mut ghci.stdout.buffer,
+        })
+        .await?;
+    Ok(receiver.await?)
 }

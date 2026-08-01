@@ -271,7 +271,9 @@ impl GhciManager {
     /// non-interruptible dispatch are accumulated into `pending_event` and returned as
     /// `Interrupted` for retry.
     async fn handle_event(&mut self, mut event: WatcherEvent) -> eyre::Result<HandleResult> {
-        let _eval_reload_guard = self.eval_barrier.begin_reload();
+        // Queue behind any active eval and prevent later evals from entering GHCi
+        // until this complete dispatch (including interruption cleanup) is done.
+        let _eval_reload_guard = self.eval_barrier.begin_operation().await;
         let (reload_sender, reload_receiver) = oneshot::channel();
         let mut task = Box::pin(tokio::task::spawn(dispatch(
             self.ghci.clone(),

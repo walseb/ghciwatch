@@ -24,6 +24,16 @@ pub enum StderrEvent {
 
     /// Get the buffer contents since the last `ClearBuffer` event.
     GetBuffer { sender: oneshot::Sender<String> },
+
+    /// Read through an exact marker line and return the preceding buffered output.
+    ///
+    /// Unlike `GetBuffer`, this provides a cross-pipe ordering guarantee: once the
+    /// marker written by GHCi has been consumed, all earlier stderr is in the buffer.
+    GetBufferThrough {
+        marker: String,
+        ready: oneshot::Sender<()>,
+        sender: oneshot::Sender<String>,
+    },
 }
 
 pub struct GhciStderr {
@@ -88,6 +98,14 @@ impl GhciStderr {
             StderrEvent::GetBuffer { sender } => {
                 self.get_buffer(sender).await?;
             }
+            StderrEvent::GetBufferThrough {
+                marker,
+                ready,
+                sender,
+            } => {
+                let _ = ready.send(());
+                self.get_buffer_through(&marker, sender).await?;
+            }
         }
 
         Ok(())
@@ -107,6 +125,30 @@ impl GhciStderr {
         self.buffer.clear();
     }
 
+    #[instrument(skip(self, sender), level = "debug")]
+    async fn get_buffer_through(
+        &mut self,
+        marker: &str,
+        mut sender: oneshot::Sender<String>,
+    ) -> eyre::Result<()> {
+        loop {
+            // The eval future can be cancelled on timeout. Do not strand the
+            // stderr task waiting for a marker that was never written; doing so
+            // would also block every later compilation-log request.
+            let line = tokio::select! {
+                _ = sender.closed() => return Ok(()),
+                line = self.reader.next_line() => line,
+            }
+            .wrap_err("Failed to read stderr while waiting for eval marker")?
+            .ok_or_else(|| eyre::eyre!("GHCi stderr closed while waiting for eval marker"))?;
+            if line == marker {
+                break;
+            }
+            self.ingest_line(line).await?;
+        }
+        let _ = sender.send(self.buffer.clone());
+        Ok(())
+    }
     #[instrument(skip(self, sender), level = "debug")]
     async fn get_buffer(&mut self, sender: oneshot::Sender<String>) -> eyre::Result<()> {
         // Read lines from the stderr stream until we can't read a line within 0.05 seconds.
