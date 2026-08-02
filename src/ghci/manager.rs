@@ -2,6 +2,7 @@
 
 use std::collections::BTreeSet;
 use std::process::ExitStatus;
+use camino::Utf8PathBuf;
 use std::sync::Arc;
 
 use eyre::Context;
@@ -12,7 +13,6 @@ use tracing::instrument;
 
 use crate::event_filter::FileEvent;
 use crate::ghci::CompilationLog;
-use crate::haskell_source_file::is_haskell_source_file;
 use crate::hooks;
 use crate::hooks::LifecycleEvent;
 use crate::shutdown::ShutdownHandle;
@@ -30,6 +30,8 @@ pub enum WatcherEvent {
     Reload {
         /// The file events to respond to.
         events: BTreeSet<FileEvent>,
+        /// A stable snapshot of Haskell files under all watch roots.
+        haskell_files: BTreeSet<Utf8PathBuf>,
     },
 }
 
@@ -39,12 +41,18 @@ impl WatcherEvent {
     fn merge(&mut self, other: WatcherEvent) {
         match (self, other) {
             (
-                WatcherEvent::Reload { events },
+                WatcherEvent::Reload {
+                    events,
+                    haskell_files,
+                },
                 WatcherEvent::Reload {
                     events: other_events,
+                    haskell_files: other_haskell_files,
                 },
             ) => {
                 events.extend(other_events);
+                // The later filesystem snapshot supersedes the earlier one.
+                *haskell_files = other_haskell_files;
             }
         }
     }
@@ -78,7 +86,11 @@ pub async fn run_ghci(
             ghci.stop().await.wrap_err("Failed to quit ghci")?;
             return Ok(());
         }
-        startup_result = ghci.initialize(&mut log, [LifecycleEvent::Startup(hooks::When::After)]) => startup_result,
+        startup_result = ghci.initialize(
+            &mut log,
+            [LifecycleEvent::Startup(hooks::When::After)],
+            None,
+        ) => startup_result,
     };
     let startup_exit: Option<ExitStatus> = match startup_result {
         // Even on success, ghci may have exited right after starting up; check for a
@@ -136,8 +148,14 @@ async fn dispatch(
     reload_sender: oneshot::Sender<GhciReloadKind>,
 ) -> eyre::Result<()> {
     match event {
-        WatcherEvent::Reload { events } => {
-            ghci.lock().await.reload(events, reload_sender).await?;
+        WatcherEvent::Reload {
+            events,
+            haskell_files,
+        } => {
+            ghci.lock()
+                .await
+                .reload(events, haskell_files, reload_sender)
+                .await?;
         }
     }
     Ok(())
@@ -294,7 +312,6 @@ impl GhciManager {
                 ref mut handle,
                 ref mut watcher_receiver,
                 ref mut exited_receiver,
-                ref classifier,
                 interrupt_reloads,
                 ..
             } = *self;
@@ -324,13 +341,9 @@ impl GhciManager {
                         "Received ghci event from watcher while reloading"
                     );
 
-                    // Skip irrelevant events (e.g. files that don't match any
-                    // reload/restart globs) so we don't needlessly interrupt a
-                    // reload or queue a retry dispatch.
-                    if !is_relevant(&new_event, classifier)? {
-                        tracing::debug!("File change not relevant to ghci; ignoring");
-                        continue;
-                    }
+                    // Every event keeps the synchronization cycle dirty. Even an event
+                    // path that is irrelevant by itself may carry a changed filesystem
+                    // snapshot (for example, a newly-created directory).
 
                     // Check if we should interrupt the in-progress reload. We can only
                     // check once (the oneshot is consumed), and only for interruptible
@@ -431,10 +444,9 @@ impl GhciManager {
         }
 
         // If events arrived while the dispatch was running (but we chose not to
-        // interrupt), drain any remaining events and return for retry. Each batch
-        // was already filtered by `is_relevant` before being folded into
-        // `pending_event`, and `merge` only adds events, so the accumulated set is
-        // guaranteed relevant.
+        // interrupt), drain any remaining events and return for retry. This dirty
+        // cycle is required even when event paths themselves look irrelevant, since
+        // the newest event carries the authoritative filesystem snapshot.
         if let Some(mut pending_event) = pending_event {
             drain_pending(&mut pending_event, &mut self.watcher_receiver);
             return Ok(HandleResult::Interrupted(pending_event));
@@ -465,29 +477,6 @@ fn drain_pending(event: &mut WatcherEvent, watcher_receiver: &mut mpsc::Receiver
     }
 }
 
-/// Check whether an event would trigger a reload or restart.
-///
-/// Uses a default (empty) module set for classification, which correctly
-/// identifies restart, reload, and add actions. The one gap: remove-module
-/// actions require knowing the loaded targets, so we conservatively treat any
-/// `Remove` of a Haskell source file as relevant. This may produce a false
-/// positive (e.g. for files in the reload-ignore list), but a needless dispatch
-/// is harmless — the real classify inside `reload()` will filter it out.
-fn is_relevant(event: &WatcherEvent, classifier: &FileClassifier) -> eyre::Result<bool> {
-    let WatcherEvent::Reload { ref events } = *event;
-    let kind = classifier
-        .classify(events.clone(), &ModuleSet::default())?
-        .kind();
-    if !matches!(kind, GhciReloadKind::None) {
-        return Ok(true);
-    }
-    // classify with an empty module set misses remove-module actions because
-    // targets.contains_source_path is always false. Conservatively treat any
-    // removed Haskell source file as relevant.
-    Ok(events
-        .iter()
-        .any(|e| matches!(e, FileEvent::Remove(_)) && is_haskell_source_file(e.as_path())))
-}
 
 /// Drain all pending events from the receiver, merge them, classify, and return the kind.
 /// Returns `None` when the combined events are irrelevant ([`GhciReloadKind::None`]).
@@ -498,7 +487,7 @@ fn drain_and_classify(
 ) -> eyre::Result<Option<GhciReloadKind>> {
     let mut event = initial;
     drain_pending(&mut event, watcher_receiver);
-    let WatcherEvent::Reload { events } = event;
+    let WatcherEvent::Reload { events, .. } = event;
     let kind = classifier.classify(events, &ModuleSet::default())?.kind();
     if matches!(kind, GhciReloadKind::None) {
         Ok(None)

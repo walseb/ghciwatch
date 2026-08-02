@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+use std::io::ErrorKind;
 use std::time::Duration;
 
 use eyre::eyre;
@@ -19,6 +21,7 @@ use crate::event_filter::file_events_from_action;
 use crate::ghci::manager::WatcherEvent;
 use crate::normal_path::NormalPath;
 use crate::shutdown::ShutdownHandle;
+use crate::haskell_source_file::is_haskell_source_file;
 
 /// Options for [`run_watcher`]. This is like a lower-effort builder interface, mostly
 /// provided because Rust tragically lacks named arguments.
@@ -74,6 +77,7 @@ async fn run_debouncer<T: notify::Watcher>(
         handle: Handle::current(),
         ghci_sender,
         shutdown: handle.clone(),
+        watch: opts.watch.clone(),
     };
 
     let cache = FileIdMap::new();
@@ -127,6 +131,7 @@ struct EventHandler {
     handle: Handle,
     ghci_sender: mpsc::Sender<WatcherEvent>,
     shutdown: ShutdownHandle,
+    watch: Vec<NormalPath>,
 }
 
 impl EventHandler {
@@ -165,12 +170,16 @@ impl EventHandler {
         // files inside of it. When we get new directories, we should paw through them with
         // `walkdir` or something to check for files.
         let events = file_events_from_action(events)?;
+        let haskell_files = scan_haskell_files(&self.watch)?;
         if events.is_empty() {
             tracing::debug!("No relevant file events");
         } else {
-            tracing::debug!(?events, "Processed events");
+            tracing::debug!(?events, files = haskell_files.len(), "Processed events");
             self.ghci_sender
-                .send(WatcherEvent::Reload { events })
+                .send(WatcherEvent::Reload {
+                    events,
+                    haskell_files,
+                })
                 .await?;
         }
 
@@ -182,6 +191,35 @@ impl DebounceEventHandler for EventHandler {
     fn handle_event(&mut self, event: DebounceEventResult) {
         self.handle.block_on(self.handle_event_async(event))
     }
+}
+
+/// Take a fresh snapshot instead of relying on notification ordering. Files can
+/// appear without an individual event (notably when a whole directory is created).
+fn scan_haskell_files(roots: &[NormalPath]) -> eyre::Result<BTreeSet<camino::Utf8PathBuf>> {
+    fn visit(path: &std::path::Path, files: &mut BTreeSet<camino::Utf8PathBuf>) -> eyre::Result<()> {
+        let metadata = match std::fs::metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        if metadata.is_dir() {
+            for entry in std::fs::read_dir(path)? {
+                visit(&entry?.path(), files)?;
+            }
+        } else {
+            let path = camino::Utf8PathBuf::try_from(path.to_path_buf())?;
+            if is_haskell_source_file(&path) {
+                files.insert(path);
+            }
+        }
+        Ok(())
+    }
+
+    let mut files = BTreeSet::new();
+    for root in roots {
+        visit(root.as_std_path(), &mut files)?;
+    }
+    Ok(files)
 }
 
 fn notify_error_is_fatal(err: &notify::Error) -> bool {

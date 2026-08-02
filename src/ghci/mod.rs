@@ -274,6 +274,8 @@ pub struct Ghci {
     ///
     /// [ghc-13254]: https://gitlab.haskell.org/ghc/ghc/-/issues/13254
     targets: ModuleSet,
+    /// Last filesystem snapshot successfully applied to GHCi's target set.
+    known_haskell_files: BTreeSet<NormalPath>,
     /// Eval commands, if `opts.enable_eval` is set.
     eval_commands: BTreeMap<NormalPath, Vec<EvalCommand>>,
     /// Search paths / current working directory for this `ghci` session.
@@ -409,6 +411,7 @@ impl Ghci {
             error_log,
             classifier,
             targets: Default::default(),
+            known_haskell_files: Default::default(),
             eval_commands: Default::default(),
             search_paths: ShowPaths {
                 cwd: crate::current_dir_utf8()?,
@@ -427,6 +430,7 @@ impl Ghci {
         &mut self,
         log: &mut CompilationLog,
         events: [LifecycleEvent; N],
+        haskell_files: Option<BTreeSet<NormalPath>>,
     ) -> eyre::Result<()> {
         let start_instant = Instant::now();
 
@@ -434,7 +438,14 @@ impl Ghci {
 
         // Don't propagate the error here immediately so we can be sure we always write the
         // compilation log.
-        let result = self.initialize_inner(log).await;
+        let result = async {
+            self.initialize_inner(log).await?;
+            if let Some(haskell_files) = haskell_files {
+                self.synchronize_haskell_files(haskell_files, log).await?;
+            }
+            Ok(())
+        }
+        .await;
         if let Err(err) = result.as_ref() {
             // If writing the compilation log or running hooks fails, we should log this error so
             // it's not lost forever.
@@ -466,8 +477,26 @@ impl Ghci {
         Ok(())
     }
 
-    fn get_reload_actions(&self, events: BTreeSet<FileEvent>) -> eyre::Result<ReloadActions> {
-        self.classifier.classify(events, &self.targets)
+    fn get_reload_actions(
+        &self,
+        events: BTreeSet<FileEvent>,
+        haskell_files: &BTreeSet<NormalPath>,
+    ) -> eyre::Result<ReloadActions> {
+        let mut actions = self.classifier.classify(events, &self.targets)?;
+
+        // Notification streams are hints, not transactions. Diff a complete
+        // filesystem snapshot so event reordering or omission cannot hide targets.
+        for path in haskell_files.difference(&self.known_haskell_files) {
+            if !self.targets.contains_source_path(path) && !actions.needs_add.contains(path) {
+                actions.needs_add.push(path.clone());
+            }
+        }
+        for path in self.known_haskell_files.difference(haskell_files) {
+            if self.targets.contains_source_path(path) && !actions.needs_remove.contains(path) {
+                actions.needs_remove.push(path.clone());
+            }
+        }
+        Ok(actions)
     }
 
     /// Reload this `ghci` session to include the given modified and removed paths.
@@ -480,10 +509,15 @@ impl Ghci {
     pub async fn reload(
         &mut self,
         events: BTreeSet<FileEvent>,
+        haskell_files: BTreeSet<Utf8PathBuf>,
         kind_sender: oneshot::Sender<GhciReloadKind>,
     ) -> eyre::Result<()> {
         let start_instant = Instant::now();
-        let actions = self.get_reload_actions(events)?;
+        let haskell_files = haskell_files
+            .into_iter()
+            .map(|path| self.classifier.relative_path(path))
+            .collect::<eyre::Result<BTreeSet<_>>>()?;
+        let actions = self.get_reload_actions(events, &haskell_files)?;
         let _ = kind_sender.send(actions.kind());
 
         if actions.needs_restart() {
@@ -493,9 +527,9 @@ impl Ghci {
                 "Restarting ghci:\n{}",
                 format_bulleted_list(&actions.needs_restart)
             );
-            self.restart().await?;
-            // Once we restart, everything is freshly loaded. We don't need to add or
-            // reload any other modules.
+            // Carry the snapshot through the restart. A fresh GHCi initially knows
+            // only the command's targets; synchronize before after-hooks run.
+            self.restart(haskell_files).await?;
             return Ok(());
         }
 
@@ -523,6 +557,10 @@ impl Ghci {
             );
             self.add_modules(&actions.needs_add, &mut log).await?;
         }
+
+        // Commit only after all target-set commands have completed. If this
+        // future is interrupted earlier, the previous snapshot remains dirty.
+        self.known_haskell_files = haskell_files;
 
         if !actions.needs_reload.is_empty() {
             tracing::info!(
@@ -558,15 +596,19 @@ impl Ghci {
     async fn startup_restart(&mut self) -> eyre::Result<()> {
         let mut log = CompilationLog::default();
 
-        self.restart_inner(&mut log, [LifecycleEvent::Startup(hooks::When::After)])
-            .await?;
+        self.restart_inner(
+            &mut log,
+            [LifecycleEvent::Startup(hooks::When::After)],
+            None,
+        )
+        .await?;
 
         Ok(())
     }
 
-    /// Restart the `ghci` session.
+    /// Restart the `ghci` session and synchronize its target set.
     #[instrument(skip_all, level = "debug")]
-    async fn restart(&mut self) -> eyre::Result<()> {
+    async fn restart(&mut self, haskell_files: BTreeSet<NormalPath>) -> eyre::Result<()> {
         let mut log = CompilationLog::default();
 
         self.run_hooks(LifecycleEvent::Restart(hooks::When::Before), &mut log)
@@ -577,6 +619,7 @@ impl Ghci {
                 LifecycleEvent::Startup(hooks::When::After),
                 LifecycleEvent::Restart(hooks::When::After),
             ],
+            Some(haskell_files),
         )
         .await?;
 
@@ -588,6 +631,7 @@ impl Ghci {
         &mut self,
         log: &mut CompilationLog,
         events: [LifecycleEvent; N],
+        haskell_files: Option<BTreeSet<NormalPath>>,
     ) -> eyre::Result<()> {
         self.stop().await?;
         let new = Self::new(
@@ -597,8 +641,36 @@ impl Ghci {
         )
         .await?;
         let _ = std::mem::replace(self, new);
-        self.initialize(log, events).await?;
+        self.initialize(log, events, haskell_files).await?;
 
+        Ok(())
+    }
+
+    /// Synchronize a complete filesystem snapshot with GHCi's target set.
+    async fn synchronize_haskell_files(
+        &mut self,
+        haskell_files: BTreeSet<NormalPath>,
+        log: &mut CompilationLog,
+    ) -> eyre::Result<()> {
+        let needs_remove = self
+            .known_haskell_files
+            .difference(&haskell_files)
+            .filter(|path| self.targets.contains_source_path(*path))
+            .cloned()
+            .collect::<Vec<_>>();
+        let needs_add = haskell_files
+            .difference(&self.known_haskell_files)
+            .filter(|path| !self.targets.contains_source_path(*path))
+            .cloned()
+            .collect::<Vec<_>>();
+
+        if !needs_remove.is_empty() {
+            self.remove_modules(&needs_remove, log).await?;
+        }
+        if !needs_add.is_empty() {
+            self.add_modules(&needs_add, log).await?;
+        }
+        self.known_haskell_files = haskell_files;
         Ok(())
     }
 
@@ -1101,6 +1173,12 @@ impl Ghci {
         self.write_error_log(log).await?;
 
         for event in events {
+            // Failed reloads must not run commands against modules GHCi just unloaded.
+            if matches!(log.result(), Some(CompilationResult::Err))
+                && matches!(event, LifecycleEvent::Reload(hooks::When::After))
+            {
+                continue;
+            }
             self.run_hooks(event, log).await?;
         }
 
