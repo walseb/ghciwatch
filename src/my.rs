@@ -167,14 +167,33 @@ async fn handle_connection(
     // complete; socket delivery must not delay a queued reload or another eval.
     drop(ghci);
     drop(operation_guard);
-    socket
-        .write_all(output.as_bytes())
-        .await
-        .wrap_err("Failed to write eval socket response")?;
-    socket
-        .shutdown()
-        .await
-        .wrap_err("Failed to finish eval socket response")
+    if let Err(error) = socket.write_all(output.as_bytes()).await {
+        if is_disconnected_client(&error) {
+            tracing::debug!(%error, "Eval client disconnected before reading the response");
+            return Ok(());
+        }
+        return Err(error).wrap_err("Failed to write eval socket response");
+    }
+    if let Err(error) = socket.shutdown().await {
+        if is_disconnected_client(&error) {
+            tracing::debug!(%error, "Eval client disconnected before response shutdown");
+            return Ok(());
+        }
+        return Err(error).wrap_err("Failed to finish eval socket response");
+    }
+    Ok(())
+}
+
+/// A socket client is free to stop waiting while its eval is queued or running.
+/// Failure to deliver that client's response does not affect GHCi or the listener.
+fn is_disconnected_client(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::NotConnected
+    )
 }
 
 async fn eval_socket_command(ghci: &mut Ghci, command: &str) -> eyre::Result<String> {
