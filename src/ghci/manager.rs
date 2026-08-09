@@ -1,10 +1,11 @@
 //! Subsystem for [`Ghci`] to support graceful shutdown.
 
 use std::collections::BTreeSet;
+use std::os::unix::process::ExitStatusExt;
 use std::process::ExitStatus;
-use camino::Utf8PathBuf;
 use std::sync::Arc;
 
+use camino::Utf8PathBuf;
 use eyre::Context;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
@@ -18,6 +19,7 @@ use crate::hooks::LifecycleEvent;
 use crate::shutdown::ShutdownHandle;
 
 use super::FileClassifier;
+use super::print_ghciwatch_error;
 use super::Ghci;
 use super::GhciOpts;
 use super::GhciReloadKind;
@@ -117,6 +119,7 @@ pub async fn run_ghci(
             &mut exited_receiver,
             &classifier,
             status,
+            "during initial GHCi startup",
             &mut RestartStrategy::Startup(&mut ghci),
         )
         .await?
@@ -275,7 +278,10 @@ impl GhciManager {
             }
         };
         // self is no longer partially borrowed, so we can call methods.
-        match self.wait_and_restart_runtime(ghci_exited).await? {
+        match self
+            .wait_and_restart_runtime(ghci_exited, "while waiting for filesystem events")
+            .await?
+        {
             RetryResult::Restarted => Ok(WaitResult::Restarted),
             RetryResult::Shutdown => Ok(WaitResult::Shutdown),
         }
@@ -437,7 +443,10 @@ impl GhciManager {
 
         // If ghci died during the dispatch, wait for a file change and restart.
         if let Some(status) = ghci_exited {
-            match self.wait_and_restart_runtime(status).await? {
+            match self
+                .wait_and_restart_runtime(status, "while dispatching a reload/restart event")
+                .await?
+            {
                 RetryResult::Restarted => {}
                 RetryResult::Shutdown => return Ok(HandleResult::Shutdown),
             }
@@ -457,13 +466,18 @@ impl GhciManager {
 
     /// Wait for a relevant file change, then attempt to restart ghci.
     #[instrument(level = "debug", skip_all)]
-    async fn wait_and_restart_runtime(&mut self, status: ExitStatus) -> eyre::Result<RetryResult> {
+    async fn wait_and_restart_runtime(
+        &mut self,
+        status: ExitStatus,
+        detected_phase: &'static str,
+    ) -> eyre::Result<RetryResult> {
         wait_and_restart(
             &mut self.handle,
             &mut self.watcher_receiver,
             &mut self.exited_receiver,
             &self.classifier,
             status,
+            detected_phase,
             &mut RestartStrategy::Runtime(self.ghci.clone()),
         )
         .await
@@ -534,6 +548,13 @@ impl RestartStrategy<'_> {
                 .wrap_err("Failed to restart ghci after unexpected exit"),
         }
     }
+
+    async fn diagnostic_context(&mut self) -> String {
+        match self {
+            Self::Startup(ghci) => ghci.diagnostic_context(),
+            Self::Runtime(ghci) => ghci.lock().await.diagnostic_context(),
+        }
+    }
 }
 
 /// Outcome of racing a restart attempt against the exit channel in [`wait_and_restart`].
@@ -558,9 +579,18 @@ async fn wait_and_restart(
     exited_receiver: &mut mpsc::Receiver<ExitStatus>,
     classifier: &FileClassifier,
     mut status: ExitStatus,
+    detected_phase: &'static str,
     strategy: &mut RestartStrategy<'_>,
 ) -> eyre::Result<RetryResult> {
     let context = strategy.context();
+    let details = format!(
+        "Detected phase: {detected_phase}\nExit status: {status}\nExit code: {:?}\nSignal: {:?}\nCore dumped: {}\n{}\nRecovery: waiting for a relevant file change, then starting a fresh GHCi session",
+        status.code(),
+        status.signal(),
+        status.core_dumped(),
+        strategy.diagnostic_context().await,
+    );
+    print_ghciwatch_error("GHCi exited unexpectedly", &details);
     tracing::warn!(
         %status,
         "ghci exited {context}; waiting for a file change to restart",
@@ -631,6 +661,14 @@ async fn wait_and_restart(
             }
         };
         status = new_status;
+        let details = format!(
+            "Detected phase: while starting a replacement GHCi session\nExit status: {status}\nExit code: {:?}\nSignal: {:?}\nCore dumped: {}\n{}\nRecovery: waiting for a relevant file change, then retrying with a fresh GHCi session",
+            status.code(),
+            status.signal(),
+            status.core_dumped(),
+            strategy.diagnostic_context().await,
+        );
+        print_ghciwatch_error("GHCi exited again while restarting", &details);
         tracing::warn!(
             %status,
             "ghci exited {context}; waiting for a file change to restart",

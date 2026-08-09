@@ -96,6 +96,20 @@ use crate::shutdown::ShutdownHandle;
 use crate::CommandExt;
 use crate::StringCase;
 
+/// Upper bound for GHCi commands which can compile the complete target graph.
+const COMPILATION_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+
+/// Print a conspicuous diagnostic which remains visible even when tracing is filtered out.
+pub(crate) fn print_ghciwatch_error(summary: &str, details: &str) {
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs().to_string())
+        .unwrap_or_else(|error| format!("unavailable ({error})"));
+    println!(
+        "\n==GHCIWATCH ERROR==\nTimestamp (Unix): {timestamp}\nSummary: {summary}\n{details}\n==END GHCIWATCH ERROR==\n"
+    );
+}
+
 /// The `ghci` prompt we use. Should be unique enough, but maybe we can make it better with Unicode
 /// private-use-area codepoints or something in the future.
 pub const PROMPT: &str = "###~GHCIWATCH-PROMPT~###";
@@ -291,6 +305,16 @@ impl Debug for Ghci {
         f.debug_struct("Ghci")
             .field("pid", &self.process_group_id)
             .finish()
+    }
+}
+
+impl Ghci {
+    /// Runtime details useful when diagnosing an unexpected GHCi exit.
+    pub(crate) fn diagnostic_context(&self) -> String {
+        format!(
+            "Component: GHCi process\nProcess group ID: {}\nWorking directory: {}\nCommand: {}",
+            self.process_group_id, self.search_paths.cwd, self.opts.command
+        )
     }
 }
 
@@ -569,17 +593,26 @@ impl Ghci {
             );
             // Like `:unadd`, an ordinary reload can wedge inside GHC. It is not an
             // executable eval, so the eval socket's timeout cannot interrupt it.
-            const RELOAD_TIMEOUT: Duration = Duration::from_secs(60);
             let reload = self.stdin.reload(&mut self.stdout, &mut log);
-            match tokio::time::timeout(RELOAD_TIMEOUT, reload).await {
+            match tokio::time::timeout(COMPILATION_TIMEOUT, reload).await {
                 Ok(result) => {
                     result?;
                     self.refresh_eval_commands_for_paths(&actions.needs_reload)
                         .await?;
                 }
                 Err(_) => {
+                    print_ghciwatch_error(
+                        "GHCi reload exceeded its compilation timeout",
+                        &format!(
+                            "Component: reload (:reload)\nTimeout: {COMPILATION_TIMEOUT:?}\nProcess group ID: {}\nWorking directory: {}\nCommand: {}\nChanged paths:\n{}\nRecovery: interrupting GHCi with process-group SIGINT and restoring prompt synchronization",
+                            self.process_group_id,
+                            self.search_paths.cwd,
+                            self.opts.command,
+                            format_bulleted_list(&actions.needs_reload),
+                        ),
+                    );
                     tracing::warn!(
-                        "Timed out waiting for GHCi to reload after {RELOAD_TIMEOUT:?}; interrupting reload"
+                        "Timed out waiting for GHCi to reload after {COMPILATION_TIMEOUT:?}; interrupting reload"
                     );
                     self.send_sigint()
                         .await
@@ -887,9 +920,35 @@ impl Ghci {
             }
         }
 
-        self.stdin
-            .add_modules(&mut self.stdout, &modules, log)
-            .await?;
+        // Like `:reload` and `:unadd`, `:add` compiles the target set and can wedge
+        // inside GHC. The reload operation owns the eval barrier, so the executable-eval
+        // timeout cannot help. Bound this command directly and restore prompt synchronization
+        // with the normal SIGINT recovery machinery.
+        let add = self.stdin.add_modules(&mut self.stdout, &modules, log);
+        match tokio::time::timeout(COMPILATION_TIMEOUT, add).await {
+            Ok(result) => result?,
+            Err(_) => {
+                print_ghciwatch_error(
+                    "GHCi module addition exceeded its compilation timeout",
+                    &format!(
+                        "Component: target synchronization (:add)\nTimeout: {COMPILATION_TIMEOUT:?}\nProcess group ID: {}\nWorking directory: {}\nCommand: {}\nAdded paths:\n{}\nRecovery: interrupting GHCi with process-group SIGINT and restoring prompt synchronization",
+                        self.process_group_id,
+                        self.search_paths.cwd,
+                        self.opts.command,
+                        format_bulleted_list(paths),
+                    ),
+                );
+                tracing::warn!(
+                    "Timed out waiting for GHCi to finish :add after {COMPILATION_TIMEOUT:?}; interrupting module compilation"
+                );
+                self.send_sigint()
+                    .await
+                    .wrap_err("Failed to restore GHCi after timed-out :add")?;
+                // SIGINT recovery consumes the interrupted command's output itself, so
+                // CompilationLog cannot observe a normal `Failed` summary.
+                log.mark_failed();
+            }
+        }
 
         // TODO: This could lead to the module set getting out of sync with the underlying GHCi
         // session.
@@ -994,15 +1053,24 @@ impl Ghci {
         // restore the prompt with the same interrupt machinery used for superseded reloads. GHCi
         // updates its target set before starting the implicit reload, so after recovery the unadd
         // has taken effect and it is safe to update our target bookkeeping below.
-        const UNADD_TIMEOUT: Duration = Duration::from_secs(60);
         let unadd = self
             .stdin
             .remove_modules(&mut self.stdout, modules.iter().map(Borrow::borrow), log);
-        match tokio::time::timeout(UNADD_TIMEOUT, unadd).await {
+        match tokio::time::timeout(COMPILATION_TIMEOUT, unadd).await {
             Ok(result) => result?,
             Err(_) => {
+                print_ghciwatch_error(
+                    "GHCi module removal exceeded its compilation timeout",
+                    &format!(
+                        "Component: target synchronization (:unadd, including its implicit reload)\nTimeout: {COMPILATION_TIMEOUT:?}\nProcess group ID: {}\nWorking directory: {}\nCommand: {}\nRemoved paths:\n{}\nRecovery: interrupting GHCi with process-group SIGINT and restoring prompt synchronization",
+                        self.process_group_id,
+                        self.search_paths.cwd,
+                        self.opts.command,
+                        format_bulleted_list(paths),
+                    ),
+                );
                 tracing::warn!(
-                    "Timed out waiting for GHCi to finish :unadd after {UNADD_TIMEOUT:?}; interrupting its implicit reload"
+                    "Timed out waiting for GHCi to finish :unadd after {COMPILATION_TIMEOUT:?}; interrupting its implicit reload"
                 );
                 self.send_sigint()
                     .await
