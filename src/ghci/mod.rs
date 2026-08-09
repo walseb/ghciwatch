@@ -567,9 +567,28 @@ impl Ghci {
                 "Reloading ghci:\n{}",
                 format_bulleted_list(&actions.needs_reload)
             );
-            self.stdin.reload(&mut self.stdout, &mut log).await?;
-            self.refresh_eval_commands_for_paths(&actions.needs_reload)
-                .await?;
+            // Like `:unadd`, an ordinary reload can wedge inside GHC. It is not an
+            // executable eval, so the eval socket's timeout cannot interrupt it.
+            const RELOAD_TIMEOUT: Duration = Duration::from_secs(60);
+            let reload = self.stdin.reload(&mut self.stdout, &mut log);
+            match tokio::time::timeout(RELOAD_TIMEOUT, reload).await {
+                Ok(result) => {
+                    result?;
+                    self.refresh_eval_commands_for_paths(&actions.needs_reload)
+                        .await?;
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        "Timed out waiting for GHCi to reload after {RELOAD_TIMEOUT:?}; interrupting reload"
+                    );
+                    self.send_sigint()
+                        .await
+                        .wrap_err("Failed to restore GHCi after timed-out reload")?;
+                    // SIGINT recovery consumes output directly, so no normal `Failed`
+                    // summary reaches the compilation log.
+                    log.mark_failed();
+                }
+            }
         }
 
         if actions.needs_modify() {
@@ -969,10 +988,27 @@ impl Ghci {
         // Each `:unadd` implicitly reloads as well, so we have to `:unadd` all the modules in a
         // single command so that GHCi doesn't try to load a bunch of removed modules after each
         // one.
-        self.stdin
-            .remove_modules(&mut self.stdout, modules.iter().map(Borrow::borrow), log)
-            .await?;
-
+        //
+        // GHCi can occasionally wedge in that implicit reload. The executable-eval timeout cannot
+        // help here: reload owns the eval barrier and the GHCi mutex. Bound the command itself and
+        // restore the prompt with the same interrupt machinery used for superseded reloads. GHCi
+        // updates its target set before starting the implicit reload, so after recovery the unadd
+        // has taken effect and it is safe to update our target bookkeeping below.
+        const UNADD_TIMEOUT: Duration = Duration::from_secs(60);
+        let unadd = self
+            .stdin
+            .remove_modules(&mut self.stdout, modules.iter().map(Borrow::borrow), log);
+        match tokio::time::timeout(UNADD_TIMEOUT, unadd).await {
+            Ok(result) => result?,
+            Err(_) => {
+                tracing::warn!(
+                    "Timed out waiting for GHCi to finish :unadd after {UNADD_TIMEOUT:?}; interrupting its implicit reload"
+                );
+                self.send_sigint()
+                    .await
+                    .wrap_err("Failed to restore GHCi after timed-out :unadd")?;
+            }
+        }
         for path in paths {
             self.targets.remove_source_path(path);
         }

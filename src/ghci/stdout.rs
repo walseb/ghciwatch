@@ -76,14 +76,21 @@ impl GhciStdout {
         Ok(())
     }
 
-    #[instrument(skip_all, level = "debug")]
-    pub async fn prompt(&mut self, find: FindAt, log: &mut CompilationLog) -> eyre::Result<()> {
+    /// Clear stderr diagnostics from the preceding GHCi operation.
+    ///
+    /// This must complete before the next command is written. Otherwise a fast
+    /// diagnostic can reach the stderr task before a delayed clear and be lost.
+    pub async fn clear_stderr_buffer(&self) -> eyre::Result<()> {
         let (sender, receiver) = oneshot::channel();
         self.stderr_sender
             .send(StderrEvent::ClearBuffer { sender })
             .await?;
         receiver.await?;
+        Ok(())
+    }
 
+    #[instrument(skip_all, level = "debug")]
+    pub async fn prompt(&mut self, find: FindAt, log: &mut CompilationLog) -> eyre::Result<()> {
         let data = self
             .reader
             .read_until(&mut ReadOpts {

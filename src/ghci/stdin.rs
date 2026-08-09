@@ -33,6 +33,7 @@ impl GhciStdin {
         find: FindAt,
         log: &mut CompilationLog,
     ) -> eyre::Result<()> {
+        stdout.clear_stderr_buffer().await?;
         self.stdin.write_all(line.as_bytes()).await?;
         stdout.prompt(find, log).await
     }
@@ -89,6 +90,7 @@ impl GhciStdin {
         find: FindAt,
         log: &mut CompilationLog,
     ) -> eyre::Result<()> {
+        stdout.clear_stderr_buffer().await?;
         self.write_set_prompt(prompt).await?;
         stdout.prompt(find, log).await
     }

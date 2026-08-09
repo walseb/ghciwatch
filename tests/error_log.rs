@@ -32,6 +32,52 @@ async fn can_write_error_log() {
     .assert_eq(&error_contents);
 }
 
+/// Recursive-module diagnostics emitted immediately on stderr are preserved in `--error-file`.
+#[test]
+async fn can_write_error_log_recursive_module_errors() {
+    let error_path = "ghcid.txt";
+    let mut session = GhciWatchBuilder::new("tests/data/simple")
+        .with_args(["--error-file", error_path])
+        .start()
+        .await
+        .expect("ghciwatch starts");
+    let error_path = session.path(error_path);
+    session
+        .wait_until_ready()
+        .await
+        .expect("ghciwatch loads ghci");
+
+    session
+        .fs()
+        .replace(
+            session.path("src/MyLib.hs"),
+            "module MyLib (example) where",
+            "module MyLib (example) where\n\nimport MyLib",
+        )
+        .await
+        .expect("can make MyLib import itself");
+
+    session
+        .wait_for_log(BaseMatcher::span_close().in_leaf_spans(["error_log_write"]))
+        .await
+        .expect("ghciwatch writes ghcid.txt");
+    session
+        .wait_for_log(BaseMatcher::reload_completes())
+        .await
+        .expect("ghciwatch finishes reloading");
+
+    let error_contents = session
+        .fs()
+        .read(&error_path)
+        .await
+        .expect("ghciwatch writes ghcid.txt");
+    assert!(
+        error_contents.contains("src/MyLib.hs: error:")
+            && error_contents.contains("imports itself"),
+        "recursive-module diagnostic missing from error log: {error_contents:?}"
+    );
+}
+
 /// Test that `ghciwatch --errors ...` can write the error log with `--repl-no-load`.
 #[test]
 async fn can_write_error_log_repl_no_load() {

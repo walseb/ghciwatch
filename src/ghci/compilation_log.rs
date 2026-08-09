@@ -50,6 +50,15 @@ impl CompilationLog {
         });
     }
 
+    /// Record a failed compilation when an operation was interrupted before GHCi emitted a
+    /// compilation summary.
+    pub fn mark_failed(&mut self) {
+        self.summary = Some(CompilationSummary {
+            result: CompilationResult::Err,
+            modules_loaded: ModulesLoaded::Count(0),
+        });
+    }
+
     /// Get the result of compilation.
     pub fn result(&self) -> Option<CompilationResult> {
         self.summary.map(|summary| summary.result)
