@@ -1,9 +1,12 @@
 //! Subsystem for [`Ghci`] to support graceful shutdown.
 
 use std::collections::BTreeSet;
+use std::fs;
+use std::io;
 use std::os::unix::process::ExitStatusExt;
 use std::process::ExitStatus;
 use std::sync::Arc;
+use std::time::Duration;
 
 use camino::Utf8PathBuf;
 use eyre::Context;
@@ -24,6 +27,11 @@ use super::Ghci;
 use super::GhciOpts;
 use super::GhciReloadKind;
 use super::ModuleSet;
+
+/// Recheck often enough to catch leaks without continuously walking `/proc`.
+const MEMORY_WATCHDOG_INTERVAL: Duration = Duration::from_secs(30);
+/// Resident-memory limit for the complete process group containing GHCi.
+const GHCI_MEMORY_LIMIT_BYTES: u64 = 20 * 1024 * 1024 * 1024;
 
 /// An event sent to [`Ghci`] by the watcher.
 #[derive(Debug, Clone)]
@@ -132,6 +140,8 @@ pub async fn run_ghci(
     let ghci = Arc::new(Mutex::new(ghci));
     let eval_barrier = crate::my::EvalBarrier::new();
     crate::my::spawn(ghci.clone(), eval_barrier.clone()).await?;
+    let mut memory_watchdog = tokio::time::interval(MEMORY_WATCHDOG_INTERVAL);
+    memory_watchdog.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let manager = GhciManager {
         ghci,
         eval_barrier,
@@ -140,6 +150,7 @@ pub async fn run_ghci(
         exited_receiver,
         classifier,
         interrupt_reloads,
+        memory_watchdog,
     };
     manager.run().await
 }
@@ -197,6 +208,7 @@ struct GhciManager {
     exited_receiver: mpsc::Receiver<ExitStatus>,
     classifier: FileClassifier,
     interrupt_reloads: bool,
+    memory_watchdog: tokio::time::Interval,
 }
 
 /// Result of [`GhciManager::wait_for_event`].
@@ -241,49 +253,68 @@ impl GhciManager {
         Ok(())
     }
 
-    /// Wait for the next watcher event, handling shutdown and ghci death along the way.
+    /// Wait for the next watcher event, handling shutdown, ghci death, and memory checks.
     async fn wait_for_event(&mut self) -> eyre::Result<WaitResult> {
-        let ghci_exited = {
-            let GhciManager {
-                ref ghci,
-                ref mut handle,
-                ref mut watcher_receiver,
-                ref mut exited_receiver,
-                ..
-            } = *self;
-            tokio::select! {
-                _ = handle.on_shutdown_requested() => {
-                    ghci.lock().await.stop().await
-                        .wrap_err("Failed to quit ghci")?;
-                    return Ok(WaitResult::Shutdown);
-                }
-                ret = watcher_receiver.recv() => {
-                    match ret {
-                        Some(event) => {
-                            tracing::debug!(?event, "Received ghci event from watcher");
-                            return Ok(WaitResult::Event(event));
-                        }
-                        None => {
-                            // Channel closed — shutdown in progress.
-                            tracing::debug!(
-                                "Watcher event channel closed; shutting down"
-                            );
-                            ghci.lock().await.stop().await
-                                .wrap_err("Failed to quit ghci")?;
-                            return Ok(WaitResult::Shutdown);
+        enum Wake {
+            GhciExited(ExitStatus),
+            MemoryWatchdog,
+        }
+
+        loop {
+            let wake = {
+                let GhciManager {
+                    ref ghci,
+                    ref mut handle,
+                    ref mut watcher_receiver,
+                    ref mut exited_receiver,
+                    ref mut memory_watchdog,
+                    ..
+                } = *self;
+                tokio::select! {
+                    _ = handle.on_shutdown_requested() => {
+                        ghci.lock().await.stop().await
+                            .wrap_err("Failed to quit ghci")?;
+                        return Ok(WaitResult::Shutdown);
+                    }
+                    ret = watcher_receiver.recv() => {
+                        match ret {
+                            Some(event) => {
+                                tracing::debug!(?event, "Received ghci event from watcher");
+                                return Ok(WaitResult::Event(event));
+                            }
+                            None => {
+                                // Channel closed — shutdown in progress.
+                                tracing::debug!(
+                                    "Watcher event channel closed; shutting down"
+                                );
+                                ghci.lock().await.stop().await
+                                    .wrap_err("Failed to quit ghci")?;
+                                return Ok(WaitResult::Shutdown);
+                            }
                         }
                     }
+                    Some(status) = exited_receiver.recv() => Wake::GhciExited(status),
+                    _ = memory_watchdog.tick() => Wake::MemoryWatchdog,
                 }
-                Some(status) = exited_receiver.recv() => status,
+            };
+            // self is no longer partially borrowed, so lock ordering remains the same
+            // as eval/reload: operation barrier first, GHCi mutex second.
+            match wake {
+                Wake::MemoryWatchdog => {
+                    if self.run_memory_watchdog().await? {
+                        return Ok(WaitResult::Restarted);
+                    }
+                }
+                Wake::GhciExited(status) => {
+                    return match self
+                        .wait_and_restart_runtime(status, "while waiting for filesystem events")
+                        .await?
+                    {
+                        RetryResult::Restarted => Ok(WaitResult::Restarted),
+                        RetryResult::Shutdown => Ok(WaitResult::Shutdown),
+                    };
+                }
             }
-        };
-        // self is no longer partially borrowed, so we can call methods.
-        match self
-            .wait_and_restart_runtime(ghci_exited, "while waiting for filesystem events")
-            .await?
-        {
-            RetryResult::Restarted => Ok(WaitResult::Restarted),
-            RetryResult::Shutdown => Ok(WaitResult::Shutdown),
         }
     }
 
@@ -311,6 +342,9 @@ impl GhciManager {
         // Events that arrive while we're waiting for a non-interruptible dispatch
         // (e.g. a restart) to complete. Returned as `Interrupted` for retry.
         let mut pending_event: Option<WatcherEvent> = None;
+        // A due check waits for this serialized reload/restart to finish; it never
+        // aborts a pipe protocol or takes the GHCi mutex out of lock order.
+        let mut memory_watchdog_due = false;
 
         let ghci_exited = loop {
             let GhciManager {
@@ -318,6 +352,7 @@ impl GhciManager {
                 ref mut handle,
                 ref mut watcher_receiver,
                 ref mut exited_receiver,
+                ref mut memory_watchdog,
                 interrupt_reloads,
                 ..
             } = *self;
@@ -335,6 +370,10 @@ impl GhciManager {
                     // Mutex.
                     task.abort();
                     Some(status)
+                }
+                _ = memory_watchdog.tick() => {
+                    memory_watchdog_due = true;
+                    continue;
                 }
                 Some(mut new_event) = watcher_receiver.recv() => {
                     // Drain any other events already queued up so we treat a burst
@@ -452,6 +491,12 @@ impl GhciManager {
             }
         }
 
+        if ghci_exited.is_none() && memory_watchdog_due {
+            // The operation permit is still held here, and the dispatch task has released
+            // the GHCi mutex. Check and restart without reacquiring the non-reentrant barrier.
+            self.run_memory_watchdog_with_operation_permit().await?;
+        }
+
         // If events arrived while the dispatch was running (but we chose not to
         // interrupt), drain any remaining events and return for retry. This dirty
         // cycle is required even when event paths themselves look irrelevant, since
@@ -462,6 +507,54 @@ impl GhciManager {
         }
 
         Ok(HandleResult::Done)
+    }
+
+    async fn run_memory_watchdog(&self) -> eyre::Result<bool> {
+        let _operation_guard = self.eval_barrier.begin_operation().await;
+        self.run_memory_watchdog_with_operation_permit().await
+    }
+
+    async fn run_memory_watchdog_with_operation_permit(&self) -> eyre::Result<bool> {
+        let mut ghci = self.ghci.lock().await;
+        let process_group_id = ghci.process_group_id();
+        let usage = tokio::task::spawn_blocking(move || {
+            process_group_resident_bytes(process_group_id.as_raw())
+        })
+        .await
+        .wrap_err("GHCi memory watchdog task failed")?;
+        let usage = match usage {
+            Ok(usage) => usage,
+            Err(error) => {
+                tracing::warn!(%error, "Failed to read GHCi process-group memory usage");
+                return Ok(false);
+            }
+        };
+        tracing::debug!(
+            bytes = usage,
+            limit = GHCI_MEMORY_LIMIT_BYTES,
+            pgid = process_group_id.as_raw(),
+            "Checked GHCi process-group resident memory"
+        );
+        if usage <= GHCI_MEMORY_LIMIT_BYTES {
+            return Ok(false);
+        }
+
+        print_ghciwatch_error(
+            "GHCi exceeded its resident-memory limit",
+            &format!(
+                "Component: GHCi process group\nProcess group ID: {}\nResident memory: {usage} bytes\nLimit: {GHCI_MEMORY_LIMIT_BYTES} bytes (20 GiB)\nRecovery: restarting GHCi through the normal lifecycle-hook and target-synchronization machinery",
+                process_group_id.as_raw(),
+            ),
+        );
+        tracing::warn!(
+            bytes = usage,
+            limit = GHCI_MEMORY_LIMIT_BYTES,
+            "GHCi memory watchdog is restarting the session"
+        );
+        ghci.restart_for_memory_watchdog()
+            .await
+            .wrap_err("Failed to restart GHCi after exceeding its memory limit")?;
+        Ok(true)
     }
 
     /// Wait for a relevant file change, then attempt to restart ghci.
@@ -672,6 +765,67 @@ async fn wait_and_restart(
         tracing::warn!(
             %status,
             "ghci exited {context}; waiting for a file change to restart",
+        );
+    }
+}
+
+/// Sum resident memory for every process in GHCi's process group.
+///
+/// Linux reports `VmRSS` in KiB and `NSpgid` from outermost to innermost PID
+/// namespace. Ghciwatch and its child are in the same namespace, so the final
+/// process-group value is the one represented by `Pid`. Processes may disappear
+/// during the scan; those races are intentionally ignored.
+fn process_group_resident_bytes(process_group_id: i32) -> io::Result<u64> {
+    let mut total = 0_u64;
+    for entry in fs::read_dir("/proc")? {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => continue,
+        };
+        if entry.file_name().to_string_lossy().parse::<u32>().is_err() {
+            continue;
+        }
+        let status = match fs::read(entry.path().join("status")) {
+            Ok(status) => status,
+            Err(_) => continue,
+        };
+        let status = String::from_utf8_lossy(&status);
+        if let Some((pgrp, resident_bytes)) = parse_process_status(&status) {
+            if pgrp == process_group_id {
+                total = total.saturating_add(resident_bytes);
+            }
+        }
+    }
+    Ok(total)
+}
+
+fn parse_process_status(status: &str) -> Option<(i32, u64)> {
+    let process_group_id = status
+        .lines()
+        .find_map(|line| line.strip_prefix("NSpgid:"))?
+        .split_whitespace()
+        .last()?
+        .parse::<i32>()
+        .ok()?;
+    let resident_kib = status
+        .lines()
+        .find_map(|line| line.strip_prefix("VmRSS:"))
+        .and_then(|value| value.split_whitespace().next())
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
+    Some((process_group_id, resident_kib.saturating_mul(1024)))
+}
+
+#[cfg(test)]
+mod memory_watchdog_tests {
+    use super::parse_process_status;
+
+    #[test]
+    fn parses_namespaced_process_group_and_resident_memory() {
+        let status = "Name:\tghci\nNSpgid:\t71\t203\nVmRSS:\t20971521 kB\n";
+        assert_eq!(
+            parse_process_status(status),
+            Some((203, 20_971_521 * 1024))
         );
     }
 }

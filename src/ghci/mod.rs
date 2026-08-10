@@ -316,6 +316,20 @@ impl Ghci {
             self.process_group_id, self.search_paths.cwd, self.opts.command
         )
     }
+
+    pub(crate) fn process_group_id(&self) -> Pid {
+        self.process_group_id
+    }
+}
+
+impl Ghci {
+    /// Restart a leaking session through the normal lifecycle-hook and target-sync path.
+    pub(crate) async fn restart_for_memory_watchdog(&mut self) -> eyre::Result<()> {
+        let haskell_files = self.known_haskell_files.clone();
+        self.opts.clear();
+        self.error_log.write_still_compiling().await?;
+        self.restart(haskell_files).await
+    }
 }
 
 impl Ghci {
