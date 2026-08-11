@@ -10,6 +10,7 @@ use tracing::instrument;
 use crate::aho_corasick::AhoCorasickExt;
 use crate::incremental_reader::FindAt;
 use crate::incremental_reader::IncrementalReader;
+use crate::incremental_reader::ReadUntilStatus;
 use crate::incremental_reader::ReadOpts;
 use crate::incremental_reader::WriteBehavior;
 
@@ -104,6 +105,38 @@ impl GhciStdout {
 
         self.parse_into_log(&data, log).await?;
         Ok(())
+    }
+
+    /// Wait for the GHCi prompt, but stop if no `Compiling` progress is seen for the timeout.
+    /// Unrelated output is still forwarded but does not keep a wedged compilation alive.
+    #[instrument(skip_all, level = "debug")]
+    pub async fn prompt_with_progress_timeout(
+        &mut self,
+        find: FindAt,
+        log: &mut CompilationLog,
+        progress_timeout: Duration,
+    ) -> eyre::Result<bool> {
+        let result = self
+            .reader
+            .read_until_with_progress_timeout(
+                &mut ReadOpts {
+                    end_marker: &self.prompt_patterns,
+                    find,
+                    writing: WriteBehavior::NoFinalLine,
+                    buffer: &mut self.buffer,
+                },
+                progress_timeout,
+                "Compiling",
+            )
+            .await?;
+        match result {
+            ReadUntilStatus::Complete(data) => {
+                tracing::debug!(bytes = data.len(), "Got data from ghci");
+                self.parse_into_log(&data, log).await?;
+                Ok(true)
+            }
+            ReadUntilStatus::Inactive => Ok(false),
+        }
     }
 
     /// Read any immediately-available output from the pipe, then drain stale prompts from

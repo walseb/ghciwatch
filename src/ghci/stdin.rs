@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use eyre::Context;
 use itertools::Itertools;
 use tokio::io::AsyncWriteExt;
@@ -48,6 +50,22 @@ impl GhciStdin {
         log: &mut CompilationLog,
     ) -> eyre::Result<()> {
         self.write_line_with_prompt_at(stdout, line, FindAt::LineStart, log)
+            .await
+    }
+
+    /// Write a line and wait until either the prompt arrives or compilation progress stops for the
+    /// supplied timeout. Returns `false` when no `Compiling` line appears before the deadline.
+    async fn write_line_with_progress_timeout(
+        &mut self,
+        stdout: &mut GhciStdout,
+        line: &str,
+        log: &mut CompilationLog,
+        progress_timeout: Duration,
+    ) -> eyre::Result<bool> {
+        stdout.clear_stderr_buffer().await?;
+        self.stdin.write_all(line.as_bytes()).await?;
+        stdout
+            .prompt_with_progress_timeout(FindAt::LineStart, log, progress_timeout)
             .await
     }
 
@@ -115,8 +133,15 @@ impl GhciStdin {
         &mut self,
         stdout: &mut GhciStdout,
         log: &mut CompilationLog,
-    ) -> eyre::Result<()> {
-        self.write_line(stdout, ":reload\n", log).await
+        inactivity_timeout: Duration,
+    ) -> eyre::Result<bool> {
+        self.write_line_with_progress_timeout(
+            stdout,
+            ":reload\n",
+            log,
+            inactivity_timeout,
+        )
+        .await
     }
 
     #[instrument(skip_all, level = "debug")]
@@ -125,7 +150,8 @@ impl GhciStdin {
         stdout: &mut GhciStdout,
         modules: impl IntoIterator<Item = &LoadedModule>,
         log: &mut CompilationLog,
-    ) -> eyre::Result<()> {
+        inactivity_timeout: Duration,
+    ) -> eyre::Result<bool> {
         let modules = modules.into_iter().format(" ");
         // We use `:add` because `:load` unloads all previously loaded modules:
         //
@@ -134,8 +160,13 @@ impl GhciStdin {
         // > to unload all the currently loaded modules and bindings.
         //
         // https://downloads.haskell.org/ghc/latest/docs/users_guide/ghci.html#ghci-cmd-:load
-        self.write_line(stdout, &format!(":add {modules}\n"), log)
-            .await
+        self.write_line_with_progress_timeout(
+            stdout,
+            &format!(":add {modules}\n"),
+            log,
+            inactivity_timeout,
+        )
+        .await
     }
 
     #[instrument(skip_all, level = "debug")]
@@ -144,10 +175,16 @@ impl GhciStdin {
         stdout: &mut GhciStdout,
         modules: impl IntoIterator<Item = &LoadedModule>,
         log: &mut CompilationLog,
-    ) -> eyre::Result<()> {
+        inactivity_timeout: Duration,
+    ) -> eyre::Result<bool> {
         let modules = modules.into_iter().format(" ");
-        self.write_line(stdout, &format!(":unadd {modules}\n"), log)
-            .await
+        self.write_line_with_progress_timeout(
+            stdout,
+            &format!(":unadd {modules}\n"),
+            log,
+            inactivity_timeout,
+        )
+        .await
     }
 
     #[instrument(skip(self, stdout), level = "debug")]

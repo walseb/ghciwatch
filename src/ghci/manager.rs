@@ -1,8 +1,6 @@
 //! Subsystem for [`Ghci`] to support graceful shutdown.
 
 use std::collections::BTreeSet;
-use std::fs;
-use std::io;
 use std::os::unix::process::ExitStatusExt;
 use std::process::ExitStatus;
 use std::sync::Arc;
@@ -21,17 +19,20 @@ use crate::hooks;
 use crate::hooks::LifecycleEvent;
 use crate::shutdown::ShutdownHandle;
 
+use super::memory::format_bytes;
+use super::memory::repl_resident_memory;
 use super::FileClassifier;
 use super::print_ghciwatch_error;
 use super::Ghci;
+use super::GhciRecoveryFailed;
 use super::GhciOpts;
 use super::GhciReloadKind;
 use super::ModuleSet;
 
 /// Recheck often enough to catch leaks without continuously walking `/proc`.
 const MEMORY_WATCHDOG_INTERVAL: Duration = Duration::from_secs(30);
-/// Resident-memory limit for the complete process group containing GHCi.
-const GHCI_MEMORY_LIMIT_BYTES: u64 = 20 * 1024 * 1024 * 1024;
+/// Resident-memory limit for the persistent interactive GHC process.
+const GHCI_MEMORY_LIMIT_BYTES: u64 = 28 * 1024 * 1024 * 1024;
 
 /// An event sent to [`Ghci`] by the watcher.
 #[derive(Debug, Clone)]
@@ -65,6 +66,29 @@ impl WatcherEvent {
                 *haskell_files = other_haskell_files;
             }
         }
+    }
+
+    fn haskell_files(&self) -> BTreeSet<Utf8PathBuf> {
+        match self {
+            Self::Reload { haskell_files, .. } => haskell_files.clone(),
+        }
+    }
+
+    /// Paths whose watcher events were being dispatched when GHCi exited.
+    fn affected_paths(&self) -> Option<String> {
+        let events = match self {
+            Self::Reload { events, .. } => events,
+        };
+        if events.is_empty() {
+            return None;
+        }
+        Some(
+            events
+                .iter()
+                .map(|event| format!("  - {}", event.as_path()))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
     }
 }
 
@@ -106,12 +130,10 @@ pub async fn run_ghci(
         // Even on success, ghci may have exited right after starting up; check for a
         // pending exit status so we don't hand the manager a dead session.
         Ok(()) => exited_receiver.try_recv().ok(),
-        Err(err) if is_broken_pipe(&err) => {
-            // A broken pipe means ghci exited during startup. `GhciProcess` is
-            // guaranteed to deliver the exit status (unless a shutdown wins its
-            // `select!` first), so wait for it rather than racing it with `try_recv` --
-            // losing that race would misattribute the failure to the runtime loop
-            // ("exited unexpectedly" instead of "exited during startup").
+        Err(err) if is_broken_pipe(&err) || is_recovery_failure(&err) => {
+            // GHCi exited during startup, or failed prompt recovery force-killed it.
+            // `GhciProcess` delivers the status in both cases. Wait rather than racing
+            // `try_recv`, so retry policy attributes the failure to startup correctly.
             tracing::debug!("ghci exited during startup: {err}");
             tokio::select! {
                 _ = handle.on_shutdown_requested() => return Ok(()),
@@ -129,6 +151,7 @@ pub async fn run_ghci(
             status,
             "during initial GHCi startup",
             &mut RestartStrategy::Startup(&mut ghci),
+            None,
         )
         .await?
         {
@@ -306,8 +329,30 @@ impl GhciManager {
                     }
                 }
                 Wake::GhciExited(status) => {
+                    // Failed SIGINT recovery deliberately kills the session. Unlike an
+                    // unrelated crash, replace it immediately without waiting for a file event.
+                    let recovered = {
+                        let _operation = self.eval_barrier.begin_operation().await;
+                        let mut ghci = self.ghci.lock().await;
+                        if ghci.recovery_restart_required() {
+                            tracing::warn!(%status, "Restarting GHCi immediately after failed interrupt recovery");
+                            ghci.restart_after_recovery_kill_with_known_files()
+                                .await
+                                .wrap_err("Failed to restart GHCi after unsuccessful interrupt recovery")?;
+                            true
+                        } else {
+                            false
+                        }
+                    };
+                    if recovered {
+                        return Ok(WaitResult::Restarted);
+                    }
                     return match self
-                        .wait_and_restart_runtime(status, "while waiting for filesystem events")
+                        .wait_and_restart_runtime(
+                            status,
+                            "while waiting for filesystem events",
+                            None,
+                        )
                         .await?
                     {
                         RetryResult::Restarted => Ok(WaitResult::Restarted),
@@ -345,6 +390,9 @@ impl GhciManager {
         // A due check waits for this serialized reload/restart to finish; it never
         // aborts a pipe protocol or takes the GHCi mutex out of lock order.
         let mut memory_watchdog_due = false;
+        // Failed prompt recovery force-kills GHCi and must trigger an immediate
+        // replacement, rather than the unexpected-exit policy of waiting for a file change.
+        let mut restart_after_recovery_kill = false;
 
         let ghci_exited = loop {
             let GhciManager {
@@ -357,6 +405,7 @@ impl GhciManager {
                 ..
             } = *self;
             break tokio::select! {
+                biased;
                 _ = handle.on_shutdown_requested() => {
                     // Cancel any in-progress reloads. This releases the lock so we don't
                     // block here.
@@ -366,9 +415,13 @@ impl GhciManager {
                     return Ok(HandleResult::Shutdown);
                 }
                 Some(status) = exited_receiver.recv() => {
-                    // ghci died during the dispatch. Abort the stuck task to release the
-                    // Mutex.
+                    // Prefer process death over queued watcher traffic so a busy filesystem cannot
+                    // indefinitely delay the crash report. Abort the dispatch to release its mutex.
                     task.abort();
+                    if ghci.lock().await.recovery_restart_required() {
+                        restart_after_recovery_kill = true;
+                        preserve_recovery_event(&event, &mut pending_event);
+                    }
                     Some(status)
                 }
                 _ = memory_watchdog.tick() => {
@@ -412,16 +465,16 @@ impl GhciManager {
                                 match ghci.lock().await.send_sigint().await {
                                     Ok(()) => return Ok(HandleResult::Interrupted(event)),
                                     Err(e) => {
-                                        // `send_sigint` may kill the session if it
-                                        // cannot leave ghci in a usable state (e.g.
-                                        // sync barrier failure). Wait for the exit
-                                        // and route through the standard restart
-                                        // path with the merged event preserved.
+                                        // `send_sigint` force-kills the session if prompt
+                                        // synchronization cannot be restored. Consume its exit
+                                        // status, then immediately initialize a replacement with
+                                        // the merged event's filesystem snapshot.
                                         tracing::warn!(
                                             error = ?e,
                                             "Failed to interrupt ghci; session was killed for restart",
                                         );
-                                        pending_event = Some(event);
+                                        pending_event = Some(event.clone());
+                                        restart_after_recovery_kill = true;
                                         let status = exited_receiver
                                             .recv()
                                             .await
@@ -454,13 +507,18 @@ impl GhciManager {
                             tracing::debug!("Finished dispatching ghci event");
                             None
                         }
-                        Err(err) if is_broken_pipe(&err) => {
-                            // ghci died during the dispatch and the death surfaced
-                            // inside the dispatch task itself as a broken pipe. The
-                            // exit status is guaranteed to arrive on the exit channel
-                            // (unless a shutdown wins the `select!` in
-                            // `GhciProcess::run` first), so wait for it and route
-                            // through the standard restart path.
+                        Err(err) if is_broken_pipe(&err) || is_recovery_failure(&err) => {
+                            // GHCi died during dispatch. A broken pipe follows the normal
+                            // unexpected-exit policy; a typed recovery failure means
+                            // send_sigint force-killed an unsynchronized session and requires
+                            // an immediate replacement. In either case, consume the matching
+                            // process-exit notification before continuing.
+                            if is_recovery_failure(&err)
+                                || ghci.lock().await.recovery_restart_required()
+                            {
+                                restart_after_recovery_kill = true;
+                                preserve_recovery_event(&event, &mut pending_event);
+                            }
                             tracing::debug!("ghci exited while dispatching: {err}");
                             tokio::select! {
                                 _ = handle.on_shutdown_requested() => {
@@ -480,14 +538,34 @@ impl GhciManager {
             };
         };
 
-        // If ghci died during the dispatch, wait for a file change and restart.
         if let Some(status) = ghci_exited {
-            match self
-                .wait_and_restart_runtime(status, "while dispatching a reload/restart event")
-                .await?
-            {
-                RetryResult::Restarted => {}
-                RetryResult::Shutdown => return Ok(HandleResult::Shutdown),
+            if restart_after_recovery_kill {
+                tracing::warn!(%status, "Restarting GHCi immediately after failed interrupt recovery");
+                let haskell_files = pending_event
+                    .take()
+                    .expect("recovery kill must preserve its triggering event")
+                    .haskell_files();
+                self.ghci
+                    .lock()
+                    .await
+                    .restart_after_recovery_kill(haskell_files)
+                    .await
+                    .wrap_err("Failed to restart GHCi after unsuccessful interrupt recovery")?;
+            } else {
+                // An unrelated unexpected exit retains the established policy: wait for a
+                // relevant file event before attempting a replacement.
+                let affected_paths = event.affected_paths();
+                match self
+                    .wait_and_restart_runtime(
+                        status,
+                        "while dispatching a reload/restart event",
+                        affected_paths,
+                    )
+                    .await?
+                {
+                    RetryResult::Restarted => {}
+                    RetryResult::Shutdown => return Ok(HandleResult::Shutdown),
+                }
             }
         }
 
@@ -516,38 +594,42 @@ impl GhciManager {
 
     async fn run_memory_watchdog_with_operation_permit(&self) -> eyre::Result<bool> {
         let mut ghci = self.ghci.lock().await;
+        let process_id = ghci.process_id();
         let process_group_id = ghci.process_group_id();
         let usage = tokio::task::spawn_blocking(move || {
-            process_group_resident_bytes(process_group_id.as_raw())
+            repl_resident_memory(process_id.as_raw(), process_group_id.as_raw())
         })
         .await
         .wrap_err("GHCi memory watchdog task failed")?;
         let usage = match usage {
             Ok(usage) => usage,
             Err(error) => {
-                tracing::warn!(%error, "Failed to read GHCi process-group memory usage");
+                tracing::warn!(%error, "Failed to read GHCi repl memory usage");
                 return Ok(false);
             }
         };
         tracing::debug!(
-            bytes = usage,
+            bytes = usage.bytes,
             limit = GHCI_MEMORY_LIMIT_BYTES,
-            pgid = process_group_id.as_raw(),
-            "Checked GHCi process-group resident memory"
+            command_pid = usage.command_pid,
+            interactive_ghc_pid = usage.interactive_ghc.map(|(pid, _)| pid),
+            "Checked GHCi repl resident memory"
         );
-        if usage <= GHCI_MEMORY_LIMIT_BYTES {
+        if usage.bytes <= GHCI_MEMORY_LIMIT_BYTES {
             return Ok(false);
         }
 
         print_ghciwatch_error(
             "GHCi exceeded its resident-memory limit",
             &format!(
-                "Component: GHCi process group\nProcess group ID: {}\nResident memory: {usage} bytes\nLimit: {GHCI_MEMORY_LIMIT_BYTES} bytes (20 GiB)\nRecovery: restarting GHCi through the normal lifecycle-hook and target-synchronization machinery",
-                process_group_id.as_raw(),
+                "Component: GHCi process\n{}\nResident memory: {}\nLimit: {}\nRecovery: restarting GHCi through the normal lifecycle-hook and target-synchronization machinery",
+                usage.details(),
+                format_bytes(usage.bytes),
+                format_bytes(GHCI_MEMORY_LIMIT_BYTES),
             ),
         );
         tracing::warn!(
-            bytes = usage,
+            bytes = usage.bytes,
             limit = GHCI_MEMORY_LIMIT_BYTES,
             "GHCi memory watchdog is restarting the session"
         );
@@ -563,6 +645,7 @@ impl GhciManager {
         &mut self,
         status: ExitStatus,
         detected_phase: &'static str,
+        affected_paths: Option<String>,
     ) -> eyre::Result<RetryResult> {
         wait_and_restart(
             &mut self.handle,
@@ -572,6 +655,7 @@ impl GhciManager {
             status,
             detected_phase,
             &mut RestartStrategy::Runtime(self.ghci.clone()),
+            affected_paths,
         )
         .await
     }
@@ -584,22 +668,35 @@ fn drain_pending(event: &mut WatcherEvent, watcher_receiver: &mut mpsc::Receiver
     }
 }
 
+fn preserve_recovery_event(
+    event: &WatcherEvent,
+    pending_event: &mut Option<WatcherEvent>,
+) {
+    let mut recovery_event = event.clone();
+    if let Some(newer_event) = pending_event.take() {
+        recovery_event.merge(newer_event);
+    }
+    *pending_event = Some(recovery_event);
+}
 
-/// Drain all pending events from the receiver, merge them, classify, and return the kind.
-/// Returns `None` when the combined events are irrelevant ([`GhciReloadKind::None`]).
+
+/// Drain all pending events, merge them, and return the complete event when it is relevant.
+/// Keeping the event preserves its newest filesystem snapshot for replacement initialization.
 fn drain_and_classify(
     initial: WatcherEvent,
     watcher_receiver: &mut mpsc::Receiver<WatcherEvent>,
     classifier: &FileClassifier,
-) -> eyre::Result<Option<GhciReloadKind>> {
+) -> eyre::Result<Option<WatcherEvent>> {
     let mut event = initial;
     drain_pending(&mut event, watcher_receiver);
-    let WatcherEvent::Reload { events, .. } = event;
+    let events = match &event {
+        WatcherEvent::Reload { events, .. } => events.clone(),
+    };
     let kind = classifier.classify(events, &ModuleSet::default())?.kind();
     if matches!(kind, GhciReloadKind::None) {
         Ok(None)
     } else {
-        Ok(Some(kind))
+        Ok(Some(event))
     }
 }
 
@@ -627,16 +724,16 @@ impl RestartStrategy<'_> {
         }
     }
 
-    async fn restart(&mut self) -> eyre::Result<()> {
+    async fn restart(&mut self, haskell_files: BTreeSet<Utf8PathBuf>) -> eyre::Result<()> {
         match self {
             Self::Startup(ghci) => ghci
-                .startup_restart()
+                .startup_restart(haskell_files)
                 .await
                 .wrap_err("Failed to restart ghci after startup failure"),
             Self::Runtime(ghci) => ghci
                 .lock()
                 .await
-                .startup_restart()
+                .startup_restart(haskell_files)
                 .await
                 .wrap_err("Failed to restart ghci after unexpected exit"),
         }
@@ -674,13 +771,15 @@ async fn wait_and_restart(
     mut status: ExitStatus,
     detected_phase: &'static str,
     strategy: &mut RestartStrategy<'_>,
+    affected_paths: Option<String>,
 ) -> eyre::Result<RetryResult> {
     let context = strategy.context();
+    let affected_paths = affected_paths
+        .map(|paths| format!("\nAffected paths:\n{paths}"))
+        .unwrap_or_default();
     let details = format!(
-        "Detected phase: {detected_phase}\nExit status: {status}\nExit code: {:?}\nSignal: {:?}\nCore dumped: {}\n{}\nRecovery: waiting for a relevant file change, then starting a fresh GHCi session",
-        status.code(),
-        status.signal(),
-        status.core_dumped(),
+        "Detected phase: {detected_phase}\n{}\n{}{affected_paths}\nRecovery: waiting for a relevant file change, then starting a fresh GHCi session",
+        exit_status_diagnostic(status),
         strategy.diagnostic_context().await,
     );
     print_ghciwatch_error("GHCi exited unexpectedly", &details);
@@ -689,26 +788,34 @@ async fn wait_and_restart(
         "ghci exited {context}; waiting for a file change to restart",
     );
     loop {
-        // Wait for a watcher event to use as a restart trigger. We handle both the shutdown
-        // signal and the channel closing (which also indicates shutdown, since the sender is
-        // exclusively owned by `run_watcher` and it only exits on shutdown).
-        tokio::select! {
-            _ = handle.on_shutdown_requested() => {
-                // ghci is already dead; nothing to stop.
-                return Ok(RetryResult::Shutdown);
-            }
-            ret = watcher_receiver.recv() => {
-                let Some(event) = ret else {
-                    // Channel closed — shutdown in progress. ghci is already dead.
-                    tracing::debug!("Watcher event channel closed; shutting down");
+        // Wait for a relevant watcher event and retain its authoritative filesystem snapshot.
+        let event = loop {
+            let event = tokio::select! {
+                _ = handle.on_shutdown_requested() => {
+                    // ghci is already dead; nothing to stop.
                     return Ok(RetryResult::Shutdown);
-                };
-                if drain_and_classify(event, watcher_receiver, classifier)?.is_none() {
+                }
+                ret = watcher_receiver.recv() => {
+                    let Some(event) = ret else {
+                        // Channel closed — shutdown in progress. ghci is already dead.
+                        tracing::debug!("Watcher event channel closed; shutting down");
+                        return Ok(RetryResult::Shutdown);
+                    };
+                    event
+                }
+            };
+            match drain_and_classify(event, watcher_receiver, classifier)? {
+                Some(event) => break event,
+                None => {
                     tracing::debug!("File change not relevant to ghci; continuing to wait");
-                    continue;
                 }
             }
-        }
+        };
+        let haskell_files = event.haskell_files();
+        let affected_paths = event
+            .affected_paths()
+            .map(|paths| format!("\nAffected paths:\n{paths}"))
+            .unwrap_or_default();
         tracing::debug!("Restarting ghci");
         // Race the restart attempt against the exit channel. If ghci dies mid-restart,
         // the death usually surfaces inside `restart()` itself: its stdout EOFs (which
@@ -719,9 +826,9 @@ async fn wait_and_restart(
         let race = tokio::select! {
             biased;
             Some(new_status) = exited_receiver.recv() => RestartRace::Exited(new_status),
-            result = strategy.restart() => match result {
+            result = strategy.restart(haskell_files) => match result {
                 Ok(()) => RestartRace::Restarted,
-                Err(err) if is_broken_pipe(&err) => {
+                Err(err) if is_broken_pipe(&err) || is_recovery_failure(&err) => {
                     tracing::debug!("ghci exited while restarting: {err}");
                     RestartRace::ExitPending
                 }
@@ -755,10 +862,8 @@ async fn wait_and_restart(
         };
         status = new_status;
         let details = format!(
-            "Detected phase: while starting a replacement GHCi session\nExit status: {status}\nExit code: {:?}\nSignal: {:?}\nCore dumped: {}\n{}\nRecovery: waiting for a relevant file change, then retrying with a fresh GHCi session",
-            status.code(),
-            status.signal(),
-            status.core_dumped(),
+            "Detected phase: while starting a replacement GHCi session\n{}\n{}{affected_paths}\nRecovery: waiting for a relevant file change, then retrying with a fresh GHCi session",
+            exit_status_diagnostic(status),
             strategy.diagnostic_context().await,
         );
         print_ghciwatch_error("GHCi exited again while restarting", &details);
@@ -769,65 +874,45 @@ async fn wait_and_restart(
     }
 }
 
-/// Sum resident memory for every process in GHCi's process group.
-///
-/// Linux reports `VmRSS` in KiB and `NSpgid` from outermost to innermost PID
-/// namespace. Ghciwatch and its child are in the same namespace, so the final
-/// process-group value is the one represented by `Pid`. Processes may disappear
-/// during the scan; those races are intentionally ignored.
-fn process_group_resident_bytes(process_group_id: i32) -> io::Result<u64> {
-    let mut total = 0_u64;
-    for entry in fs::read_dir("/proc")? {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(_) => continue,
-        };
-        if entry.file_name().to_string_lossy().parse::<u32>().is_err() {
-            continue;
+fn exit_status_diagnostic(status: ExitStatus) -> String {
+    let signal = status.signal();
+    let signal_description = match signal {
+        Some(number) => match nix::sys::signal::Signal::try_from(number) {
+            Ok(signal) => format!("{number} ({signal:?})"),
+            Err(_) => number.to_string(),
+        },
+        None => "none".to_owned(),
+    };
+    let hint = match signal {
+        Some(number) if number == nix::sys::signal::Signal::SIGKILL as i32 => {
+            "\nDiagnostic hint: SIGKILL can indicate the Linux OOM killer or an external kill; check `journalctl -k`/`dmesg` around this timestamp"
         }
-        let status = match fs::read(entry.path().join("status")) {
-            Ok(status) => status,
-            Err(_) => continue,
-        };
-        let status = String::from_utf8_lossy(&status);
-        if let Some((pgrp, resident_bytes)) = parse_process_status(&status) {
-            if pgrp == process_group_id {
-                total = total.saturating_add(resident_bytes);
-            }
+        Some(number)
+            if [
+                nix::sys::signal::Signal::SIGABRT,
+                nix::sys::signal::Signal::SIGBUS,
+                nix::sys::signal::Signal::SIGILL,
+                nix::sys::signal::Signal::SIGSEGV,
+            ]
+            .iter()
+            .any(|signal| *signal as i32 == number) =>
+        {
+            "\nDiagnostic hint: this signal usually indicates a native-code crash; inspect the core dump if one was produced"
         }
-    }
-    Ok(total)
+        _ => "",
+    };
+    format!(
+        "Command exit status: {status}\nExit code: {:?}\nTerminating signal: {signal_description}\nCore dumped: {}{hint}\nStatus note: this status belongs to the configured --command process; a wrapper such as cabal may translate a child GHC crash signal into its own exit code",
+        status.code(),
+        status.core_dumped(),
+    )
 }
 
-fn parse_process_status(status: &str) -> Option<(i32, u64)> {
-    let process_group_id = status
-        .lines()
-        .find_map(|line| line.strip_prefix("NSpgid:"))?
-        .split_whitespace()
-        .last()?
-        .parse::<i32>()
-        .ok()?;
-    let resident_kib = status
-        .lines()
-        .find_map(|line| line.strip_prefix("VmRSS:"))
-        .and_then(|value| value.split_whitespace().next())
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(0);
-    Some((process_group_id, resident_kib.saturating_mul(1024)))
-}
-
-#[cfg(test)]
-mod memory_watchdog_tests {
-    use super::parse_process_status;
-
-    #[test]
-    fn parses_namespaced_process_group_and_resident_memory() {
-        let status = "Name:\tghci\nNSpgid:\t71\t203\nVmRSS:\t20971521 kB\n";
-        assert_eq!(
-            parse_process_status(status),
-            Some((203, 20_971_521 * 1024))
-        );
-    }
+fn is_recovery_failure(err: &eyre::Report) -> bool {
+    err.downcast_ref::<GhciRecoveryFailed>().is_some()
+        || err
+            .chain()
+            .any(|error| error.downcast_ref::<GhciRecoveryFailed>().is_some())
 }
 
 /// Check whether the error (or anything in its chain) is a broken pipe.

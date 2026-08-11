@@ -3,6 +3,7 @@
 use std::borrow::Cow;
 use std::pin::Pin;
 use std::time::Duration;
+use std::time::Instant;
 
 use aho_corasick::AhoCorasick;
 use line_span::LineSpans;
@@ -88,6 +89,31 @@ where
         }
     }
 
+    /// Read until an end marker, returning early if no line containing `progress_marker` is seen
+    /// for `progress_timeout`. Other output is consumed and forwarded without resetting the timer.
+    pub async fn read_until_with_progress_timeout(
+        &mut self,
+        opts: &mut ReadOpts<'_>,
+        progress_timeout: Duration,
+        progress_marker: &str,
+    ) -> eyre::Result<ReadUntilStatus> {
+        let mut last_progress = Instant::now();
+        loop {
+            match self
+                .try_read_until_with_progress_timeout(
+                    opts,
+                    progress_timeout,
+                    progress_marker,
+                    &mut last_progress,
+                )
+                .await?
+            {
+                Some(status) => return Ok(status),
+                None => continue,
+            }
+        }
+    }
+
     /// Examines the internal buffer and reads at most once from the underlying reader.
     ///
     /// If a line beginning with one of the `end_marker` patterns is seen, the lines before the
@@ -127,6 +153,48 @@ where
                 }
             }
             Err(err) => Err(err.into()),
+        }
+    }
+
+    /// Like [`Self::try_read_until`], but limits time since compilation progress rather than time
+    /// since any bytes arrived.
+    async fn try_read_until_with_progress_timeout(
+        &mut self,
+        opts: &mut ReadOpts<'_>,
+        progress_timeout: Duration,
+        progress_marker: &str,
+        last_progress: &mut Instant,
+    ) -> eyre::Result<Option<ReadUntilStatus>> {
+        self.drain_pending(opts.writing).await?;
+
+        if let Some(chunk) = self.take_chunk_from_buffer(opts) {
+            tracing::trace!(data = chunk.len(), "Got data from buffer");
+            return Ok(Some(ReadUntilStatus::Complete(chunk)));
+        }
+
+        let remaining = progress_timeout.saturating_sub(last_progress.elapsed());
+        let read = tokio::time::timeout(remaining, self.reader.read(opts.buffer)).await;
+        match read {
+            Err(_) => Ok(Some(ReadUntilStatus::Inactive)),
+            Ok(Ok(0)) => {
+                let lines = self.take_lines(opts.writing).await?;
+                Ok(Some(ReadUntilStatus::Complete(lines)))
+            }
+            Ok(Ok(n)) => {
+                let decoded = self.decode(&opts.buffer[..n]);
+                // Include the previous partial line so a marker split across reads is recognized.
+                if self.line.contains(progress_marker)
+                    || decoded.contains(progress_marker)
+                    || format!("{}{}", self.line, decoded).contains(progress_marker)
+                {
+                    *last_progress = Instant::now();
+                }
+                match self.consume_str(&decoded, opts).await? {
+                    Some(lines) => Ok(Some(ReadUntilStatus::Complete(lines))),
+                    None => Ok(None),
+                }
+            }
+            Ok(Err(error)) => Err(error.into()),
         }
     }
 
@@ -445,6 +513,15 @@ where
     }
 }
 
+/// Result of reading through a compilation-progress inactivity boundary.
+#[derive(Debug, Eq, PartialEq)]
+pub enum ReadUntilStatus {
+    /// The configured end marker was found or the stream ended.
+    Complete(String),
+    /// No matching progress line was observed before the timeout.
+    Inactive,
+}
+
 /// Determines how an [`IncrementalReader`] forwards output to its contained writer. See
 /// [`IncrementalReader::read_until`].
 #[derive(Clone, Copy, Debug)]
@@ -535,6 +612,69 @@ mod tests {
                 Preprocessing library 'test-dev' for mwb-0..
                 "
             )
+        );
+    }
+
+    #[tokio::test]
+    async fn progress_timeout_ignores_unrelated_output() {
+        let (input, mut output) = tokio::io::duplex(64);
+        tokio::spawn(async move {
+            for _ in 0..5 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                output.write_all(b"server output\n").await.unwrap();
+            }
+        });
+        let mut reader = IncrementalReader::new(input).with_writer(tokio::io::sink());
+        let end_marker = AhoCorasick::from_anchored_patterns(["prompt"]);
+        let mut buffer = vec![0; LINE_BUFFER_CAPACITY];
+        let result = reader
+            .read_until_with_progress_timeout(
+                &mut ReadOpts {
+                    end_marker: &end_marker,
+                    find: FindAt::LineStart,
+                    writing: WriteBehavior::Hide,
+                    buffer: &mut buffer,
+                },
+                Duration::from_millis(35),
+                "Compiling",
+            )
+            .await
+            .unwrap();
+        assert_eq!(result, ReadUntilStatus::Inactive);
+    }
+
+    #[tokio::test]
+    async fn compiling_progress_resets_timeout_even_when_split_across_reads() {
+        let (input, mut output) = tokio::io::duplex(64);
+        tokio::spawn(async move {
+            for chunk in [
+                &b"[1 of 2] Comp"[..],
+                &b"iling Main\n"[..],
+                &b"prompt"[..],
+            ] {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+                output.write_all(chunk).await.unwrap();
+            }
+        });
+        let mut reader = IncrementalReader::new(input).with_writer(tokio::io::sink());
+        let end_marker = AhoCorasick::from_anchored_patterns(["prompt"]);
+        let mut buffer = vec![0; LINE_BUFFER_CAPACITY];
+        let result = reader
+            .read_until_with_progress_timeout(
+                &mut ReadOpts {
+                    end_marker: &end_marker,
+                    find: FindAt::LineStart,
+                    writing: WriteBehavior::Hide,
+                    buffer: &mut buffer,
+                },
+                Duration::from_millis(60),
+                "Compiling",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result,
+            ReadUntilStatus::Complete("[1 of 2] Compiling Main\n".to_owned())
         );
     }
 

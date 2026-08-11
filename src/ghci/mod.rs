@@ -42,7 +42,9 @@ mod stderr;
 pub(crate) use stderr::StderrEvent;
 use stderr::GhciStderr;
 
+mod memory;
 mod process;
+use process::kill_process_tree;
 use process::GhciProcess;
 
 pub mod manager;
@@ -96,8 +98,8 @@ use crate::shutdown::ShutdownHandle;
 use crate::CommandExt;
 use crate::StringCase;
 
-/// Upper bound for GHCi commands which can compile the complete target graph.
-const COMPILATION_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+/// Maximum time a compiling GHCi command may produce no output before it is considered wedged.
+const COMPILATION_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(2 * 60);
 
 /// Print a conspicuous diagnostic which remains visible even when tracing is filtered out.
 pub(crate) fn print_ghciwatch_error(summary: &str, details: &str) {
@@ -109,6 +111,18 @@ pub(crate) fn print_ghciwatch_error(summary: &str, details: &str) {
         "\n==GHCIWATCH ERROR==\nTimestamp (Unix): {timestamp}\nSummary: {summary}\n{details}\n==END GHCIWATCH ERROR==\n"
     );
 }
+
+/// Marks an interruption failure after GHCi has been force-killed for recovery.
+#[derive(Debug)]
+pub(crate) struct GhciRecoveryFailed;
+
+impl std::fmt::Display for GhciRecoveryFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("GHCi interruption recovery failed; the session was force-killed")
+    }
+}
+
+impl std::error::Error for GhciRecoveryFailed {}
 
 /// The `ghci` prompt we use. Should be unique enough, but maybe we can make it better with Unicode
 /// private-use-area codepoints or something in the future.
@@ -259,9 +273,12 @@ pub struct Ghci {
     opts: GhciOpts,
     /// The shutdown handle, used for performing or responding to graceful shutdowns.
     shutdown: ShutdownHandle,
+    /// PID of the process created directly from the configured `--command`.
+    process_id: Pid,
     /// The process group ID of the `ghci` session process.
     ///
-    /// This is used to send the process `Ctrl-C` (`SIGINT`) to cancel reloads or other actions.
+    /// This is used to send the process tree `Ctrl-C` (`SIGINT`) to cancel reloads or other
+    /// actions.
     process_group_id: Pid,
     /// The stdin writer.
     pub(crate) stdin: GhciStdin,
@@ -298,12 +315,15 @@ pub struct Ghci {
     command_handles: Vec<JoinHandle<eyre::Result<ExitStatus>>>,
     /// Monotonic counter for generating unique sync barrier nonces.
     sync_nonce: u64,
+    /// Set before force-killing a session whose prompt synchronization failed.
+    recovery_restart_required: bool,
 }
 
 impl Debug for Ghci {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Ghci")
-            .field("pid", &self.process_group_id)
+            .field("pid", &self.process_id)
+            .field("pgid", &self.process_group_id)
             .finish()
     }
 }
@@ -312,13 +332,21 @@ impl Ghci {
     /// Runtime details useful when diagnosing an unexpected GHCi exit.
     pub(crate) fn diagnostic_context(&self) -> String {
         format!(
-            "Component: GHCi process\nProcess group ID: {}\nWorking directory: {}\nCommand: {}",
-            self.process_group_id, self.search_paths.cwd, self.opts.command
+            "Component: configured GHCi --command process\nCommand process ID: {}\nProcess group ID: {}\nWorking directory: {}\nCommand: {}",
+            self.process_id, self.process_group_id, self.search_paths.cwd, self.opts.command
         )
+    }
+
+    pub(crate) fn process_id(&self) -> Pid {
+        self.process_id
     }
 
     pub(crate) fn process_group_id(&self) -> Pid {
         self.process_group_id
+    }
+
+    pub(crate) fn recovery_restart_required(&self) -> bool {
+        self.recovery_restart_required
     }
 }
 
@@ -329,6 +357,44 @@ impl Ghci {
         self.opts.clear();
         self.error_log.write_still_compiling().await?;
         self.restart(haskell_files).await
+    }
+
+    /// Start a replacement after failed SIGINT recovery. The old session is dead, so
+    /// before-restart GHCi hooks cannot run; after hooks and watched-target sync still do.
+    pub(crate) async fn restart_after_recovery_kill(
+        &mut self,
+        haskell_files: BTreeSet<Utf8PathBuf>,
+    ) -> eyre::Result<()> {
+        let haskell_files = haskell_files
+            .into_iter()
+            .map(|path| self.classifier.relative_path(path))
+            .collect::<eyre::Result<BTreeSet<_>>>()?;
+        self.restart_after_recovery_kill_inner(haskell_files).await
+    }
+
+    pub(crate) async fn restart_after_recovery_kill_with_known_files(
+        &mut self,
+    ) -> eyre::Result<()> {
+        let haskell_files = self.known_haskell_files.clone();
+        self.restart_after_recovery_kill_inner(haskell_files).await
+    }
+
+    async fn restart_after_recovery_kill_inner(
+        &mut self,
+        haskell_files: BTreeSet<NormalPath>,
+    ) -> eyre::Result<()> {
+        let mut log = CompilationLog::default();
+        self.opts.clear();
+        self.error_log.write_still_compiling().await?;
+        self.restart_inner(
+            &mut log,
+            [
+                LifecycleEvent::Startup(hooks::When::After),
+                LifecycleEvent::Restart(hooks::When::After),
+            ],
+            Some(haskell_files),
+        )
+        .await
     }
 }
 
@@ -423,6 +489,7 @@ impl Ghci {
                 GhciProcess {
                     shutdown,
                     restart_receiver,
+                    process_id,
                     process_group_id,
                     exited_sender: exited_sender.clone(),
                 }
@@ -441,6 +508,7 @@ impl Ghci {
         Ok(Ghci {
             opts,
             shutdown: shutdown.clone(),
+            process_id,
             process_group_id,
             stdin,
             stdout,
@@ -457,6 +525,7 @@ impl Ghci {
             },
             command_handles,
             sync_nonce: 0,
+            recovery_restart_required: false,
         })
     }
 
@@ -605,36 +674,39 @@ impl Ghci {
                 "Reloading ghci:\n{}",
                 format_bulleted_list(&actions.needs_reload)
             );
-            // Like `:unadd`, an ordinary reload can wedge inside GHC. It is not an
-            // executable eval, so the eval socket's timeout cannot interrupt it.
-            let reload = self.stdin.reload(&mut self.stdout, &mut log);
-            match tokio::time::timeout(COMPILATION_TIMEOUT, reload).await {
-                Ok(result) => {
-                    result?;
-                    self.refresh_eval_commands_for_paths(&actions.needs_reload)
-                        .await?;
-                }
-                Err(_) => {
-                    print_ghciwatch_error(
-                        "GHCi reload exceeded its compilation timeout",
-                        &format!(
-                            "Component: reload (:reload)\nTimeout: {COMPILATION_TIMEOUT:?}\nProcess group ID: {}\nWorking directory: {}\nCommand: {}\nChanged paths:\n{}\nRecovery: interrupting GHCi with process-group SIGINT and restoring prompt synchronization",
-                            self.process_group_id,
-                            self.search_paths.cwd,
-                            self.opts.command,
-                            format_bulleted_list(&actions.needs_reload),
-                        ),
-                    );
-                    tracing::warn!(
-                        "Timed out waiting for GHCi to reload after {COMPILATION_TIMEOUT:?}; interrupting reload"
-                    );
-                    self.send_sigint()
-                        .await
-                        .wrap_err("Failed to restore GHCi after timed-out reload")?;
-                    // SIGINT recovery consumes output directly, so no normal `Failed`
-                    // summary reaches the compilation log.
-                    log.mark_failed();
-                }
+            // Like `:unadd`, an ordinary reload can wedge inside GHC. It is not an executable
+            // eval, so monitor the output read itself and interrupt only if compilation goes quiet.
+            let completed = self
+                .stdin
+                .reload(
+                    &mut self.stdout,
+                    &mut log,
+                    COMPILATION_INACTIVITY_TIMEOUT,
+                )
+                .await?;
+            if completed {
+                self.refresh_eval_commands_for_paths(&actions.needs_reload)
+                    .await?;
+            } else {
+                print_ghciwatch_error(
+                    "GHCi reload stopped reporting compilation progress",
+                    &format!(
+                        "Component: reload (:reload)\nInactivity timeout: {COMPILATION_INACTIVITY_TIMEOUT:?}\nProcess group ID: {}\nWorking directory: {}\nCommand: {}\nChanged paths:\n{}\nRecovery: interrupting GHCi with process-group SIGINT and restoring prompt synchronization",
+                        self.process_group_id,
+                        self.search_paths.cwd,
+                        self.opts.command,
+                        format_bulleted_list(&actions.needs_reload),
+                    ),
+                );
+                tracing::warn!(
+                    "GHCi reported no reload compilation progress for {COMPILATION_INACTIVITY_TIMEOUT:?}; interrupting reload"
+                );
+                self.send_sigint()
+                    .await
+                    .wrap_err("Failed to restore GHCi after inactive reload")?;
+                // SIGINT recovery consumes output directly, so no normal `Failed` summary reaches
+                // the compilation log.
+                log.mark_failed();
             }
         }
 
@@ -659,13 +731,20 @@ impl Ghci {
     /// really "restarting" a session so much as starting it again. That is, this method avoids
     /// "broken pipe" errors with `--before-restart-ghci` hooks.
     #[instrument(skip_all, level = "debug")]
-    async fn startup_restart(&mut self) -> eyre::Result<()> {
+    async fn startup_restart(
+        &mut self,
+        haskell_files: BTreeSet<Utf8PathBuf>,
+    ) -> eyre::Result<()> {
         let mut log = CompilationLog::default();
+        let haskell_files = haskell_files
+            .into_iter()
+            .map(|path| self.classifier.relative_path(path))
+            .collect::<eyre::Result<BTreeSet<_>>>()?;
 
         self.restart_inner(
             &mut log,
             [LifecycleEvent::Startup(hooks::When::After)],
-            None,
+            Some(haskell_files),
         )
         .await?;
 
@@ -934,34 +1013,37 @@ impl Ghci {
             }
         }
 
-        // Like `:reload` and `:unadd`, `:add` compiles the target set and can wedge
-        // inside GHC. The reload operation owns the eval barrier, so the executable-eval
-        // timeout cannot help. Bound this command directly and restore prompt synchronization
-        // with the normal SIGINT recovery machinery.
-        let add = self.stdin.add_modules(&mut self.stdout, &modules, log);
-        match tokio::time::timeout(COMPILATION_TIMEOUT, add).await {
-            Ok(result) => result?,
-            Err(_) => {
-                print_ghciwatch_error(
-                    "GHCi module addition exceeded its compilation timeout",
-                    &format!(
-                        "Component: target synchronization (:add)\nTimeout: {COMPILATION_TIMEOUT:?}\nProcess group ID: {}\nWorking directory: {}\nCommand: {}\nAdded paths:\n{}\nRecovery: interrupting GHCi with process-group SIGINT and restoring prompt synchronization",
-                        self.process_group_id,
-                        self.search_paths.cwd,
-                        self.opts.command,
-                        format_bulleted_list(paths),
-                    ),
-                );
-                tracing::warn!(
-                    "Timed out waiting for GHCi to finish :add after {COMPILATION_TIMEOUT:?}; interrupting module compilation"
-                );
-                self.send_sigint()
-                    .await
-                    .wrap_err("Failed to restore GHCi after timed-out :add")?;
-                // SIGINT recovery consumes the interrupted command's output itself, so
-                // CompilationLog cannot observe a normal `Failed` summary.
-                log.mark_failed();
-            }
+        // Like `:reload` and `:unadd`, `:add` compiles the target set and can wedge inside GHC.
+        // Monitor stdout activity rather than imposing an absolute compilation duration.
+        let completed = self
+            .stdin
+            .add_modules(
+                &mut self.stdout,
+                &modules,
+                log,
+                COMPILATION_INACTIVITY_TIMEOUT,
+            )
+            .await?;
+        if !completed {
+            print_ghciwatch_error(
+                "GHCi module addition stopped reporting compilation progress",
+                &format!(
+                    "Component: target synchronization (:add)\nInactivity timeout: {COMPILATION_INACTIVITY_TIMEOUT:?}\nProcess group ID: {}\nWorking directory: {}\nCommand: {}\nAdded paths:\n{}\nRecovery: interrupting GHCi with process-group SIGINT and restoring prompt synchronization",
+                    self.process_group_id,
+                    self.search_paths.cwd,
+                    self.opts.command,
+                    format_bulleted_list(paths),
+                ),
+            );
+            tracing::warn!(
+                "GHCi reported no :add compilation progress for {COMPILATION_INACTIVITY_TIMEOUT:?}; interrupting module compilation"
+            );
+            self.send_sigint()
+                .await
+                .wrap_err("Failed to restore GHCi after inactive :add")?;
+            // SIGINT recovery consumes the interrupted command's output itself, so
+            // CompilationLog cannot observe a normal `Failed` summary.
+            log.mark_failed();
         }
 
         // TODO: This could lead to the module set getting out of sync with the underlying GHCi
@@ -1063,33 +1145,36 @@ impl Ghci {
         // one.
         //
         // GHCi can occasionally wedge in that implicit reload. The executable-eval timeout cannot
-        // help here: reload owns the eval barrier and the GHCi mutex. Bound the command itself and
-        // restore the prompt with the same interrupt machinery used for superseded reloads. GHCi
-        // updates its target set before starting the implicit reload, so after recovery the unadd
-        // has taken effect and it is safe to update our target bookkeeping below.
-        let unadd = self
+        // help here because reload owns the eval barrier and mutex, so monitor output inactivity.
+        // GHCi updates its target set before starting the implicit reload; after recovery it is safe
+        // to update our target bookkeeping below.
+        let completed = self
             .stdin
-            .remove_modules(&mut self.stdout, modules.iter().map(Borrow::borrow), log);
-        match tokio::time::timeout(COMPILATION_TIMEOUT, unadd).await {
-            Ok(result) => result?,
-            Err(_) => {
-                print_ghciwatch_error(
-                    "GHCi module removal exceeded its compilation timeout",
-                    &format!(
-                        "Component: target synchronization (:unadd, including its implicit reload)\nTimeout: {COMPILATION_TIMEOUT:?}\nProcess group ID: {}\nWorking directory: {}\nCommand: {}\nRemoved paths:\n{}\nRecovery: interrupting GHCi with process-group SIGINT and restoring prompt synchronization",
-                        self.process_group_id,
-                        self.search_paths.cwd,
-                        self.opts.command,
-                        format_bulleted_list(paths),
-                    ),
-                );
-                tracing::warn!(
-                    "Timed out waiting for GHCi to finish :unadd after {COMPILATION_TIMEOUT:?}; interrupting its implicit reload"
-                );
-                self.send_sigint()
-                    .await
-                    .wrap_err("Failed to restore GHCi after timed-out :unadd")?;
-            }
+            .remove_modules(
+                &mut self.stdout,
+                modules.iter().map(Borrow::borrow),
+                log,
+                COMPILATION_INACTIVITY_TIMEOUT,
+            )
+            .await?;
+        if !completed {
+            print_ghciwatch_error(
+                "GHCi module removal stopped reporting compilation progress",
+                &format!(
+                    "Component: target synchronization (:unadd, including its implicit reload)\nInactivity timeout: {COMPILATION_INACTIVITY_TIMEOUT:?}\nProcess group ID: {}\nWorking directory: {}\nCommand: {}\nRemoved paths:\n{}\nRecovery: interrupting GHCi with process-group SIGINT and restoring prompt synchronization",
+                    self.process_group_id,
+                    self.search_paths.cwd,
+                    self.opts.command,
+                    format_bulleted_list(paths),
+                ),
+            );
+            tracing::warn!(
+                "GHCi reported no :unadd compilation progress for {COMPILATION_INACTIVITY_TIMEOUT:?}; interrupting its implicit reload"
+            );
+            self.send_sigint()
+                .await
+                .wrap_err("Failed to restore GHCi after inactive :unadd")?;
+            log.mark_failed();
         }
         for path in paths {
             self.targets.remove_source_path(path);
@@ -1112,12 +1197,32 @@ impl Ghci {
 
     /// Interrupt the running GHCi session.
     ///
-    /// On `Err`, the GHCi session may have been killed (e.g. because the sync
-    /// barrier could not restore the prompt). Callers MUST treat an error here
-    /// as a session-died event and route through the normal restart path
-    /// rather than propagating it as fatal. See [`Ghci::sync_barrier`] for details.
+    /// On `Err`, this method attempts to force-kill GHCi because its prompt state cannot be
+    /// trusted. Callers MUST consume the process-exit notification and start a fresh session when
+    /// the kill succeeds, rather than propagating the recovery error as fatal.
     #[instrument(skip_all, level = "debug")]
     pub(crate) async fn send_sigint(&mut self) -> eyre::Result<()> {
+        match self.send_sigint_inner().await {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                // No caller may continue using a session whose prompt synchronization is
+                // uncertain. Force an exit so the manager can replace it.
+                self.recovery_restart_required = true;
+                match kill_process_tree(self.process_id, self.process_group_id) {
+                    Ok(()) => {}
+                    Err(kill_error) => {
+                        return Err(kill_error)
+                            .wrap_err("Failed to kill GHCi process tree after unsuccessful recovery")
+                            .wrap_err(format!("Original prompt-recovery error: {error:#}"))
+                            .wrap_err(GhciRecoveryFailed);
+                    }
+                }
+                Err(error).wrap_err(GhciRecoveryFailed)
+            }
+        }
+    }
+
+    async fn send_sigint_inner(&mut self) -> eyre::Result<()> {
         let start_instant = Instant::now();
 
         // Phase 1: Send SIGINT repeatedly until we find a clean, uninterrupted prompt.
@@ -1200,9 +1305,8 @@ impl Ghci {
 
         // From here until the prompt is restored, any failure leaves the session
         // unable to match `PROMPT` again. Restoring in-band after a failed read
-        // is not safe (the buffer is in an unknown state, and confirming the
-        // restore would itself depend on prompt matching), so on any error we
-        // SIGKILL the process and let the manager restart the session.
+        // is not safe, so return the error to `send_sigint`; its outer recovery
+        // boundary marks and force-kills the session before notifying the manager.
         let sync_timeout = Duration::from_secs(3);
         let read =
             tokio::time::timeout(sync_timeout, self.stdout.read_until_marker(&sync_marker)).await;
@@ -1225,24 +1329,9 @@ impl Ghci {
             )),
         };
 
-        if let Err(e) = result {
-            // Kill the process directly rather than going through `restart_sender`.
-            // `restart_sender` is the graceful-shutdown path: `GhciProcess` consumes it
-            // and intentionally suppresses `exited_sender`, so the manager would never
-            // learn ghci died. We need the wait future in `GhciProcess::run` to win the
-            // select so `exited_sender` fires and `wait_and_restart_runtime` takes over.
-            if let Err(kill_err) = signal::killpg(self.process_group_id, Signal::SIGKILL)
-                .wrap_err("Failed to send `SIGKILL` to ghci session")
-            {
-                tracing::error!(
-                    error = %kill_err,
-                    "Failed to SIGKILL ghci after sync_barrier failure",
-                );
-            }
-            return Err(e).wrap_err(
-                "ghci sync barrier failed; killed the session because the prompt could not be restored",
-            );
-        }
+        result.wrap_err(
+            "ghci sync barrier failed because the prompt could not be restored",
+        )?;
         Ok(())
     }
 
