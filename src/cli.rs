@@ -61,6 +61,12 @@ pub struct Opts {
     #[arg(long, alias = "allow-eval")]
     pub enable_eval: bool,
 
+    /// Unix socket used for executable evaluation requests.
+    ///
+    /// Give each simultaneous ghciwatch session a different path to expose eval for all of them.
+    #[arg(long, value_name = "PATH", default_value = "ghciwatch-eval.sock")]
+    pub eval_socket: Utf8PathBuf,
+
     /// An extra directory for converting module paths to module names and vice versa, in
     /// addition to the module import search paths from GHCi's `:show paths` output.
     ///

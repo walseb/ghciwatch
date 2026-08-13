@@ -1,6 +1,3 @@
-use std::time::Duration;
-use std::time::Instant;
-
 use backoff::backoff::Backoff;
 use backoff::ExponentialBackoff;
 use eyre::Context;
@@ -22,13 +19,8 @@ pub enum StderrEvent {
     /// Clear the buffer contents and acknowledge when it has been cleared.
     ClearBuffer { sender: oneshot::Sender<()> },
 
-    /// Get the buffer contents since the last `ClearBuffer` event.
-    GetBuffer { sender: oneshot::Sender<String> },
-
     /// Read through an exact marker line and return the preceding buffered output.
-    ///
-    /// Unlike `GetBuffer`, this provides a cross-pipe ordering guarantee: once the
-    /// marker written by GHCi has been consumed, all earlier stderr is in the buffer.
+    /// Once the marker written by GHCi has been consumed, all earlier stderr is in the buffer.
     GetBufferThrough {
         marker: String,
         ready: oneshot::Sender<()>,
@@ -95,9 +87,6 @@ impl GhciStderr {
                 self.clear_buffer().await;
                 let _ = sender.send(());
             }
-            StderrEvent::GetBuffer { sender } => {
-                self.get_buffer(sender).await?;
-            }
             StderrEvent::GetBufferThrough {
                 marker,
                 ready,
@@ -132,49 +121,22 @@ impl GhciStderr {
         mut sender: oneshot::Sender<String>,
     ) -> eyre::Result<()> {
         loop {
-            // The eval future can be cancelled on timeout. Do not strand the
-            // stderr task waiting for a marker that was never written; doing so
-            // would also block every later compilation-log request.
+            // A caller can be cancelled after registering a marker but before writing it. Do not
+            // strand the stderr task: that would block every later synchronization request.
             let line = tokio::select! {
                 _ = sender.closed() => return Ok(()),
                 line = self.reader.next_line() => line,
             }
-            .wrap_err("Failed to read stderr while waiting for eval marker")?
-            .ok_or_else(|| eyre::eyre!("GHCi stderr closed while waiting for eval marker"))?;
+            .wrap_err("Failed to read stderr while waiting for synchronization marker")?
+            .ok_or_else(|| {
+                eyre::eyre!("GHCi stderr closed while waiting for synchronization marker")
+            })?;
             if line == marker {
                 break;
             }
             self.ingest_line(line).await?;
         }
         let _ = sender.send(self.buffer.clone());
-        Ok(())
-    }
-    #[instrument(skip(self, sender), level = "debug")]
-    async fn get_buffer(&mut self, sender: oneshot::Sender<String>) -> eyre::Result<()> {
-        // Read lines from the stderr stream until we can't read a line within 0.05 seconds.
-        //
-        // This helps make sure we've read all the available data.
-        //
-        // In testing, this takes ~52ms.
-        let start_instant = Instant::now();
-        while let Ok(maybe_line) =
-            tokio::time::timeout(Duration::from_millis(50), self.reader.next_line()).await
-        {
-            match maybe_line.wrap_err("Failed to read stderr line")? {
-                Some(line) => {
-                    self.ingest_line(line).await?;
-                }
-                None => {
-                    tracing::debug!("No more lines available from stderr");
-                    break;
-                }
-            }
-        }
-        tracing::debug!("Drained stderr buffer in {:.2?}", start_instant.elapsed());
-
-        // TODO: Does it make more sense to clear the buffer here?
-        let _ = sender.send(self.buffer.clone());
-
         Ok(())
     }
 }

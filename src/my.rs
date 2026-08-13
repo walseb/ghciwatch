@@ -64,41 +64,52 @@ impl Drop for SocketLease {
 pub(crate) async fn spawn(
     ghci: Arc<Mutex<Ghci>>,
     barrier: Arc<EvalBarrier>,
+    path: PathBuf,
 ) -> eyre::Result<()> {
-    let directory = std::env::current_dir()?;
-    let path = directory.join("ghciwatch-eval.sock");
-    let lock_path = directory.join("ghciwatch-eval.lock");
+    let lock_path = path.with_extension("lock");
 
-    // `flock` waits without polling and the kernel releases it even after a
-    // crash or SIGKILL. Do the blocking operation away from Tokio's workers.
-    let lock = tokio::task::spawn_blocking(move || acquire_lock(&lock_path))
+    // The eval endpoint is optional when another ghciwatch session already owns it.
+    // Never wait for that session: doing so would leave this session's initialized GHCi
+    // manager unable to consume the file events produced by its watcher.
+    let Some(lock) = tokio::task::spawn_blocking(move || try_acquire_lock(&lock_path))
         .await
-        .wrap_err("Eval socket lock task failed")??;
+        .wrap_err("Eval socket lock task failed")??
+    else {
+        tracing::info!(
+            path = %path.display(),
+            "Another ghciwatch session owns the eval socket; continuing without executable eval"
+        );
+        return Ok(());
+    };
 
     // Only the lock owner may remove this path. It may remain after an
     // unclean shutdown, but cannot belong to a live cooperating process.
     match std::fs::remove_file(&path) {
         Ok(()) => tracing::debug!(path = %path.display(), "Removed stale eval socket"),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error).wrap_err("Failed to remove stale ghciwatch-eval.sock"),
+        Err(error) => return Err(error).wrap_err("Failed to remove stale eval socket"),
     }
 
-    let listener = UnixListener::bind(&path).wrap_err("Failed to bind ghciwatch-eval.sock")?;
+    let listener = UnixListener::bind(&path)
+        .wrap_err_with(|| format!("Failed to bind eval socket {}", path.display()))?;
     let lease = SocketLease { path, _lock: lock };
     tokio::spawn(run(listener, lease, ghci, barrier));
     Ok(())
 }
 
-fn acquire_lock(path: &Path) -> eyre::Result<File> {
+fn try_acquire_lock(path: &Path) -> eyre::Result<Option<File>> {
     let lock = OpenOptions::new()
         .create(true)
         .read(true)
         .write(true)
         .open(path)
         .wrap_err_with(|| format!("Failed to open {}", path.display()))?;
-    flock(lock.as_raw_fd(), FlockArg::LockExclusive)
-        .wrap_err_with(|| format!("Failed to lock {}", path.display()))?;
-    Ok(lock)
+    match flock(lock.as_raw_fd(), FlockArg::LockExclusiveNonblock) {
+        Ok(()) => Ok(Some(lock)),
+        Err(nix::errno::Errno::EWOULDBLOCK) => Ok(None),
+        Err(error) => Err(error)
+            .wrap_err_with(|| format!("Failed to lock {}", path.display())),
+    }
 }
 
 async fn run(
@@ -160,14 +171,29 @@ async fn handle_connection(
     // of GHCi's pipes and a reload arriving during an eval waits for it to finish.
     let operation_guard = barrier.begin_operation().await;
     let mut ghci = ghci.lock().await;
-    let output = eval_socket_command(&mut ghci, command)
+    let output = match eval_socket_command(&mut ghci, command)
         .await
-        .wrap_err("Failed to evaluate socket command")?;
+        .wrap_err("Failed to evaluate socket command")
+    {
+        Ok(output) => output,
+        Err(error) => {
+            tracing::error!(?error, "Eval socket command failed");
+            format!("Error: ghciwatch executable eval failed: {error:#}")
+        }
+    };
     // The client may be slow or disappear. GHCi is free as soon as evaluation is
     // complete; socket delivery must not delay a queued reload or another eval.
     drop(ghci);
     drop(operation_guard);
-    if let Err(error) = socket.write_all(output.as_bytes()).await {
+    // An empty successful GHCi command is still a response. Send one delimiter in
+    // that case so DelimitedEnd clients can distinguish it from EOF before response,
+    // while preserving the historical EOF-terminated form for nonempty responses.
+    let response = if output.is_empty() {
+        COMMAND_TERMINATOR
+    } else {
+        output.as_bytes()
+    };
+    if let Err(error) = socket.write_all(response).await {
         if is_disconnected_client(&error) {
             tracing::debug!(%error, "Eval client disconnected before reading the response");
             return Ok(());
@@ -319,13 +345,15 @@ async fn stderr_through_marker(ghci: &mut Ghci) -> eyre::Result<String> {
         .stdin
         .write_all(format!(":! printf '%s\\n' '{marker}' >&2\n").as_bytes())
         .await?;
-    // Consume the marker command's stdout prompt as well as its stderr marker.
+    // Consume the marker command's stdout prompt as well as its stderr marker. The shell
+    // command intentionally emits no stdout, so GHCi may print this prompt immediately after
+    // the previously consumed prompt with no intervening newline.
     let _ = ghci
         .stdout
         .reader
         .read_until(&mut ReadOpts {
             end_marker: &ghci.stdout.prompt_patterns,
-            find: FindAt::LineStart,
+            find: FindAt::Anywhere,
             writing: WriteBehavior::NoFinalLine,
             buffer: &mut ghci.stdout.buffer,
         })

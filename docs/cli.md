@@ -78,6 +78,15 @@ Evaluate Haskell code in comments.
 This parses line commands starting with `-- $>` or multiline commands delimited by `{- $>` and `<$ -}` and evaluates them after reloads.
 
 </dd>
+<dt><a id="--eval-socket" href="#--eval-socket"><code>--eval-socket &lt;PATH&gt;</code></a></dt><dd>
+
+Unix socket used for executable evaluation requests.
+
+Give each simultaneous ghciwatch session a different path to expose eval for all of them.
+
+[default: ghciwatch-eval.sock]
+
+</dd>
 <dt><a id="--extra-module-search-path" href="#--extra-module-search-path"><code>--extra-module-search-path &lt;PATH&gt;</code></a></dt><dd>
 
 An extra directory for converting module paths to module names and vice versa, in addition to the module import search paths from GHCi's `:show paths` output.

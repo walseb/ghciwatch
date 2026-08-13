@@ -2,6 +2,8 @@ use std::time::Duration;
 
 use aho_corasick::AhoCorasick;
 use eyre::Context;
+use tokio::io::AsyncWriteExt;
+use tokio::process::ChildStdin;
 use tokio::process::ChildStdout;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
@@ -33,24 +35,63 @@ pub struct GhciStdout {
     pub prompt_patterns: AhoCorasick,
     /// A buffer to read data into. Lets us avoid allocating buffers in the [`IncrementalReader`].
     pub buffer: Vec<u8>,
+    /// Nonce used to make stderr synchronization markers unique within this session.
+    pub stderr_sync_nonce: u64,
 }
 
 impl GhciStdout {
     #[instrument(skip_all, level = "debug")]
-    async fn parse_into_log(&self, data: &str, log: &mut CompilationLog) -> eyre::Result<()> {
-        // Parse GHCi output into compiler messages.
-        //
-        // These include diagnostics, which modules were compiled, and a compilation summary.
-        let stderr_data = {
-            let (sender, receiver) = oneshot::channel();
-            self.stderr_sender
-                .send(StderrEvent::GetBuffer { sender })
-                .await?;
-            receiver.await?
-        };
+    async fn parse_into_log(
+        &mut self,
+        stdin: &mut ChildStdin,
+        data: &str,
+        log: &mut CompilationLog,
+    ) -> eyre::Result<()> {
+        // Stdout and stderr are independent pipes. A stdout prompt does not prove that the stderr
+        // task has consumed all diagnostics emitted by the command. Submit a subsequent marker
+        // command and read stderr through it before parsing the operation's output.
+        let stderr_data = self.stderr_buffer_through_marker(stdin).await?;
         log.extend(parse_ghc_messages(data).wrap_err("Failed to parse compiler output")?);
         log.extend(parse_ghc_messages(&stderr_data).wrap_err("Failed to parse compiler output")?);
         Ok(())
+    }
+
+    async fn stderr_buffer_through_marker(
+        &mut self,
+        stdin: &mut ChildStdin,
+    ) -> eyre::Result<String> {
+        let marker = format!(
+            "__GHCIWATCH_STDERR_END_{}_{}__",
+            std::process::id(),
+            self.stderr_sync_nonce
+        );
+        self.stderr_sync_nonce = self.stderr_sync_nonce.wrapping_add(1);
+        let (ready_sender, ready_receiver) = oneshot::channel();
+        let (sender, receiver) = oneshot::channel();
+        self.stderr_sender
+            .send(StderrEvent::GetBufferThrough {
+                marker: marker.clone(),
+                ready: ready_sender,
+                sender,
+            })
+            .await?;
+        ready_receiver.await?;
+
+        stdin
+            .write_all(format!(":! printf '%s\\n' '{marker}' >&2\n").as_bytes())
+            .await?;
+        // Consume the marker command's stdout prompt. The shell command emits no stdout, so GHCi
+        // may print this prompt directly after the previously consumed prompt, without a newline.
+        let _ = self
+            .reader
+            .read_until(&mut ReadOpts {
+                end_marker: &self.prompt_patterns,
+                find: FindAt::Anywhere,
+                writing: WriteBehavior::NoFinalLine,
+                buffer: &mut self.buffer,
+            })
+            .await?;
+        Ok(receiver.await?)
     }
 
     #[instrument(skip_all, name = "stdout_initialize", level = "debug")]
@@ -72,7 +113,11 @@ impl GhciStdout {
             .await?;
         tracing::debug!(data, "ghci started, saw version marker");
 
-        self.parse_into_log(&data, log).await?;
+        // The configured prompt is not active yet, so initialization cannot use a marker command.
+        // Parse startup stdout now, but leave stderr buffered. `GhciStdin::initialize` installs the
+        // prompt without clearing stderr and then uses the normal marker boundary to collect every
+        // startup diagnostic, including output delayed beyond the version banner.
+        log.extend(parse_ghc_messages(&data).wrap_err("Failed to parse compiler output")?);
 
         Ok(())
     }
@@ -91,7 +136,12 @@ impl GhciStdout {
     }
 
     #[instrument(skip_all, level = "debug")]
-    pub async fn prompt(&mut self, find: FindAt, log: &mut CompilationLog) -> eyre::Result<()> {
+    pub async fn prompt(
+        &mut self,
+        stdin: &mut ChildStdin,
+        find: FindAt,
+        log: &mut CompilationLog,
+    ) -> eyre::Result<()> {
         let data = self
             .reader
             .read_until(&mut ReadOpts {
@@ -103,7 +153,7 @@ impl GhciStdout {
             .await?;
         tracing::debug!(bytes = data.len(), "Got data from ghci");
 
-        self.parse_into_log(&data, log).await?;
+        self.parse_into_log(stdin, &data, log).await?;
         Ok(())
     }
 
@@ -112,6 +162,7 @@ impl GhciStdout {
     #[instrument(skip_all, level = "debug")]
     pub async fn prompt_with_progress_timeout(
         &mut self,
+        stdin: &mut ChildStdin,
         find: FindAt,
         log: &mut CompilationLog,
         progress_timeout: Duration,
@@ -132,7 +183,7 @@ impl GhciStdout {
         match result {
             ReadUntilStatus::Complete(data) => {
                 tracing::debug!(bytes = data.len(), "Got data from ghci");
-                self.parse_into_log(&data, log).await?;
+                self.parse_into_log(stdin, &data, log).await?;
                 Ok(true)
             }
             ReadUntilStatus::Inactive => Ok(false),

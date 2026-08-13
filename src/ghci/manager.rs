@@ -102,6 +102,7 @@ pub async fn run_ghci(
     // This function is pretty tricky! We need to handle shutdowns at each stage, and the process
     // is a little different each time, so the `select!`s can't be consolidated.
 
+    let eval_socket = opts.eval_socket.clone().into_std_path_buf();
     let interrupt_reloads = opts.interrupt_reloads;
     let classifier = opts.file_classifier()?;
     let (exited_sender, mut exited_receiver) = mpsc::channel::<ExitStatus>(1);
@@ -162,7 +163,7 @@ pub async fn run_ghci(
 
     let ghci = Arc::new(Mutex::new(ghci));
     let eval_barrier = crate::my::EvalBarrier::new();
-    crate::my::spawn(ghci.clone(), eval_barrier.clone()).await?;
+    crate::my::spawn(ghci.clone(), eval_barrier.clone(), eval_socket).await?;
     let mut memory_watchdog = tokio::time::interval(MEMORY_WATCHDOG_INTERVAL);
     memory_watchdog.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let manager = GhciManager {

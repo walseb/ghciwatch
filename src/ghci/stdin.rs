@@ -37,7 +37,7 @@ impl GhciStdin {
     ) -> eyre::Result<()> {
         stdout.clear_stderr_buffer().await?;
         self.stdin.write_all(line.as_bytes()).await?;
-        stdout.prompt(find, log).await
+        stdout.prompt(&mut self.stdin, find, log).await
     }
 
     /// Write a line on `stdin` and wait for a prompt on stdout.
@@ -65,7 +65,12 @@ impl GhciStdin {
         stdout.clear_stderr_buffer().await?;
         self.stdin.write_all(line.as_bytes()).await?;
         stdout
-            .prompt_with_progress_timeout(FindAt::LineStart, log, progress_timeout)
+            .prompt_with_progress_timeout(
+                &mut self.stdin,
+                FindAt::LineStart,
+                log,
+                progress_timeout,
+            )
             .await
     }
 
@@ -110,7 +115,7 @@ impl GhciStdin {
     ) -> eyre::Result<()> {
         stdout.clear_stderr_buffer().await?;
         self.write_set_prompt(prompt).await?;
-        stdout.prompt(find, log).await
+        stdout.prompt(&mut self.stdin, find, log).await
     }
 
     #[instrument(skip(self, stdout), name = "stdin_initialize", level = "debug")]
@@ -119,9 +124,11 @@ impl GhciStdin {
         stdout: &mut GhciStdout,
         log: &mut CompilationLog,
     ) -> eyre::Result<()> {
-        // We tell stdout/stderr we're compiling for the first prompt because this includes all the
-        // module compilation before the first prompt.
-        self.set_prompt(stdout, PROMPT, FindAt::Anywhere, log)
+        // Startup compilation continues after the version banner. Do not clear stderr here: the
+        // marker synchronized by `prompt` captures all startup diagnostics through this command.
+        self.write_set_prompt(PROMPT).await?;
+        stdout
+            .prompt(&mut self.stdin, FindAt::Anywhere, log)
             .await?;
         self.write_line(stdout, &format!(":set prompt-cont {PROMPT}\n"), log)
             .await?;

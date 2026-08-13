@@ -6,11 +6,12 @@
 //! can start `cabal test`, batch GHC compiler processes, GCC, and the linker. Summing their RSS
 //! can therefore restart a healthy interactive session.
 //!
-//! Memory accounting charges only the persistent GHC process running with an exact
-//! `--interactive` argument. It does not charge the configured command wrapper (often `cabal`) or
-//! any child of the interactive GHC. The shallowest interactive descendant is the session GHC; a
-//! nested GHCi launched by evaluated code is deeper. Ancestry, rather than process-group
-//! membership, identifies the session because wrappers may put descendants in another group.
+//! Memory accounting charges only the persistent GHC process at the known process-tree position:
+//! three edges below ghciwatch, and therefore two edges below the configured command process stored
+//! by `Ghci`. The candidate must have an exact `--interactive` argument and resolve through
+//! `/proc/PID/exe` to a GHC executable. Looking at exactly that depth avoids charging processes
+//! spawned by the interactive GHC. Ancestry, rather than process-group membership, identifies the
+//! session because wrappers may put descendants in another group.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -23,6 +24,7 @@ struct Process {
     process_group_id: i32,
     resident_bytes: u64,
     interactive: bool,
+    ghc_executable: bool,
 }
 
 /// Resident memory belonging to the persistent interactive GHC process.
@@ -66,7 +68,7 @@ impl MemoryUsage {
     }
 }
 
-/// Read RSS for the shallowest `--interactive` GHC descended from the direct command.
+/// Read RSS for the interactive GHC exactly two edges below the direct command.
 pub(super) fn repl_resident_memory(
     command_pid: i32,
     process_group_id: i32,
@@ -107,6 +109,9 @@ fn process_snapshot() -> io::Result<BTreeMap<i32, Process>> {
                     .any(|argument| argument == b"--interactive")
             })
             .unwrap_or(false);
+        let ghc_executable = fs::read_link(entry.path().join("exe"))
+            .ok()
+            .is_some_and(|path| is_ghc_executable(&path));
         processes.insert(
             pid,
             Process {
@@ -115,6 +120,7 @@ fn process_snapshot() -> io::Result<BTreeMap<i32, Process>> {
                 process_group_id,
                 resident_bytes,
                 interactive,
+                ghc_executable,
             },
         );
     }
@@ -134,13 +140,10 @@ fn select_repl_processes(
     let interactive_ghc = if command_is_current {
         processes
             .values()
-            .filter(|process| process.interactive)
-            .filter_map(|process| {
-                descendant_depth(process.pid, command_pid, processes)
-                    .map(|depth| (depth, process.pid, process.resident_bytes))
-            })
-            .min_by_key(|(depth, pid, _)| (*depth, *pid))
-            .map(|(_, pid, bytes)| (pid, bytes))
+            .filter(|process| process.interactive && process.ghc_executable)
+            .filter(|process| descendant_depth(process.pid, command_pid, processes) == Some(2))
+            .min_by_key(|process| process.pid)
+            .map(|process| (process.pid, process.resident_bytes))
     } else {
         None
     };
@@ -150,6 +153,14 @@ fn select_repl_processes(
         command_pid,
         interactive_ghc,
     }
+}
+
+fn is_ghc_executable(path: &std::path::Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            name == "ghc" || name.strip_prefix("ghc-").is_some_and(|version| !version.is_empty())
+        })
 }
 
 fn descendant_depth(
@@ -228,42 +239,68 @@ mod tests {
             process_group_id: 10,
             resident_bytes: mib * 1024 * 1024,
             interactive,
+            ghc_executable: interactive,
         }
     }
 
     #[test]
-    fn counts_only_main_interactive_ghc() {
+    fn counts_only_main_interactive_ghc_at_the_expected_depth() {
         let processes = BTreeMap::from([
             (10, process(10, 1, false, 2_000)), // cabal repl; not charged
             (11, process(11, 10, false, 20)), // cabal setup wrapper
             (12, process(12, 11, true, 12_000)), // persistent GHCi
-            (20, process(20, 12, false, 8_000)), // cabal test
-            (21, process(21, 20, false, 6_000)), // batch GHC
-            (22, process(22, 20, true, 4_000)), // nested ghci launched by a test
+            (13, process(13, 12, true, 11_000)), // nested GHCi; too deep
+            (20, process(20, 10, true, 4_000)), // other GHCi; too shallow
         ]);
         let usage = select_repl_processes(10, 10, &processes);
         assert_eq!(usage.bytes, 12_000 * 1024 * 1024);
-        assert_eq!(usage.interactive_ghc, Some((12, 12_000 * 1024 * 1024)));
+        assert_eq!(
+            usage.interactive_ghc,
+            Some((12, 12_000 * 1024 * 1024))
+        );
     }
 
     #[test]
-    fn counts_a_direct_interactive_ghc() {
-        let processes = BTreeMap::from([(10, process(10, 1, true, 12_000))]);
+    fn rejects_a_non_ghc_executable_at_the_expected_depth() {
+        let mut candidate = process(12, 11, true, 12_000);
+        candidate.ghc_executable = false;
+        let processes = BTreeMap::from([
+            (10, process(10, 1, false, 100)),
+            (11, process(11, 10, false, 20)),
+            (12, candidate),
+        ]);
         let usage = select_repl_processes(10, 10, &processes);
-        assert_eq!(usage.bytes, 12_000 * 1024 * 1024);
-        assert_eq!(usage.interactive_ghc, Some((10, 12_000 * 1024 * 1024)));
+        assert_eq!(usage.bytes, 0);
+        assert_eq!(usage.interactive_ghc, None);
     }
 
     #[test]
-    fn finds_an_interactive_descendant_in_another_process_group() {
+    fn finds_the_expected_ghc_in_another_process_group() {
         let mut processes = BTreeMap::from([
             (10, process(10, 1, false, 100)),
-            (11, process(11, 10, true, 12_000)),
+            (11, process(11, 10, false, 20)),
+            (12, process(12, 11, true, 12_000)),
         ]);
-        processes.get_mut(&11).unwrap().process_group_id = 11;
+        processes.get_mut(&12).unwrap().process_group_id = 12;
         let usage = select_repl_processes(10, 10, &processes);
         assert_eq!(usage.bytes, 12_000 * 1024 * 1024);
-        assert_eq!(usage.interactive_ghc, Some((11, 12_000 * 1024 * 1024)));
+        assert_eq!(
+            usage.interactive_ghc,
+            Some((12, 12_000 * 1024 * 1024))
+        );
+    }
+
+    #[test]
+    fn recognizes_versioned_ghc_executables() {
+        assert!(is_ghc_executable(std::path::Path::new(
+            "/nix/store/x/bin/ghc"
+        )));
+        assert!(is_ghc_executable(std::path::Path::new(
+            "/nix/store/x/bin/ghc-9.14.1"
+        )));
+        assert!(!is_ghc_executable(std::path::Path::new(
+            "/nix/store/x/bin/ghciwatch"
+        )));
     }
 
     #[test]
