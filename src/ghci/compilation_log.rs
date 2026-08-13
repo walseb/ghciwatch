@@ -1,5 +1,3 @@
-use camino::Utf8Path;
-
 use crate::ghci::parse::CompilationResult;
 use crate::ghci::parse::CompilationSummary;
 use crate::ghci::parse::GhcDiagnostic;
@@ -16,14 +14,6 @@ pub struct CompilationLog {
 }
 
 impl CompilationLog {
-    /// Make the diagnostic paths for this log relative to a different directory.
-    pub fn relocate(&mut self, old_base: &Utf8Path, new_base: &Utf8Path) -> eyre::Result<()> {
-        for diagnostic in self.diagnostics.iter_mut() {
-            diagnostic.make_relative_to(old_base, new_base)?;
-        }
-        Ok(())
-    }
-
     /// If we start up in `--repl-no-load`, we don't get a compilation summary, but we don't want to
     /// leave the error log empty, so we synthesize an "All good (0 modules)" message.
     pub fn fill_empty_summary(&mut self) {

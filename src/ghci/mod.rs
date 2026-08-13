@@ -39,8 +39,8 @@ mod stdout;
 use stdout::GhciStdout;
 
 mod stderr;
-pub(crate) use stderr::StderrEvent;
 use stderr::GhciStderr;
+pub(crate) use stderr::StderrEvent;
 
 mod memory;
 mod process;
@@ -154,6 +154,10 @@ pub struct GhciOpts {
     pub extra_search_paths: Vec<Utf8PathBuf>,
     /// Lifecycle hooks, mostly `ghci` commands to run at certain points.
     pub hooks: HookOpts,
+    /// Shell commands to run synchronously before sending SIGINT.
+    pub before_interrupt: Vec<ClonableCommand>,
+    /// Shell commands to run synchronously before sending SIGKILL.
+    pub before_kill: Vec<ClonableCommand>,
     /// Restart the `ghci` session when paths matching these globs are changed.
     pub restart_globs: GlobMatcher,
     /// Reload the `ghci` session when paths matching these globs are changed.
@@ -244,6 +248,8 @@ impl GhciOpts {
                     .map(|path| path.absolute().to_owned())
                     .collect(),
                 hooks: opts.hooks.clone(),
+                before_interrupt: opts.before_interrupt.clone(),
+                before_kill: opts.before_kill.clone(),
                 restart_globs: opts.watch.restart_globs()?,
                 reload_globs: opts.watch.reload_globs()?,
                 interrupt_reloads: opts.interrupt_reloads(),
@@ -363,7 +369,6 @@ impl Ghci {
     pub(crate) async fn restart_for_memory_watchdog(&mut self) -> eyre::Result<()> {
         let haskell_files = self.known_haskell_files.clone();
         self.opts.clear();
-        self.error_log.write_still_compiling().await?;
         self.restart(haskell_files).await
     }
 
@@ -393,7 +398,6 @@ impl Ghci {
     ) -> eyre::Result<()> {
         let mut log = CompilationLog::default();
         self.opts.clear();
-        self.error_log.write_still_compiling().await?;
         self.restart_inner(
             &mut log,
             [
@@ -501,6 +505,7 @@ impl Ghci {
                     process_id,
                     process_group_id,
                     exited_sender: exited_sender.clone(),
+                    before_kill: opts.before_kill.clone(),
                 }
                 .run(group)
             })
@@ -550,8 +555,6 @@ impl Ghci {
     ) -> eyre::Result<()> {
         let start_instant = Instant::now();
 
-        self.error_log.write_still_compiling().await?;
-
         // Don't propagate the error here immediately so we can be sure we always write the
         // compilation log.
         let result = async {
@@ -598,6 +601,24 @@ impl Ghci {
         events: BTreeSet<FileEvent>,
         haskell_files: &BTreeSet<NormalPath>,
     ) -> eyre::Result<ReloadActions> {
+        // Debounced notifications can race with atomic replacement. Reconcile Haskell event kinds
+        // with the newer complete snapshot so a stale Remove hint cannot unadd a file that exists
+        // (or a stale Modify hint hide a deletion). Non-Haskell events still use their hints.
+        let events = events
+            .into_iter()
+            .map(|event| {
+                let normalized = self.classifier.relative_path(event.as_path())?;
+                if !is_haskell_source_file(&normalized) {
+                    return Ok(event);
+                }
+                let path = event.as_path().to_owned();
+                Ok(if haskell_files.contains(&normalized) {
+                    FileEvent::Modify(path)
+                } else {
+                    FileEvent::Remove(path)
+                })
+            })
+            .collect::<eyre::Result<BTreeSet<_>>>()?;
         let mut actions = self.classifier.classify(events, &self.targets)?;
 
         // Notification streams are hints, not transactions. Diff a complete
@@ -638,7 +659,6 @@ impl Ghci {
 
         if actions.needs_restart() {
             self.opts.clear();
-            self.error_log.write_still_compiling().await?;
             tracing::info!(
                 "Restarting ghci:\n{}",
                 format_bulleted_list(&actions.needs_restart)
@@ -653,7 +673,6 @@ impl Ghci {
 
         if actions.needs_modify() {
             self.opts.clear();
-            self.error_log.write_still_compiling().await?;
             self.run_hooks(LifecycleEvent::Reload(hooks::When::Before), &mut log)
                 .await?;
         }
@@ -687,11 +706,7 @@ impl Ghci {
             // eval, so monitor the output read itself and interrupt only if compilation goes quiet.
             let completed = self
                 .stdin
-                .reload(
-                    &mut self.stdout,
-                    &mut log,
-                    COMPILATION_INACTIVITY_TIMEOUT,
-                )
+                .reload(&mut self.stdout, &mut log, COMPILATION_INACTIVITY_TIMEOUT)
                 .await?;
             if completed {
                 self.refresh_eval_commands_for_paths(&actions.needs_reload)
@@ -739,10 +754,7 @@ impl Ghci {
     /// really "restarting" a session so much as starting it again. That is, this method avoids
     /// "broken pipe" errors with `--before-restart-ghci` hooks.
     #[instrument(skip_all, level = "debug")]
-    async fn startup_restart(
-        &mut self,
-        haskell_files: BTreeSet<Utf8PathBuf>,
-    ) -> eyre::Result<()> {
+    async fn startup_restart(&mut self, haskell_files: BTreeSet<Utf8PathBuf>) -> eyre::Result<()> {
         let mut log = CompilationLog::default();
         let haskell_files = haskell_files
             .into_iter()
@@ -1016,9 +1028,12 @@ impl Ghci {
                     "Attempting to add already-loaded module: {path}\n\
                     This is a ghciwatch bug; please report it upstream"
                 ));
-            } else {
-                modules.push(LoadedModule::new(path.clone()));
             }
+            let name = self
+                .search_paths
+                .path_to_module(path)
+                .wrap_err_with(|| format!("Failed to determine module name for {path}"))?;
+            modules.push(LoadedModule::with_name(path.clone(), name));
         }
 
         // Like `:reload` and `:unadd`, `:add` compiles the target set and can wedge inside GHC.
@@ -1091,12 +1106,10 @@ impl Ghci {
         // to avoid the "module defined in multiple files" bug [1], so the potential outcomes of
         // making this mistake are:
         //
-        // 1. The next time the file is modified, we attempt to `:add` it instead of `:reload`ing
-        //    it. This is harmless, though it changes the order that `:show modules` prints output
-        //    in (maybe local binding order as well or something).
-        // 2. The next time the file is modified, we attempt to `:add` it by path instead of by
-        //    module name, but this function is only used when the modules aren't already in the
-        //    target set, so we know the module doesn't need to be referred to by its module name.
+        // The next time the file is modified, we may attempt to `:add` it again instead of
+        // `:reload`ing it. This is harmless, though it changes target ordering. New modules are
+        // added by module name so Cabal/GHCi can associate them with an existing home unit instead
+        // of assigning a path target to the interactive unit.
         //
         // [1]: https://gitlab.haskell.org/ghc/ghc/-/issues/13254#note_525037
 
@@ -1236,6 +1249,7 @@ impl Ghci {
         self.force_kill_for_recovery(eyre!(
             "Recovery :reload after {inactive_component} stopped reporting compilation progress for {RECOVERY_COMPILATION_INACTIVITY_TIMEOUT:?}"
         ))
+        .await
     }
 
     /// Stop this `ghci` session and cancel the async tasks associated with it.
@@ -1257,16 +1271,23 @@ impl Ghci {
     pub(crate) async fn send_sigint(&mut self) -> eyre::Result<()> {
         match self.send_sigint_inner().await {
             Ok(()) => Ok(()),
-            Err(error) => self.force_kill_for_recovery(error),
+            Err(error) => self.force_kill_for_recovery(error).await,
         }
     }
 
     /// Force-kill a session whose pipe protocol cannot be trusted and mark it for immediate
     /// replacement by the manager.
-    fn force_kill_for_recovery(&mut self, error: eyre::Report) -> eyre::Result<()> {
+    async fn force_kill_for_recovery(&mut self, error: eyre::Report) -> eyre::Result<()> {
         // No caller may continue using a session whose prompt synchronization is uncertain.
         // Set the flag before signaling so the process-exit branch cannot observe stale state.
         self.recovery_restart_required = true;
+        process::run_before_signal_commands(
+            &self.opts.before_kill,
+            self.process_id,
+            self.process_group_id,
+            "kill",
+        )
+        .await;
         match kill_process_tree(self.process_id, self.process_group_id) {
             Ok(()) => {}
             Err(kill_error) => {
@@ -1281,6 +1302,13 @@ impl Ghci {
 
     async fn send_sigint_inner(&mut self) -> eyre::Result<()> {
         let start_instant = Instant::now();
+        process::run_before_signal_commands(
+            &self.opts.before_interrupt,
+            self.process_id,
+            self.process_group_id,
+            "interrupt",
+        )
+        .await;
 
         // Phase 1: Send SIGINT repeatedly until we find a clean, uninterrupted prompt.
         //
@@ -1386,9 +1414,7 @@ impl Ghci {
             )),
         };
 
-        result.wrap_err(
-            "ghci sync barrier failed because the prompt could not be restored",
-        )?;
+        result.wrap_err("ghci sync barrier failed because the prompt could not be restored")?;
         Ok(())
     }
 
@@ -1429,10 +1455,6 @@ impl Ghci {
         log: &mut CompilationLog,
         events: [LifecycleEvent; N],
     ) -> eyre::Result<()> {
-        if let Some(error_log_dir) = self.error_log.path().and_then(|path| path.parent()) {
-            log.relocate(&self.search_paths.cwd, error_log_dir)?;
-        }
-
         // Allow hooks to consume the error log by updating it before running the hooks.
         self.write_error_log(log).await?;
 

@@ -89,6 +89,23 @@ pub struct Opts {
     #[arg(long)]
     no_interrupt_reloads: bool,
 
+    /// A shell command to run synchronously immediately before GHCi is sent `SIGINT`.
+    ///
+    /// The command receives the configured command PID and process-group ID in the
+    /// `GHCIWATCH_PID` and `GHCIWATCH_PGID` environment variables. Failures and the 30-second
+    /// timeout are logged but do not prevent the interrupt. Can be given multiple times.
+    #[arg(long, value_name = "SHELL_COMMAND")]
+    pub before_interrupt: Vec<ClonableCommand>,
+
+    /// A shell command to run synchronously immediately before GHCi is sent `SIGKILL`.
+    ///
+    /// This runs for recovery kills as well as ordinary GHCi restarts and shutdown. The command
+    /// receives the configured command PID and process-group ID in the `GHCIWATCH_PID` and
+    /// `GHCIWATCH_PGID` environment variables. Failures and the 30-second timeout are logged but do
+    /// not prevent the kill. Can be given multiple times.
+    #[arg(long, value_name = "SHELL_COMMAND")]
+    pub before_kill: Vec<ClonableCommand>,
+
     /// Enable experimental features. These features are unsupported and may change or be removed
     /// without notice.
     ///
@@ -155,7 +172,8 @@ pub struct WatchOpts {
 
     /// A path to watch for changes.
     ///
-    /// Directories are watched recursively. Can be given multiple times.
+    /// Directories are watched recursively. Can be given multiple times. If this option is not
+    /// given, no directory is watched. A positional `FILE` is still watched.
     #[arg(long = "watch", value_name = "PATH")]
     pub paths: Vec<NormalPath>,
 
@@ -270,8 +288,6 @@ impl Opts {
     pub fn init(&mut self) -> eyre::Result<()> {
         if let Some(file) = &self.file {
             self.watch.paths.push(file.clone());
-        } else if self.watch.paths.is_empty() {
-            self.watch.paths.push(NormalPath::from_cwd("src")?);
         }
 
         // These help our libraries (particularly `color-eyre`) see these options.

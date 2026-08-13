@@ -74,22 +74,29 @@ impl ShowPaths {
     /// Convert a Haskell source path to a module name.
     pub fn path_to_module(&self, path: &Utf8Path) -> eyre::Result<String> {
         let path = path.with_extension("");
-        let path_str = path.as_str();
-
-        for search_path in self.absolute_search_paths() {
-            if let Some(suffix) = path_str.strip_prefix(search_path.as_str()) {
-                let module_name = Utf8Path::new(suffix)
-                    .components()
-                    .filter_map(|component| match component {
-                        camino::Utf8Component::Normal(part) => Some(part),
-                        _ => None,
-                    })
-                    .join(".");
-                return Ok(module_name);
-            }
+        let suffix = self
+            .absolute_search_paths()
+            // Prefer the most specific import root when search paths overlap.
+            .filter_map(|search_path| {
+                path.strip_prefix(&search_path)
+                    .ok()
+                    .map(|suffix| (search_path.components().count(), suffix.to_owned()))
+            })
+            .max_by_key(|(component_count, _)| *component_count)
+            .map(|(_, suffix)| suffix)
+            .ok_or_else(|| eyre!("Couldn't convert {path} to module name"))?;
+        let module_name = suffix
+            .components()
+            .filter_map(|component| match component {
+                camino::Utf8Component::Normal(part) => Some(part),
+                _ => None,
+            })
+            .join(".");
+        if module_name.is_empty() {
+            Err(eyre!("Couldn't convert {path} to module name"))
+        } else {
+            Ok(module_name)
         }
-
-        Err(eyre!("Couldn't convert {path} to module name"))
     }
 }
 
@@ -238,5 +245,19 @@ mod tests {
                 .unwrap(),
             "Foo.Bar.Baz"
         );
+
+        let overlapping_paths = ShowPaths {
+            cwd: Utf8PathBuf::from("/project"),
+            search_paths: vec![Utf8PathBuf::from("src"), Utf8PathBuf::from("src/generated")],
+        };
+        assert_eq!(
+            overlapping_paths
+                .path_to_module(Utf8Path::new("/project/src/generated/Foo.hs"))
+                .unwrap(),
+            "Foo"
+        );
+        assert!(paths
+            .path_to_module(Utf8Path::new("/Users/wiggles/ghciwatch/src-other/Foo.hs"))
+            .is_err());
     }
 }

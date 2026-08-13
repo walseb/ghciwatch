@@ -1,4 +1,3 @@
-use eyre::Context;
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
 use tokio::io::BufWriter;
@@ -9,13 +8,6 @@ use crate::normal_path::NormalPath;
 use super::parse::CompilationResult;
 use super::parse::ModulesLoaded;
 use super::CompilationLog;
-
-/// Message we write to the error log to indicate that ghciwatch is currently reloading or
-/// restarting.
-///
-/// This helps LLM Agents figure out that the reason they're not seeing any errors is because
-/// compilation hasn't finished yet.
-const STILL_COMPILING: &str = "[ghciwatch is still compiling]";
 
 /// Error log writer.
 ///
@@ -36,23 +28,6 @@ impl ErrorLog {
     /// Paths in GHC error messages are written to this path.
     pub fn path(&self) -> Option<&NormalPath> {
         self.path.as_ref()
-    }
-
-    /// Write the "still compiling" message to the error log before a reload or restart.
-    pub async fn write_still_compiling(&self) -> eyre::Result<()> {
-        let path = match &self.path {
-            Some(path) => path,
-            None => {
-                tracing::debug!("No error log path, not writing");
-                return Ok(());
-            }
-        };
-
-        tokio::fs::write(path, STILL_COMPILING)
-            .await
-            .wrap_err_with(|| "Failed to write error log: {path}")?;
-
-        Ok(())
     }
 
     /// Write the error log, if any, with the given compilation summary and diagnostic messages.

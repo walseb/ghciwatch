@@ -5,7 +5,7 @@ when source files change.
 
 Load `cabal v2-repl` and watch for changes in `src`:
 
-    ghciwatch
+    ghciwatch --watch src
 
 Load a custom GHCi session and watch for changes in multiple locations:
 

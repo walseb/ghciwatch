@@ -1,5 +1,6 @@
 //! Subsystem for [`Ghci`] to support graceful shutdown.
 
+use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::os::unix::process::ExitStatusExt;
 use std::process::ExitStatus;
@@ -14,6 +15,7 @@ use tokio::sync::Mutex;
 use tracing::instrument;
 
 use crate::event_filter::FileEvent;
+use crate::event_filter::FileState;
 use crate::ghci::CompilationLog;
 use crate::hooks;
 use crate::hooks::LifecycleEvent;
@@ -21,11 +23,11 @@ use crate::shutdown::ShutdownHandle;
 
 use super::memory::format_bytes;
 use super::memory::repl_resident_memory;
-use super::FileClassifier;
 use super::print_ghciwatch_error;
+use super::FileClassifier;
 use super::Ghci;
-use super::GhciRecoveryFailed;
 use super::GhciOpts;
+use super::GhciRecoveryFailed;
 use super::GhciReloadKind;
 use super::ModuleSet;
 
@@ -41,6 +43,8 @@ pub enum WatcherEvent {
     Reload {
         /// The file events to respond to.
         events: BTreeSet<FileEvent>,
+        /// State of each event path when this watcher batch was delivered.
+        states: BTreeMap<Utf8PathBuf, FileState>,
         /// A stable snapshot of Haskell files under all watch roots.
         haskell_files: BTreeSet<Utf8PathBuf>,
     },
@@ -54,16 +58,63 @@ impl WatcherEvent {
             (
                 WatcherEvent::Reload {
                     events,
+                    states,
                     haskell_files,
                 },
                 WatcherEvent::Reload {
                     events: other_events,
+                    states: other_states,
                     haskell_files: other_haskell_files,
                 },
             ) => {
-                events.extend(other_events);
+                // Keep only the newest event kind and captured state for each path.
+                for other_event in other_events {
+                    events.retain(|event| event.as_path() != other_event.as_path());
+                    events.insert(other_event);
+                }
+                states.extend(other_states);
                 // The later filesystem snapshot supersedes the earlier one.
                 *haskell_files = other_haskell_files;
+            }
+        }
+    }
+
+    /// Remove event hints whose captured file contents have already been dispatched.
+    ///
+    /// Returns `true` if neither file contents nor the complete Haskell-file snapshot changed.
+    fn discard_applied(
+        &mut self,
+        applied_states: &BTreeMap<Utf8PathBuf, FileState>,
+        applied_haskell_files: Option<&BTreeSet<Utf8PathBuf>>,
+    ) -> bool {
+        match self {
+            Self::Reload {
+                events,
+                states,
+                haskell_files,
+            } => {
+                events.retain(|event| {
+                    states.get(event.as_path()) != applied_states.get(event.as_path())
+                });
+                events.is_empty()
+                    && applied_haskell_files.is_some_and(|applied| applied == haskell_files)
+            }
+        }
+    }
+
+    fn mark_applied(
+        &self,
+        applied_states: &mut BTreeMap<Utf8PathBuf, FileState>,
+        applied_haskell_files: &mut Option<BTreeSet<Utf8PathBuf>>,
+    ) {
+        match self {
+            Self::Reload {
+                states,
+                haskell_files,
+                ..
+            } => {
+                applied_states.extend(states.clone());
+                *applied_haskell_files = Some(haskell_files.clone());
             }
         }
     }
@@ -175,6 +226,8 @@ pub async fn run_ghci(
         classifier,
         interrupt_reloads,
         memory_watchdog,
+        applied_states: BTreeMap::new(),
+        applied_haskell_files: None,
     };
     manager.run().await
 }
@@ -189,6 +242,7 @@ async fn dispatch(
         WatcherEvent::Reload {
             events,
             haskell_files,
+            ..
         } => {
             ghci.lock()
                 .await
@@ -233,6 +287,10 @@ struct GhciManager {
     classifier: FileClassifier,
     interrupt_reloads: bool,
     memory_watchdog: tokio::time::Interval,
+    /// File states represented by the last successfully completed dispatch.
+    applied_states: BTreeMap<Utf8PathBuf, FileState>,
+    /// Complete watched-source snapshot represented by the last completed dispatch.
+    applied_haskell_files: Option<BTreeSet<Utf8PathBuf>>,
 }
 
 /// Result of [`GhciManager::wait_for_event`].
@@ -292,6 +350,8 @@ impl GhciManager {
                     ref mut watcher_receiver,
                     ref mut exited_receiver,
                     ref mut memory_watchdog,
+                    ref applied_states,
+                    ref applied_haskell_files,
                     ..
                 } = *self;
                 tokio::select! {
@@ -302,8 +362,15 @@ impl GhciManager {
                     }
                     ret = watcher_receiver.recv() => {
                         match ret {
-                            Some(event) => {
+                            Some(mut event) => {
                                 tracing::debug!(?event, "Received ghci event from watcher");
+                                if event.discard_applied(
+                                    applied_states,
+                                    applied_haskell_files.as_ref(),
+                                ) {
+                                    tracing::debug!("Discarding watcher event already applied to GHCi");
+                                    continue;
+                                }
                                 return Ok(WaitResult::Event(event));
                             }
                             None => {
@@ -339,7 +406,9 @@ impl GhciManager {
                             tracing::warn!(%status, "Restarting GHCi immediately after failed interrupt recovery");
                             ghci.restart_after_recovery_kill_with_known_files()
                                 .await
-                                .wrap_err("Failed to restart GHCi after unsuccessful interrupt recovery")?;
+                                .wrap_err(
+                                    "Failed to restart GHCi after unsuccessful interrupt recovery",
+                                )?;
                             true
                         } else {
                             false
@@ -403,6 +472,8 @@ impl GhciManager {
                 ref mut exited_receiver,
                 ref mut memory_watchdog,
                 interrupt_reloads,
+                ref mut applied_states,
+                ref mut applied_haskell_files,
                 ..
             } = *self;
             break tokio::select! {
@@ -440,9 +511,9 @@ impl GhciManager {
                         "Received ghci event from watcher while reloading"
                     );
 
-                    // Every event keeps the synchronization cycle dirty. Even an event
-                    // path that is irrelevant by itself may carry a changed filesystem
-                    // snapshot (for example, a newly-created directory).
+                    // Retain every event until dispatch completes. We can then discard captured
+                    // states that the completed reload already applied; a different state or full
+                    // source snapshot remains dirty for one follow-up cycle.
 
                     // Check if we should interrupt the in-progress reload. We can only
                     // check once (the oneshot is consumed), and only for interruptible
@@ -506,6 +577,7 @@ impl GhciManager {
                     match ret? {
                         Ok(()) => {
                             tracing::debug!("Finished dispatching ghci event");
+                            event.mark_applied(applied_states, applied_haskell_files);
                             None
                         }
                         Err(err) if is_broken_pipe(&err) || is_recovery_failure(&err) => {
@@ -576,13 +648,16 @@ impl GhciManager {
             self.run_memory_watchdog_with_operation_permit().await?;
         }
 
-        // If events arrived while the dispatch was running (but we chose not to
-        // interrupt), drain any remaining events and return for retry. This dirty
-        // cycle is required even when event paths themselves look irrelevant, since
-        // the newest event carries the authoritative filesystem snapshot.
+        // Merge events that arrived while dispatch was running. Retry only if their latest
+        // captured state or authoritative filesystem snapshot differs from what just completed.
         if let Some(mut pending_event) = pending_event {
             drain_pending(&mut pending_event, &mut self.watcher_receiver);
-            return Ok(HandleResult::Interrupted(pending_event));
+            if !pending_event
+                .discard_applied(&self.applied_states, self.applied_haskell_files.as_ref())
+            {
+                return Ok(HandleResult::Interrupted(pending_event));
+            }
+            tracing::debug!("Discarding watcher changes already applied by the completed reload");
         }
 
         Ok(HandleResult::Done)
@@ -669,17 +744,13 @@ fn drain_pending(event: &mut WatcherEvent, watcher_receiver: &mut mpsc::Receiver
     }
 }
 
-fn preserve_recovery_event(
-    event: &WatcherEvent,
-    pending_event: &mut Option<WatcherEvent>,
-) {
+fn preserve_recovery_event(event: &WatcherEvent, pending_event: &mut Option<WatcherEvent>) {
     let mut recovery_event = event.clone();
     if let Some(newer_event) = pending_event.take() {
         recovery_event.merge(newer_event);
     }
     *pending_event = Some(recovery_event);
 }
-
 
 /// Drain all pending events, merge them, and return the complete event when it is relevant.
 /// Keeping the event preserves its newest filesystem snapshot for replacement initialization.
@@ -925,4 +996,54 @@ fn is_broken_pipe(err: &eyre::Report) -> bool {
         e.downcast_ref::<std::io::Error>()
             .is_some_and(|io| io.kind() == std::io::ErrorKind::BrokenPipe)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::event_filter::file_states;
+    use std::time::SystemTime;
+
+    fn event(path: &camino::Utf8Path) -> WatcherEvent {
+        let events = BTreeSet::from([FileEvent::Modify(path.to_owned())]);
+        let states = file_states(&events).unwrap();
+        WatcherEvent::Reload {
+            events,
+            states,
+            haskell_files: BTreeSet::from([path.to_owned()]),
+        }
+    }
+
+    #[test]
+    fn delayed_duplicate_edit_is_discarded_after_reload() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "ghciwatch-manager-{}-{unique}.hs",
+            std::process::id()
+        ));
+        let path = camino::Utf8PathBuf::try_from(path).unwrap();
+        std::fs::write(&path, "module First where\nvalue = 1\n").unwrap();
+
+        let first = event(&path);
+        let mut applied_states = BTreeMap::new();
+        let mut applied_haskell_files = None;
+        first.mark_applied(&mut applied_states, &mut applied_haskell_files);
+
+        // Keep the replacement the same length to ensure the content hash, rather than only file
+        // size (or a coarse timestamp), distinguishes the edit.
+        std::fs::write(&path, "module First where\nvalue = 2\n").unwrap();
+        let latest = event(&path);
+        let mut delayed_duplicate = latest.clone();
+        assert!(
+            !delayed_duplicate.discard_applied(&applied_states, applied_haskell_files.as_ref(),)
+        );
+
+        latest.mark_applied(&mut applied_states, &mut applied_haskell_files);
+        assert!(delayed_duplicate.discard_applied(&applied_states, applied_haskell_files.as_ref(),));
+
+        std::fs::remove_file(path).unwrap();
+    }
 }

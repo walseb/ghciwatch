@@ -11,7 +11,7 @@ when source files change.
 
 Load `cabal v2-repl` and watch for changes in `src`:
 
-    ghciwatch
+    ghciwatch --watch src
 
 Load a custom GHCi session and watch for changes in multiple locations:
 
@@ -106,6 +106,20 @@ Clear the screen before reloads and restarts
 Don't interrupt reloads when files change.
 
 Depending on your workflow, `ghciwatch` may feel more responsive with this set.
+
+</dd>
+<dt><a id="--before-interrupt" href="#--before-interrupt"><code>--before-interrupt &lt;SHELL_COMMAND&gt;</code></a></dt><dd>
+
+A shell command to run synchronously immediately before GHCi is sent `SIGINT`.
+
+The command receives the configured command PID and process-group ID in the `GHCIWATCH_PID` and `GHCIWATCH_PGID` environment variables. Failures and the 30-second timeout are logged but do not prevent the interrupt. Can be given multiple times.
+
+</dd>
+<dt><a id="--before-kill" href="#--before-kill"><code>--before-kill &lt;SHELL_COMMAND&gt;</code></a></dt><dd>
+
+A shell command to run synchronously immediately before GHCi is sent `SIGKILL`.
+
+This runs for recovery kills as well as ordinary GHCi restarts and shutdown. The command receives the configured command PID and process-group ID in the `GHCIWATCH_PID` and `GHCIWATCH_PGID` environment variables. Failures and the 30-second timeout are logged but do not prevent the kill. Can be given multiple times.
 
 </dd>
 <dt><a id="--completions" href="#--completions"><code>--completions &lt;COMPLETIONS&gt;</code></a></dt><dd>
@@ -285,7 +299,7 @@ Defaults to 0.5 seconds.
 
 A path to watch for changes.
 
-Directories are watched recursively. Can be given multiple times.
+Directories are watched recursively. Can be given multiple times. If this option is not given, no directory is watched. A positional `FILE` is still watched.
 
 </dd>
 <dt><a id="--reload-glob" href="#--reload-glob"><code>--reload-glob &lt;RELOAD_GLOBS&gt;</code></a></dt><dd>

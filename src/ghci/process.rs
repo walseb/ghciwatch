@@ -1,6 +1,7 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::process::ExitStatus;
+use std::time::Duration;
 
 #[cfg(target_os = "linux")]
 use std::collections::{BTreeMap, BTreeSet};
@@ -17,7 +18,10 @@ use nix::unistd::Pid;
 use tokio::sync::mpsc;
 use tracing::instrument;
 
+use crate::clonable_command::ClonableCommand;
 use crate::shutdown::ShutdownHandle;
+
+const BEFORE_SIGNAL_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct GhciProcess {
     pub shutdown: ShutdownHandle,
@@ -34,6 +38,8 @@ pub struct GhciProcess {
     /// go through [`restart_receiver`][GhciProcess::restart_receiver] instead and do not send
     /// here.
     pub exited_sender: mpsc::Sender<ExitStatus>,
+    /// Commands to run before an intentional SIGKILL.
+    pub before_kill: Vec<ClonableCommand>,
 }
 
 impl GhciProcess {
@@ -65,6 +71,13 @@ impl GhciProcess {
         &self,
         wait: Pin<&mut impl Future<Output = Result<ExitStatus, std::io::Error>>>,
     ) -> eyre::Result<()> {
+        run_before_signal_commands(
+            &self.before_kill,
+            self.process_id,
+            self.process_group_id,
+            "kill",
+        )
+        .await;
         kill_process_tree(self.process_id, self.process_group_id)
             .wrap_err("Failed to kill ghci process tree")?;
         // Report the exit status.
@@ -76,6 +89,56 @@ impl GhciProcess {
 
     async fn exited(&self, status: ExitStatus) {
         tracing::debug!("ghci exited: {status}");
+    }
+}
+
+/// Run configured diagnostic commands before signaling GHCi.
+///
+/// A diagnostic failure must never prevent the signal: a wedged command still needs recovery and
+/// shutdown must remain reliable.
+pub(super) async fn run_before_signal_commands(
+    commands: &[ClonableCommand],
+    process_id: Pid,
+    process_group_id: Pid,
+    signal_action: &str,
+) {
+    for command in commands {
+        tracing::info!(%command, "Running before-{signal_action} command");
+        let mut child = command.as_tokio();
+        child
+            .env("GHCIWATCH_PID", process_id.as_raw().to_string())
+            .env("GHCIWATCH_PGID", process_group_id.as_raw().to_string())
+            .kill_on_drop(true);
+        let mut child = match child.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                tracing::warn!(%command, %error, "Failed to run before-{signal_action} command");
+                continue;
+            }
+        };
+        match tokio::time::timeout(BEFORE_SIGNAL_COMMAND_TIMEOUT, child.wait()).await {
+            Ok(Ok(status)) if status.success() => {
+                tracing::debug!(%command, %status, "Before-{signal_action} command completed");
+            }
+            Ok(Ok(status)) => {
+                tracing::warn!(%command, %status, "Before-{signal_action} command failed");
+            }
+            Ok(Err(error)) => {
+                tracing::warn!(%command, %error, "Failed to run before-{signal_action} command");
+            }
+            Err(_) => {
+                tracing::warn!(
+                    %command,
+                    timeout = ?BEFORE_SIGNAL_COMMAND_TIMEOUT,
+                    "Before-{signal_action} command timed out; terminating it"
+                );
+                // Do not await process exit here: an uninterruptible diagnostic must not delay the
+                // GHCi signal past the diagnostic timeout.
+                if let Err(error) = child.start_kill() {
+                    tracing::warn!(%command, %error, "Failed to terminate timed-out before-{signal_action} command");
+                }
+            }
+        }
     }
 }
 
@@ -246,9 +309,7 @@ fn process_tree(
     loop {
         let mut changed = false;
         for stat in snapshot.values().copied() {
-            if !family.contains(&stat.pid.as_raw())
-                && family.contains(&stat.parent_pid.as_raw())
-            {
+            if !family.contains(&stat.pid.as_raw()) && family.contains(&stat.parent_pid.as_raw()) {
                 family.insert(stat.pid.as_raw());
                 processes.push(stat);
                 changed = true;
@@ -288,10 +349,7 @@ fn track_process(expected: ProcessStat) -> Option<TrackedProcess> {
 }
 
 #[cfg(target_os = "linux")]
-fn signal_tracked_process(
-    process: &TrackedProcess,
-    signal_to_send: Signal,
-) -> eyre::Result<()> {
+fn signal_tracked_process(process: &TrackedProcess, signal_to_send: Signal) -> eyre::Result<()> {
     if let Some(pid_fd) = &process.pid_fd {
         // SAFETY: the pidfd is owned and valid, the signal number comes from nix, and a null
         // siginfo pointer is explicitly supported by pidfd_send_signal(2).
@@ -321,7 +379,10 @@ fn signal_tracked_process(
     }
 
     if !process_identity_matches(process.stat) {
-        tracing::debug!(pid = process.stat.pid.as_raw(), "Skipped a reused process ID");
+        tracing::debug!(
+            pid = process.stat.pid.as_raw(),
+            "Skipped a reused process ID"
+        );
         return Ok(());
     }
     match signal::kill(process.stat.pid, signal_to_send) {
@@ -352,12 +413,16 @@ fn current_process_stat(pid: Pid) -> Option<ProcessStat> {
 fn parse_process_stat(pid: i32, stat: &str) -> Option<ProcessStat> {
     // The comm field is parenthesized and may itself contain spaces or `)`, so split after its
     // final closing parenthesis. Fields below are numbered as documented in proc_pid_stat(5).
-    let fields = stat.rsplit_once(')')?.1.split_whitespace().collect::<Vec<_>>();
+    let fields = stat
+        .rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .collect::<Vec<_>>();
     Some(ProcessStat {
         pid: Pid::from_raw(pid),
         parent_pid: Pid::from_raw(fields.get(1)?.parse().ok()?), // field 4: ppid
         process_group_id: Pid::from_raw(fields.get(2)?.parse().ok()?), // field 5: pgrp
-        start_time: fields.get(19)?.parse().ok()?, // field 22: starttime
+        start_time: fields.get(19)?.parse().ok()?,               // field 22: starttime
     })
 }
 

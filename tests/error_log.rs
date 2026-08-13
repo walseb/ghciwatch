@@ -198,9 +198,9 @@ async fn can_write_error_log_compilation_errors() {
     .assert_eq(&error_contents);
 }
 
-/// Test that `ghciwatch --errors ...` can use the correct basename in paths in error messages.
+/// Test that `ghciwatch --errors ...` preserves paths emitted by GHC.
 #[test]
-async fn can_adjust_error_log_paths() {
+async fn preserves_error_log_paths() {
     let error_path = "ghcid.txt";
     let mut session = GhciWatchBuilder::new("tests/data/with-dep")
         .with_args(["--errors", error_path, "--watch", "simple-dep/src"])
@@ -240,17 +240,17 @@ async fn can_adjust_error_log_paths() {
         .await
         .expect("ghciwatch writes ghcid.txt");
 
-    // The path includes the path to the package:
+    // GHCi's working directory is the package, so GHC emits paths relative to it.
     let expected = match session.ghc_version() {
         GhcVersion::Ghc96 | GhcVersion::Ghc98 | GhcVersion::Ghc910 => expect![[r#"
-            simple-dep/src/SimpleDep.hs:4:28: error: [GHC-21231]
+            src/SimpleDep.hs:4:28: error: [GHC-21231]
                 lexical error in string/character literal at character '\n'
               |
             4 | depFunc = putStrLn "depFunc
               |                            ^
         "#]],
         GhcVersion::Ghc912 => expect![[r#"
-            simple-dep/src/SimpleDep.hs:4:20: error: [GHC-21231]
+            src/SimpleDep.hs:4:20: error: [GHC-21231]
                 lexical error at character '\n'
               |
             4 | depFunc = putStrLn "depFunc

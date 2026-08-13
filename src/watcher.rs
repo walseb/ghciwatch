@@ -18,10 +18,11 @@ use tracing::instrument;
 
 use crate::cli::Opts;
 use crate::event_filter::file_events_from_action;
+use crate::event_filter::file_states;
 use crate::ghci::manager::WatcherEvent;
+use crate::haskell_source_file::is_haskell_source_file;
 use crate::normal_path::NormalPath;
 use crate::shutdown::ShutdownHandle;
-use crate::haskell_source_file::is_haskell_source_file;
 
 /// Options for [`run_watcher`]. This is like a lower-effort builder interface, mostly
 /// provided because Rust tragically lacks named arguments.
@@ -170,6 +171,7 @@ impl EventHandler {
         // files inside of it. When we get new directories, we should paw through them with
         // `walkdir` or something to check for files.
         let events = file_events_from_action(events)?;
+        let states = file_states(&events)?;
         let haskell_files = scan_haskell_files(&self.watch)?;
         if events.is_empty() {
             tracing::debug!("No relevant file events");
@@ -178,6 +180,7 @@ impl EventHandler {
             self.ghci_sender
                 .send(WatcherEvent::Reload {
                     events,
+                    states,
                     haskell_files,
                 })
                 .await?;
@@ -196,7 +199,10 @@ impl DebounceEventHandler for EventHandler {
 /// Take a fresh snapshot instead of relying on notification ordering. Files can
 /// appear without an individual event (notably when a whole directory is created).
 fn scan_haskell_files(roots: &[NormalPath]) -> eyre::Result<BTreeSet<camino::Utf8PathBuf>> {
-    fn visit(path: &std::path::Path, files: &mut BTreeSet<camino::Utf8PathBuf>) -> eyre::Result<()> {
+    fn visit(
+        path: &std::path::Path,
+        files: &mut BTreeSet<camino::Utf8PathBuf>,
+    ) -> eyre::Result<()> {
         let metadata = match std::fs::metadata(path) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
