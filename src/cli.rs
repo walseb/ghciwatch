@@ -89,6 +89,13 @@ pub struct Opts {
     #[arg(long)]
     no_interrupt_reloads: bool,
 
+    /// Don't automatically issue `:reload` for watched changes.
+    ///
+    /// Watched Haskell files are still added to and removed from GHCi's target set with `:add` and
+    /// `:unadd`. Changes matching restart globs still restart the session.
+    #[arg(long)]
+    pub no_auto_reload: bool,
+
     /// A shell command to run synchronously immediately before GHCi is sent `SIGINT`.
     ///
     /// The command receives the configured command PID and process-group ID in the

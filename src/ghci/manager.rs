@@ -33,7 +33,7 @@ use super::ModuleSet;
 
 /// Recheck often enough to catch leaks without continuously walking `/proc`.
 const MEMORY_WATCHDOG_INTERVAL: Duration = Duration::from_secs(30);
-/// Resident-memory limit for the persistent interactive GHC process.
+/// Resident-memory limit for the persistent interactive GHC and its immediate Cabal parent.
 const GHCI_MEMORY_LIMIT_BYTES: u64 = 28 * 1024 * 1024 * 1024;
 
 /// An event sent to [`Ghci`] by the watcher.
@@ -688,7 +688,10 @@ impl GhciManager {
             bytes = usage.bytes,
             limit = GHCI_MEMORY_LIMIT_BYTES,
             command_pid = usage.command_pid,
+            cabal_parent_pid = usage.cabal_parent.map(|(pid, _)| pid),
+            cabal_parent_bytes = usage.cabal_parent.map(|(_, bytes)| bytes),
             interactive_ghc_pid = usage.interactive_ghc.map(|(pid, _)| pid),
+            interactive_ghc_bytes = usage.interactive_ghc.map(|(_, bytes)| bytes),
             "Checked GHCi repl resident memory"
         );
         if usage.bytes <= GHCI_MEMORY_LIMIT_BYTES {
@@ -698,7 +701,7 @@ impl GhciManager {
         print_ghciwatch_error(
             "GHCi exceeded its resident-memory limit",
             &format!(
-                "Component: GHCi process\n{}\nResident memory: {}\nLimit: {}\nRecovery: restarting GHCi through the normal lifecycle-hook and target-synchronization machinery",
+                "Component: GHCi and immediate Cabal parent\n{}\nCombined resident memory: {}\nLimit: {}\nRecovery: restarting GHCi through the normal lifecycle-hook and target-synchronization machinery",
                 usage.details(),
                 format_bytes(usage.bytes),
                 format_bytes(GHCI_MEMORY_LIMIT_BYTES),

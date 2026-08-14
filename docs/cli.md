@@ -108,6 +108,13 @@ Don't interrupt reloads when files change.
 Depending on your workflow, `ghciwatch` may feel more responsive with this set.
 
 </dd>
+<dt><a id="--no-auto-reload" href="#--no-auto-reload"><code>--no-auto-reload</code></a></dt><dd>
+
+Don't automatically issue `:reload` for watched changes.
+
+Watched Haskell files are still added to and removed from GHCi's target set with `:add` and `:unadd`. Changes matching restart globs still restart the session.
+
+</dd>
 <dt><a id="--before-interrupt" href="#--before-interrupt"><code>--before-interrupt &lt;SHELL_COMMAND&gt;</code></a></dt><dd>
 
 A shell command to run synchronously immediately before GHCi is sent `SIGINT`.

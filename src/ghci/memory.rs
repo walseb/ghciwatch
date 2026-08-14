@@ -6,12 +6,12 @@
 //! can start `cabal test`, batch GHC compiler processes, GCC, and the linker. Summing their RSS
 //! can therefore restart a healthy interactive session.
 //!
-//! Memory accounting charges only the persistent GHC process at the known process-tree position:
-//! three edges below ghciwatch, and therefore two edges below the configured command process stored
-//! by `Ghci`. The candidate must have an exact `--interactive` argument and resolve through
-//! `/proc/PID/exe` to a GHC executable. Looking at exactly that depth avoids charging processes
-//! spawned by the interactive GHC. Ancestry, rather than process-group membership, identifies the
-//! session because wrappers may put descendants in another group.
+//! Memory accounting charges exactly two persistent processes: the interactive GHC at the known
+//! process-tree position (three edges below ghciwatch, two below the configured command process),
+//! and that GHC's immediate Cabal parent. The GHC candidate must have an exact `--interactive`
+//! argument and resolve through `/proc/PID/exe` to a GHC executable. Selecting the pair directly,
+//! rather than summing a process tree or process group, excludes tests, compilers, linkers, and other
+//! descendants spawned by the interactive session.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -25,13 +25,15 @@ struct Process {
     resident_bytes: u64,
     interactive: bool,
     ghc_executable: bool,
+    cabal_executable: bool,
 }
 
-/// Resident memory belonging to the persistent interactive GHC process.
+/// Resident memory belonging to the persistent interactive GHC and its immediate Cabal parent.
 #[derive(Debug)]
 pub(super) struct MemoryUsage {
     pub(super) bytes: u64,
     pub(super) command_pid: i32,
+    pub(super) cabal_parent: Option<(i32, u64)>,
     pub(super) interactive_ghc: Option<(i32, u64)>,
 }
 
@@ -54,21 +56,22 @@ pub(super) fn format_bytes(bytes: u64) -> String {
 
 impl MemoryUsage {
     pub(super) fn details(&self) -> String {
-        match self.interactive_ghc {
-            Some((pid, bytes)) => format!(
-                "Command PID: {} (not counted)\nInteractive GHC PID: {pid} ({})",
+        match (self.cabal_parent, self.interactive_ghc) {
+            (Some((cabal_pid, cabal_bytes)), Some((ghc_pid, ghc_bytes))) => format!(
+                "Command PID: {} (not counted)\nCabal parent PID: {cabal_pid} ({})\nInteractive GHC PID: {ghc_pid} ({})",
                 self.command_pid,
-                format_bytes(bytes),
+                format_bytes(cabal_bytes),
+                format_bytes(ghc_bytes),
             ),
-            None => format!(
-                "Command PID: {} (not counted)\nInteractive GHC PID: not found",
+            _ => format!(
+                "Command PID: {} (not counted)\nCabal parent PID: not found\nInteractive GHC PID: not found",
                 self.command_pid,
             ),
         }
     }
 }
 
-/// Read RSS for the interactive GHC exactly two edges below the direct command.
+/// Read RSS for the interactive GHC and its immediate Cabal parent.
 pub(super) fn repl_resident_memory(
     command_pid: i32,
     process_group_id: i32,
@@ -109,9 +112,9 @@ fn process_snapshot() -> io::Result<BTreeMap<i32, Process>> {
                     .any(|argument| argument == b"--interactive")
             })
             .unwrap_or(false);
-        let ghc_executable = fs::read_link(entry.path().join("exe"))
-            .ok()
-            .is_some_and(|path| is_ghc_executable(&path));
+        let executable = fs::read_link(entry.path().join("exe")).ok();
+        let ghc_executable = executable.as_deref().is_some_and(is_ghc_executable);
+        let cabal_executable = executable.as_deref().is_some_and(is_cabal_executable);
         processes.insert(
             pid,
             Process {
@@ -121,6 +124,7 @@ fn process_snapshot() -> io::Result<BTreeMap<i32, Process>> {
                 resident_bytes,
                 interactive,
                 ghc_executable,
+                cabal_executable,
             },
         );
     }
@@ -137,20 +141,30 @@ fn select_repl_processes(
     let command_is_current = processes
         .get(&command_pid)
         .is_some_and(|process| process.process_group_id == process_group_id);
-    let interactive_ghc = if command_is_current {
+    let selected = if command_is_current {
         processes
             .values()
-            .filter(|process| process.interactive && process.ghc_executable)
-            .filter(|process| descendant_depth(process.pid, command_pid, processes) == Some(2))
-            .min_by_key(|process| process.pid)
-            .map(|process| (process.pid, process.resident_bytes))
+            .filter(|ghc| ghc.interactive && ghc.ghc_executable)
+            .filter(|ghc| descendant_depth(ghc.pid, command_pid, processes) == Some(2))
+            .filter_map(|ghc| {
+                let cabal = processes.get(&ghc.parent_pid)?;
+                (cabal.cabal_executable
+                    && descendant_depth(cabal.pid, command_pid, processes) == Some(1))
+                .then_some((cabal, ghc))
+            })
+            .min_by_key(|(_, ghc)| ghc.pid)
     } else {
         None
     };
-    let bytes = interactive_ghc.map_or(0, |(_, bytes)| bytes);
+    let cabal_parent = selected.map(|(cabal, _)| (cabal.pid, cabal.resident_bytes));
+    let interactive_ghc = selected.map(|(_, ghc)| (ghc.pid, ghc.resident_bytes));
+    let bytes = selected.map_or(0, |(cabal, ghc)| {
+        cabal.resident_bytes.saturating_add(ghc.resident_bytes)
+    });
     MemoryUsage {
         bytes,
         command_pid,
+        cabal_parent,
         interactive_ghc,
     }
 }
@@ -160,6 +174,18 @@ fn is_ghc_executable(path: &std::path::Path) -> bool {
         .and_then(|name| name.to_str())
         .is_some_and(|name| {
             name == "ghc" || name.strip_prefix("ghc-").is_some_and(|version| !version.is_empty())
+        })
+}
+
+fn is_cabal_executable(path: &std::path::Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            name == "cabal"
+                || name == ".cabal-wrapped"
+                || name
+                    .strip_prefix("cabal-")
+                    .is_some_and(|version| !version.is_empty())
         })
 }
 
@@ -222,13 +248,14 @@ mod tests {
         assert_eq!(format_bytes(30_064_771_072), "28.00 GiB");
 
         let usage = MemoryUsage {
-            bytes: 22_704_238_592,
+            bytes: 22_809_096_192,
             command_pid: 1_572_392,
+            cabal_parent: Some((1_572_421, 104_857_600)),
             interactive_ghc: Some((1_572_439, 22_704_238_592)),
         };
         assert_eq!(
             usage.details(),
-            "Command PID: 1572392 (not counted)\nInteractive GHC PID: 1572439 (21.14 GiB)"
+            "Command PID: 1572392 (not counted)\nCabal parent PID: 1572421 (100.00 MiB)\nInteractive GHC PID: 1572439 (21.14 GiB)"
         );
     }
 
@@ -240,20 +267,23 @@ mod tests {
             resident_bytes: mib * 1024 * 1024,
             interactive,
             ghc_executable: interactive,
+            cabal_executable: !interactive,
         }
     }
 
     #[test]
-    fn counts_only_main_interactive_ghc_at_the_expected_depth() {
+    fn counts_only_interactive_ghc_and_its_immediate_parent() {
         let processes = BTreeMap::from([
-            (10, process(10, 1, false, 2_000)), // cabal repl; not charged
-            (11, process(11, 10, false, 20)), // cabal setup wrapper
-            (12, process(12, 11, true, 12_000)), // persistent GHCi
-            (13, process(13, 12, true, 11_000)), // nested GHCi; too deep
+            (10, process(10, 1, false, 2_000)), // cabal repl; configured command, not charged
+            (11, process(11, 10, false, 20)), // .cabal-wrapped act-as-setup; charged
+            (12, process(12, 11, true, 12_000)), // ghc --interactive; charged
+            (13, process(13, 12, true, 11_000)), // nested GHCi; not charged
+            (14, process(14, 12, false, 9_000)), // GHCi child; not charged
             (20, process(20, 10, true, 4_000)), // other GHCi; too shallow
         ]);
         let usage = select_repl_processes(10, 10, &processes);
-        assert_eq!(usage.bytes, 12_000 * 1024 * 1024);
+        assert_eq!(usage.bytes, 12_020 * 1024 * 1024);
+        assert_eq!(usage.cabal_parent, Some((11, 20 * 1024 * 1024)));
         assert_eq!(
             usage.interactive_ghc,
             Some((12, 12_000 * 1024 * 1024))
@@ -272,6 +302,22 @@ mod tests {
         let usage = select_repl_processes(10, 10, &processes);
         assert_eq!(usage.bytes, 0);
         assert_eq!(usage.interactive_ghc, None);
+        assert_eq!(usage.cabal_parent, None);
+    }
+
+    #[test]
+    fn rejects_a_non_cabal_immediate_parent() {
+        let mut parent = process(11, 10, false, 20);
+        parent.cabal_executable = false;
+        let processes = BTreeMap::from([
+            (10, process(10, 1, false, 100)),
+            (11, parent),
+            (12, process(12, 11, true, 12_000)),
+        ]);
+        let usage = select_repl_processes(10, 10, &processes);
+        assert_eq!(usage.bytes, 0);
+        assert_eq!(usage.interactive_ghc, None);
+        assert_eq!(usage.cabal_parent, None);
     }
 
     #[test]
@@ -283,7 +329,8 @@ mod tests {
         ]);
         processes.get_mut(&12).unwrap().process_group_id = 12;
         let usage = select_repl_processes(10, 10, &processes);
-        assert_eq!(usage.bytes, 12_000 * 1024 * 1024);
+        assert_eq!(usage.bytes, 12_020 * 1024 * 1024);
+        assert_eq!(usage.cabal_parent, Some((11, 20 * 1024 * 1024)));
         assert_eq!(
             usage.interactive_ghc,
             Some((12, 12_000 * 1024 * 1024))
@@ -300,6 +347,22 @@ mod tests {
         )));
         assert!(!is_ghc_executable(std::path::Path::new(
             "/nix/store/x/bin/ghciwatch"
+        )));
+    }
+
+    #[test]
+    fn recognizes_cabal_executables() {
+        assert!(is_cabal_executable(std::path::Path::new(
+            "/nix/store/x/bin/cabal"
+        )));
+        assert!(is_cabal_executable(std::path::Path::new(
+            "/nix/store/x/bin/.cabal-wrapped"
+        )));
+        assert!(is_cabal_executable(std::path::Path::new(
+            "/nix/store/x/bin/cabal-3.16.1.0"
+        )));
+        assert!(!is_cabal_executable(std::path::Path::new(
+            "/nix/store/x/bin/ghc"
         )));
     }
 

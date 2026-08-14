@@ -164,6 +164,8 @@ pub struct GhciOpts {
     pub reload_globs: GlobMatcher,
     /// Determines whether we should interrupt a reload in progress or not.
     pub interrupt_reloads: bool,
+    /// Whether watched changes automatically issue `:reload`.
+    pub auto_reload: bool,
     /// Where to write what `ghci` emits to `stdout`. Inherits parent's `stdout` by default.
     pub stdout_writer: GhciWriter,
     /// Where to write what `ghci` emits to `stderr`. Inherits parent's `stderr` by default.
@@ -253,6 +255,7 @@ impl GhciOpts {
                 restart_globs: opts.watch.restart_globs()?,
                 reload_globs: opts.watch.reload_globs()?,
                 interrupt_reloads: opts.interrupt_reloads(),
+                auto_reload: !opts.no_auto_reload,
                 stdout_writer,
                 stderr_writer,
                 clear: opts.clear,
@@ -620,6 +623,10 @@ impl Ghci {
             })
             .collect::<eyre::Result<BTreeSet<_>>>()?;
         let mut actions = self.classifier.classify(events, &self.targets)?;
+        if !self.opts.auto_reload {
+            actions.needs_reload.clear();
+            // Keep target additions/removals and restart-glob actions intact.
+        }
 
         // Notification streams are hints, not transactions. Diff a complete
         // filesystem snapshot so event reordering or omission cannot hide targets.
@@ -636,7 +643,7 @@ impl Ghci {
         Ok(actions)
     }
 
-    /// Reload this `ghci` session to include the given modified and removed paths.
+    /// Synchronize watched targets and optionally reload this `ghci` session.
     ///
     /// This may fully restart the `ghci` process.
     ///
@@ -1036,13 +1043,78 @@ impl Ghci {
             modules.push(LoadedModule::with_name(path.clone(), name));
         }
 
+        // Prefer module names: in a Cabal multi-home-unit session this lets GHC associate a target
+        // with its existing home unit instead of assigning a path target to the interactive unit.
+        // `:show paths`, however, flattens the import paths from all home units and loses their unit
+        // association. A name derived from that output can consequently be valid yet unresolvable
+        // from GHCi's current unit. Keep the failed attempt out of the final compilation log if we
+        // can recover by adding those targets by path.
+        let mut name_log = CompilationLog::default();
+        self.add_loaded_modules(&modules, paths, &mut name_log).await?;
+        self.refresh_targets().await?;
+
+        let missing_paths = paths
+            .iter()
+            .filter(|path| !self.targets.contains_source_path(*path))
+            .cloned()
+            .collect::<Vec<_>>();
+        if missing_paths.is_empty() {
+            // GHCi command errors such as "Module not found" do not necessarily emit a
+            // compilation summary. Do not let an earlier successful operation's summary make this
+            // addition look successful.
+            name_log.fill_empty_summary();
+            log.summary = name_log.summary;
+            log.diagnostics.extend(name_log.diagnostics);
+        } else {
+            tracing::warn!(
+                "GHCi could not resolve some added modules by name; retrying by path:\n{}",
+                format_bulleted_list(&missing_paths)
+            );
+            let fallback_modules = missing_paths
+                .iter()
+                .cloned()
+                .map(LoadedModule::new)
+                .collect::<Vec<_>>();
+            let mut fallback_log = CompilationLog::default();
+            self.add_loaded_modules(&fallback_modules, &missing_paths, &mut fallback_log)
+                .await?;
+            self.refresh_targets().await?;
+            let unresolved_paths = missing_paths
+                .iter()
+                .filter(|path| !self.targets.contains_source_path(*path))
+                .collect::<Vec<_>>();
+            if unresolved_paths.is_empty() {
+                fallback_log.fill_empty_summary();
+            } else {
+                tracing::warn!(
+                    "GHCi did not add some modules even by path:\n{}",
+                    format_bulleted_list(unresolved_paths)
+                );
+                fallback_log.mark_failed();
+            }
+            log.summary = fallback_log.summary;
+            log.diagnostics.extend(fallback_log.diagnostics);
+        }
+
+        self.refresh_eval_commands_for_paths(paths).await?;
+
+        Ok(())
+    }
+
+    /// Submit one monitored `:add` command.
+    async fn add_loaded_modules(
+        &mut self,
+        modules: &[LoadedModule],
+        paths: &[NormalPath],
+        log: &mut CompilationLog,
+    ) -> eyre::Result<()> {
         // Like `:reload` and `:unadd`, `:add` compiles the target set and can wedge inside GHC.
         // Monitor stdout activity rather than imposing an absolute compilation duration.
         let completed = self
             .stdin
             .add_modules(
                 &mut self.stdout,
-                &modules,
+                modules,
                 log,
                 COMPILATION_INACTIVITY_TIMEOUT,
             )
@@ -1065,57 +1137,6 @@ impl Ghci {
                 .await
                 .wrap_err("Failed to recover from inactive :add")?;
         }
-
-        // TODO: This could lead to the module set getting out of sync with the underlying GHCi
-        // session.
-        //
-        // If there's a TOATOU bug here (e.g. we're attempting to add a module but the file no
-        // longer exists), then we can get into a situation like this:
-        //
-        //     ghci> :add src/DoesntExist.hs src/MyLib.hs
-        //     File src/DoesntExist.hs not found
-        //     [4 of 4] Compiling MyLib        ( src/MyLib.hs, interpreted )
-        //     Ok, four modules loaded.
-        //
-        //     ghci> :show targets
-        //     src/MyLib.hs
-        //     ...
-        //
-        // We've requested to load two modules, only one has been loaded, but GHCi has reported
-        // that compilation was successful and hasn't added the failing module to the target set.
-        // Note that if the file is found but compilation fails, the file _is_ added to the target
-        // set:
-        //
-        //     ghci> :add src/MyCoolLib.hs
-        //     [4 of 4] Compiling MyCoolLib        ( src/MyCoolLib.hs, interpreted )
-        //
-        //     src/MyCoolLib.hs:4:12: error:
-        //         • Couldn't match expected type ‘IO ()’ with actual type ‘()’
-        //         • In the expression: ()
-        //           In an equation for ‘someFunc’: someFunc = ()
-        //       |
-        //     4 | someFunc = ()
-        //       |            ^^
-        //     Failed, three modules loaded.
-        //
-        //     ghci> :show targets
-        //     src/MyCoolLib.hs
-        //     ...
-        //
-        // I think this is OK, because the only reason we need to know which modules are loaded is
-        // to avoid the "module defined in multiple files" bug [1], so the potential outcomes of
-        // making this mistake are:
-        //
-        // The next time the file is modified, we may attempt to `:add` it again instead of
-        // `:reload`ing it. This is harmless, though it changes target ordering. New modules are
-        // added by module name so Cabal/GHCi can associate them with an existing home unit instead
-        // of assigning a path target to the interactive unit.
-        //
-        // [1]: https://gitlab.haskell.org/ghc/ghc/-/issues/13254#note_525037
-
-        self.targets.extend(modules);
-
-        self.refresh_eval_commands_for_paths(paths).await?;
 
         Ok(())
     }
