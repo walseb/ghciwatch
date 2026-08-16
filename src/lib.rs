@@ -54,6 +54,7 @@ pub use shutdown::ShutdownManager;
 pub use tracing::TracingOpts;
 pub use tui::run_tui;
 pub use watcher::run_watcher;
+pub use watcher::WatcherCommand;
 pub use watcher::WatcherOpts;
 
 #[cfg(test)]

@@ -17,6 +17,7 @@ use ghciwatch::run_watcher;
 use ghciwatch::GhciOpts;
 use ghciwatch::ShutdownManager;
 use ghciwatch::TracingOpts;
+use ghciwatch::WatcherCommand;
 use ghciwatch::WatcherOpts;
 use tokio::sync::mpsc;
 
@@ -64,6 +65,7 @@ async fn main() -> eyre::Result<()> {
     std::env::set_var("IN_GHCIWATCH", "1");
 
     let (ghci_sender, ghci_receiver) = mpsc::channel(32);
+    let (watcher_command_sender, watcher_command_receiver) = mpsc::channel::<WatcherCommand>(8);
 
     let (ghci_opts, maybe_ghci_reader) = GhciOpts::from_cli(&opts)?;
     let watcher_opts = WatcherOpts::from_cli(&opts);
@@ -84,12 +86,12 @@ async fn main() -> eyre::Result<()> {
 
     manager
         .spawn("run_ghci", |handle| {
-            run_ghci(handle, ghci_opts, ghci_receiver)
+            run_ghci(handle, ghci_opts, ghci_receiver, watcher_command_sender)
         })
         .await;
     manager
         .spawn("run_watcher", move |handle| {
-            run_watcher(handle, ghci_sender, watcher_opts)
+            run_watcher(handle, ghci_sender, watcher_command_receiver, watcher_opts)
         })
         .await;
     let ret = manager.wait_for_shutdown().await;

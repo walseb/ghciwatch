@@ -1,7 +1,9 @@
+use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::io::ErrorKind;
 use std::time::Duration;
 
+use camino::Utf8PathBuf;
 use eyre::eyre;
 use notify_debouncer_full::notify;
 use notify_debouncer_full::notify::PollWatcher;
@@ -13,16 +15,39 @@ use notify_debouncer_full::Debouncer;
 use notify_debouncer_full::FileIdMap;
 use tokio::runtime::Handle;
 use tokio::sync::mpsc;
+use tokio::sync::oneshot;
 use tokio::task::block_in_place;
 use tracing::instrument;
 
 use crate::cli::Opts;
 use crate::event_filter::file_events_from_action;
 use crate::event_filter::file_states;
+use crate::event_filter::FileEvent;
+use crate::event_filter::FileState;
 use crate::ghci::manager::WatcherEvent;
 use crate::haskell_source_file::is_haskell_source_file;
 use crate::normal_path::NormalPath;
 use crate::shutdown::ShutdownHandle;
+
+/// A command sent by the GHCi manager to the filesystem watcher.
+#[derive(Debug)]
+pub enum WatcherCommand {
+    /// Replace the temporary set of source files that can trigger a retry after GHCi startup fails.
+    ///
+    /// The reply is sent only after the temporary watcher has been installed. Errors are strings so
+    /// the watcher can both report the failure and remain alive for ordinary configured watches.
+    SetStartupRetryFiles {
+        /// Absolute, normalized files to watch.
+        files: BTreeSet<Utf8PathBuf>,
+        /// Reports whether the temporary watcher was installed.
+        ack: oneshot::Sender<Result<(), String>>,
+    },
+    /// Remove all temporary startup-retry watches.
+    ClearStartupRetryFiles {
+        /// Acknowledges that the temporary watcher has stopped.
+        ack: oneshot::Sender<()>,
+    },
+}
 
 /// Options for [`run_watcher`]. This is like a lower-effort builder interface, mostly
 /// provided because Rust tragically lacks named arguments.
@@ -55,18 +80,20 @@ impl WatcherOpts {
 pub async fn run_watcher(
     handle: ShutdownHandle,
     ghci_sender: mpsc::Sender<WatcherEvent>,
+    command_receiver: mpsc::Receiver<WatcherCommand>,
     opts: WatcherOpts,
 ) -> eyre::Result<()> {
     if opts.poll.is_some() {
-        run_debouncer::<PollWatcher>(handle, ghci_sender, opts).await
+        run_debouncer::<PollWatcher>(handle, ghci_sender, command_receiver, opts).await
     } else {
-        run_debouncer::<RecommendedWatcher>(handle, ghci_sender, opts).await
+        run_debouncer::<RecommendedWatcher>(handle, ghci_sender, command_receiver, opts).await
     }
 }
 
 async fn run_debouncer<T: notify::Watcher>(
     mut handle: ShutdownHandle,
     ghci_sender: mpsc::Sender<WatcherEvent>,
+    mut command_receiver: mpsc::Receiver<WatcherCommand>,
     opts: WatcherOpts,
 ) -> eyre::Result<()> {
     let mut config = notify::Config::default();
@@ -76,7 +103,7 @@ async fn run_debouncer<T: notify::Watcher>(
 
     let event_handler = EventHandler {
         handle: Handle::current(),
-        ghci_sender,
+        ghci_sender: ghci_sender.clone(),
         shutdown: handle.clone(),
         watch: opts.watch.clone(),
     };
@@ -91,7 +118,7 @@ async fn run_debouncer<T: notify::Watcher>(
         tick_rate,
         event_handler,
         cache,
-        config,
+        config.clone(),
     )?;
 
     {
@@ -119,13 +146,101 @@ async fn run_debouncer<T: notify::Watcher>(
     }
 
     tracing::debug!("notify watcher started");
+    let mut retry_debouncer: Option<Debouncer<T, FileIdMap>> = None;
 
-    // Wait for a shutdown request, either from another subsystem or from an error in the handler.
-    let _ = handle.on_shutdown_requested().await;
+    loop {
+        tokio::select! {
+            _ = handle.on_shutdown_requested() => break,
+            command = command_receiver.recv() => {
+                let Some(command) = command else {
+                    break;
+                };
+                match command {
+                    WatcherCommand::SetStartupRetryFiles { files, ack } => {
+                        let result = if files.is_empty() {
+                            stop_debouncer(&mut retry_debouncer);
+                            Ok(())
+                        } else {
+                            match startup_retry_debouncer::<T>(
+                                ghci_sender.clone(),
+                                opts.watch.clone(),
+                                files,
+                                opts.debounce,
+                                config.clone(),
+                            ) {
+                                Ok(new_debouncer) => {
+                                    stop_debouncer(&mut retry_debouncer);
+                                    retry_debouncer = Some(new_debouncer);
+                                    Ok(())
+                                }
+                                // Keep the previous retry watcher alive if replacing it fails.
+                                Err(error) => Err(format!("{error:?}")),
+                            }
+                        };
+                        let _ = ack.send(result);
+                    }
+                    WatcherCommand::ClearStartupRetryFiles { ack } => {
+                        stop_debouncer(&mut retry_debouncer);
+                        let _ = ack.send(());
+                    }
+                }
+            }
+        }
+    }
 
+    stop_debouncer(&mut retry_debouncer);
     block_in_place(|| debouncer.stop());
-
     Ok(())
+}
+
+fn stop_debouncer<T: notify::Watcher>(debouncer: &mut Option<Debouncer<T, FileIdMap>>) {
+    if let Some(debouncer) = debouncer.take() {
+        debouncer.stop_nonblocking();
+    }
+}
+
+fn startup_retry_debouncer<T: notify::Watcher>(
+    ghci_sender: mpsc::Sender<WatcherEvent>,
+    watch: Vec<NormalPath>,
+    files: BTreeSet<Utf8PathBuf>,
+    debounce: Duration,
+    config: notify::Config,
+) -> eyre::Result<Debouncer<T, FileIdMap>> {
+    let baseline_events = files
+        .iter()
+        .cloned()
+        .map(FileEvent::Modify)
+        .collect::<BTreeSet<_>>();
+    let event_handler = StartupRetryEventHandler {
+        handle: Handle::current(),
+        ghci_sender,
+        watch,
+        files: files.clone(),
+        baseline_states: file_states(&baseline_events)?,
+    };
+    let mut debouncer = notify_debouncer_full::new_debouncer_opt(
+        debounce,
+        None,
+        event_handler,
+        FileIdMap::new(),
+        config,
+    )?;
+    let parents = files
+        .iter()
+        .filter_map(|file| file.parent().map(|parent| parent.to_owned()))
+        .collect::<BTreeSet<_>>();
+    {
+        let watcher = debouncer.watcher();
+        for parent in &parents {
+            watcher.watch(parent.as_std_path(), RecursiveMode::NonRecursive)?;
+        }
+        let mut cache = debouncer.cache();
+        for parent in parents {
+            cache.add_root(parent.into_std_path_buf(), RecursiveMode::NonRecursive);
+        }
+    }
+    tracing::debug!(?files, "Installed temporary startup-retry watches");
+    Ok(debouncer)
 }
 
 struct EventHandler {
@@ -144,49 +259,8 @@ impl EventHandler {
     }
 
     async fn handle_event_inner(&self, event: DebounceEventResult) -> eyre::Result<()> {
-        let events = match event {
-            Ok(events) => events,
-            Err(errors) => {
-                let mut fatal_error = false;
-                for err in errors {
-                    if notify_error_is_fatal(&err) {
-                        fatal_error = true;
-                        tracing::error!("{err}");
-                    } else {
-                        tracing::debug!("{err}");
-                    }
-                }
-
-                return if fatal_error {
-                    Err(eyre!("Watching files failed"))
-                } else {
-                    Ok(())
-                };
-            }
-        };
-
-        tracing::trace!(?events, "Got events");
-
-        // TODO: On Linux, sometimes we get a "new directory" event but none of the events for
-        // files inside of it. When we get new directories, we should paw through them with
-        // `walkdir` or something to check for files.
-        let events = file_events_from_action(events)?;
-        let states = file_states(&events)?;
-        let haskell_files = scan_haskell_files(&self.watch)?;
-        if events.is_empty() {
-            tracing::debug!("No relevant file events");
-        } else {
-            tracing::debug!(?events, files = haskell_files.len(), "Processed events");
-            self.ghci_sender
-                .send(WatcherEvent::Reload {
-                    events,
-                    states,
-                    haskell_files,
-                })
-                .await?;
-        }
-
-        Ok(())
+        let events = process_debounced_events(event)?;
+        send_event(&self.ghci_sender, &self.watch, events, false).await
     }
 }
 
@@ -196,13 +270,94 @@ impl DebounceEventHandler for EventHandler {
     }
 }
 
+struct StartupRetryEventHandler {
+    handle: Handle,
+    ghci_sender: mpsc::Sender<WatcherEvent>,
+    watch: Vec<NormalPath>,
+    files: BTreeSet<Utf8PathBuf>,
+    baseline_states: BTreeMap<Utf8PathBuf, FileState>,
+}
+
+impl StartupRetryEventHandler {
+    async fn handle_event_async(&self, event: DebounceEventResult) {
+        let result = async {
+            let mut events = process_debounced_events(event)?;
+            events.retain(|event| self.files.contains(event.as_path()));
+            let states = file_states(&events)?;
+            events.retain(|event| {
+                states.get(event.as_path()) != self.baseline_states.get(event.as_path())
+            });
+            send_event(&self.ghci_sender, &self.watch, events, true).await
+        }
+        .await;
+        if let Err(err) = result {
+            // Retry watches are best-effort. Ordinary configured watches remain available if a
+            // temporary watcher reports an error.
+            tracing::warn!("Startup-retry watcher error: {err:?}");
+        }
+    }
+}
+
+impl DebounceEventHandler for StartupRetryEventHandler {
+    fn handle_event(&mut self, event: DebounceEventResult) {
+        self.handle.block_on(self.handle_event_async(event))
+    }
+}
+
+fn process_debounced_events(
+    event: DebounceEventResult,
+) -> eyre::Result<BTreeSet<FileEvent>> {
+    let events = match event {
+        Ok(events) => events,
+        Err(errors) => {
+            let mut fatal_error = false;
+            for err in errors {
+                if notify_error_is_fatal(&err) {
+                    fatal_error = true;
+                    tracing::error!("{err}");
+                } else {
+                    tracing::debug!("{err}");
+                }
+            }
+            return if fatal_error {
+                Err(eyre!("Watching files failed"))
+            } else {
+                Ok(BTreeSet::new())
+            };
+        }
+    };
+    tracing::trace!(?events, "Got events");
+    file_events_from_action(events)
+}
+
+async fn send_event(
+    ghci_sender: &mpsc::Sender<WatcherEvent>,
+    watch: &[NormalPath],
+    events: BTreeSet<FileEvent>,
+    startup_retry: bool,
+) -> eyre::Result<()> {
+    let states = file_states(&events)?;
+    let haskell_files = scan_haskell_files(watch)?;
+    if events.is_empty() {
+        tracing::debug!("No relevant file events");
+    } else {
+        tracing::debug!(?events, files = haskell_files.len(), "Processed events");
+        ghci_sender
+            .send(WatcherEvent::Reload {
+                events,
+                states,
+                haskell_files,
+                startup_retry,
+            })
+            .await?;
+    }
+    Ok(())
+}
+
 /// Take a fresh snapshot instead of relying on notification ordering. Files can
 /// appear without an individual event (notably when a whole directory is created).
-fn scan_haskell_files(roots: &[NormalPath]) -> eyre::Result<BTreeSet<camino::Utf8PathBuf>> {
-    fn visit(
-        path: &std::path::Path,
-        files: &mut BTreeSet<camino::Utf8PathBuf>,
-    ) -> eyre::Result<()> {
+fn scan_haskell_files(roots: &[NormalPath]) -> eyre::Result<BTreeSet<Utf8PathBuf>> {
+    fn visit(path: &std::path::Path, files: &mut BTreeSet<Utf8PathBuf>) -> eyre::Result<()> {
         let metadata = match std::fs::metadata(path) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
@@ -213,7 +368,7 @@ fn scan_haskell_files(roots: &[NormalPath]) -> eyre::Result<BTreeSet<camino::Utf
                 visit(&entry?.path(), files)?;
             }
         } else {
-            let path = camino::Utf8PathBuf::try_from(path.to_path_buf())?;
+            let path = Utf8PathBuf::try_from(path.to_path_buf())?;
             if is_haskell_source_file(&path) {
                 files.insert(path);
             }
@@ -230,10 +385,7 @@ fn scan_haskell_files(roots: &[NormalPath]) -> eyre::Result<BTreeSet<camino::Utf
 
 fn notify_error_is_fatal(err: &notify::Error) -> bool {
     match &err.kind {
-        notify::ErrorKind::Io(error) => {
-            // "File not found" isn't fatal, everything else is.
-            error.kind() != std::io::ErrorKind::NotFound
-        }
+        notify::ErrorKind::Io(error) => error.kind() != std::io::ErrorKind::NotFound,
         notify::ErrorKind::PathNotFound | notify::ErrorKind::WatchNotFound => false,
         _ => true,
     }

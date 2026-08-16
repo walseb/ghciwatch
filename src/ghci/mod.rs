@@ -761,15 +761,18 @@ impl Ghci {
     /// really "restarting" a session so much as starting it again. That is, this method avoids
     /// "broken pipe" errors with `--before-restart-ghci` hooks.
     #[instrument(skip_all, level = "debug")]
-    async fn startup_restart(&mut self, haskell_files: BTreeSet<Utf8PathBuf>) -> eyre::Result<()> {
-        let mut log = CompilationLog::default();
+    async fn startup_restart(
+        &mut self,
+        haskell_files: BTreeSet<Utf8PathBuf>,
+        log: &mut CompilationLog,
+    ) -> eyre::Result<()> {
         let haskell_files = haskell_files
             .into_iter()
             .map(|path| self.classifier.relative_path(path))
             .collect::<eyre::Result<BTreeSet<_>>>()?;
 
         self.restart_inner(
-            &mut log,
+            log,
             [LifecycleEvent::Startup(hooks::When::After)],
             Some(haskell_files),
         )

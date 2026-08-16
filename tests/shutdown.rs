@@ -185,7 +185,8 @@ async fn handles_repeated_startup_failures() {
         .await
         .expect("ghciwatch detects second startup failure");
 
-    // Fix the dependency, then trigger another restart.
+    // Fixing the diagnosed dependency itself triggers another restart even though the test
+    // harness only configures `--watch src` and the package file.
     session
         .fs()
         .replace(
@@ -195,11 +196,6 @@ async fn handles_repeated_startup_failures() {
         )
         .await
         .expect("can fix simple-dep");
-    session
-        .fs()
-        .touch(session.path("src/MyLib.hs"))
-        .await
-        .expect("can touch source file");
 
     // This restart should succeed.
     session
@@ -208,6 +204,41 @@ async fn handles_repeated_startup_failures() {
         ))
         .await
         .expect("ghciwatch restarts ghci after dependency is fixed");
+}
+
+/// A diagnosed source already covered by `--watch` also triggers exactly the same startup retry.
+#[test]
+async fn startup_retry_file_already_watched() {
+    let mut session = GhciWatchBuilder::new("tests/data/with-dep")
+        .before_start(move |path| async move {
+            Fs::new()
+                .replace(path.join("src/MyLib.hs"), "\"someFunc\"", "\"someFunc")
+                .await
+        })
+        .start()
+        .await
+        .expect("ghciwatch starts");
+
+    session
+        .wait_for_startup_log("ghci exited during startup")
+        .await
+        .expect("ghciwatch detects startup failure");
+    session.clear_events();
+
+    session
+        .fs()
+        .replace(
+            session.path("src/MyLib.hs"),
+            "\"someFunc",
+            "\"someFunc\"",
+        )
+        .await
+        .expect("can fix watched source file");
+
+    session
+        .wait_for_startup_log(BaseMatcher::ghci_started())
+        .await
+        .expect("ghciwatch retries after diagnosed watched source changes");
 }
 
 /// Check that startup failures are handled correctly with `--before-restart-ghci` hooks.
