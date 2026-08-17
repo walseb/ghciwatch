@@ -287,10 +287,6 @@
       just
       prek
     ];
-
-    shellHook = ''
-      prek install -f >/dev/null
-    '';
   };
 in
   craneLib.buildPackage (releaseArgs
