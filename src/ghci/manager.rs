@@ -100,6 +100,7 @@ impl WatcherEvent {
                 events,
                 states,
                 haskell_files,
+                ..
             } => {
                 events.retain(|event| {
                     states.get(event.as_path()) != applied_states.get(event.as_path())

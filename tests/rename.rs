@@ -28,8 +28,8 @@ async fn can_compile_renamed_module() {
         .await
         .expect("ghciwatch adds and removes modules on module move");
 
-    // New targets are added by module name so GHCi can preserve home-unit ownership. Until the
-    // declaration is renamed to match its new module name, compilation should fail.
+    // The moved path still declares its old module name, so adding it must fail until the
+    // declaration is renamed to match the new path.
     session
         .wait_for_log(BaseMatcher::compilation_failed())
         .await

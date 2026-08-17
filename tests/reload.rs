@@ -68,7 +68,8 @@ async fn can_synchronize_targets_without_auto_reload() {
     );
 
     let new_module = session.path("src/NewModule.hs");
-    session.fs()
+    session
+        .fs()
         .write(&new_module, "module NewModule where\nnewValue = ()\n")
         .await
         .unwrap();

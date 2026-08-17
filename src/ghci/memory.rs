@@ -173,7 +173,10 @@ fn is_ghc_executable(path: &std::path::Path) -> bool {
     path.file_name()
         .and_then(|name| name.to_str())
         .is_some_and(|name| {
-            name == "ghc" || name.strip_prefix("ghc-").is_some_and(|version| !version.is_empty())
+            name == "ghc"
+                || name
+                    .strip_prefix("ghc-")
+                    .is_some_and(|version| !version.is_empty())
         })
 }
 
@@ -275,7 +278,7 @@ mod tests {
     fn counts_only_interactive_ghc_and_its_immediate_parent() {
         let processes = BTreeMap::from([
             (10, process(10, 1, false, 2_000)), // cabal repl; configured command, not charged
-            (11, process(11, 10, false, 20)), // .cabal-wrapped act-as-setup; charged
+            (11, process(11, 10, false, 20)),   // .cabal-wrapped act-as-setup; charged
             (12, process(12, 11, true, 12_000)), // ghc --interactive; charged
             (13, process(13, 12, true, 11_000)), // nested GHCi; not charged
             (14, process(14, 12, false, 9_000)), // GHCi child; not charged
@@ -284,10 +287,7 @@ mod tests {
         let usage = select_repl_processes(10, 10, &processes);
         assert_eq!(usage.bytes, 12_020 * 1024 * 1024);
         assert_eq!(usage.cabal_parent, Some((11, 20 * 1024 * 1024)));
-        assert_eq!(
-            usage.interactive_ghc,
-            Some((12, 12_000 * 1024 * 1024))
-        );
+        assert_eq!(usage.interactive_ghc, Some((12, 12_000 * 1024 * 1024)));
     }
 
     #[test]
@@ -331,10 +331,7 @@ mod tests {
         let usage = select_repl_processes(10, 10, &processes);
         assert_eq!(usage.bytes, 12_020 * 1024 * 1024);
         assert_eq!(usage.cabal_parent, Some((11, 20 * 1024 * 1024)));
-        assert_eq!(
-            usage.interactive_ghc,
-            Some((12, 12_000 * 1024 * 1024))
-        );
+        assert_eq!(usage.interactive_ghc, Some((12, 12_000 * 1024 * 1024)));
     }
 
     #[test]
@@ -368,8 +365,7 @@ mod tests {
 
     #[test]
     fn parses_process_group_in_the_procfs_mount_namespace() {
-        let status =
-            "Name:\tghci\nPPid:\t17\nNSpgid:\t71\t203\nVmRSS:\t20971521 kB\n";
+        let status = "Name:\tghci\nPPid:\t17\nNSpgid:\t71\t203\nVmRSS:\t20971521 kB\n";
         assert_eq!(
             parse_process_status(status),
             Some((17, 71, 20_971_521 * 1024))

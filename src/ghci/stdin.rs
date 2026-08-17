@@ -65,12 +65,7 @@ impl GhciStdin {
         stdout.clear_stderr_buffer().await?;
         self.stdin.write_all(line.as_bytes()).await?;
         stdout
-            .prompt_with_progress_timeout(
-                &mut self.stdin,
-                FindAt::LineStart,
-                log,
-                progress_timeout,
-            )
+            .prompt_with_progress_timeout(&mut self.stdin, FindAt::LineStart, log, progress_timeout)
             .await
     }
 
@@ -142,13 +137,8 @@ impl GhciStdin {
         log: &mut CompilationLog,
         inactivity_timeout: Duration,
     ) -> eyre::Result<bool> {
-        self.write_line_with_progress_timeout(
-            stdout,
-            ":reload\n",
-            log,
-            inactivity_timeout,
-        )
-        .await
+        self.write_line_with_progress_timeout(stdout, ":reload\n", log, inactivity_timeout)
+            .await
     }
 
     #[instrument(skip_all, level = "debug")]

@@ -107,8 +107,7 @@ fn try_acquire_lock(path: &Path) -> eyre::Result<Option<File>> {
     match flock(lock.as_raw_fd(), FlockArg::LockExclusiveNonblock) {
         Ok(()) => Ok(Some(lock)),
         Err(nix::errno::Errno::EWOULDBLOCK) => Ok(None),
-        Err(error) => Err(error)
-            .wrap_err_with(|| format!("Failed to lock {}", path.display())),
+        Err(error) => Err(error).wrap_err_with(|| format!("Failed to lock {}", path.display())),
     }
 }
 

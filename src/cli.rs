@@ -91,10 +91,18 @@ pub struct Opts {
 
     /// Don't automatically issue `:reload` for watched changes.
     ///
-    /// Watched Haskell files are still added to and removed from GHCi's target set with `:add` and
-    /// `:unadd`. Changes matching restart globs still restart the session.
+    /// Watched Haskell files still update GHCi's target set. Changes matching restart globs, or
+    /// additions with `--restart-on-add`, still restart the session.
     #[arg(long)]
     pub no_auto_reload: bool,
+
+    /// Restart the GHCi command rather than using path-based `:add` for a new Haskell module.
+    ///
+    /// Use this for object-code package sessions. `:add` assigns a path target to GHCi's
+    /// interactive unit, while adding by module name cannot update the running package graph.
+    /// Restarting lets the package command rebuild its home-unit target set from current metadata.
+    #[arg(long)]
+    pub restart_on_add: bool,
 
     /// A shell command to run synchronously immediately before GHCi is sent `SIGINT`.
     ///

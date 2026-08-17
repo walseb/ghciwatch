@@ -166,6 +166,8 @@ pub struct GhciOpts {
     pub interrupt_reloads: bool,
     /// Whether watched changes automatically issue `:reload`.
     pub auto_reload: bool,
+    /// Whether discovering a Haskell module restarts the package-managed session.
+    pub restart_on_add: bool,
     /// Where to write what `ghci` emits to `stdout`. Inherits parent's `stdout` by default.
     pub stdout_writer: GhciWriter,
     /// Where to write what `ghci` emits to `stderr`. Inherits parent's `stderr` by default.
@@ -256,6 +258,7 @@ impl GhciOpts {
                 reload_globs: opts.watch.reload_globs()?,
                 interrupt_reloads: opts.interrupt_reloads(),
                 auto_reload: !opts.no_auto_reload,
+                restart_on_add: opts.restart_on_add,
                 stdout_writer,
                 stderr_writer,
                 clear: opts.clear,
@@ -639,6 +642,15 @@ impl Ghci {
             if self.targets.contains_source_path(path) && !actions.needs_remove.contains(path) {
                 actions.needs_remove.push(path.clone());
             }
+        }
+        // A path-based `:add` is correct for ordinary interpreted sessions, but in an
+        // object-code Cabal session it creates an interactive-unit target rather than extending
+        // the configured home unit. Symbols compiled under the package-qualified home unit can
+        // then be missing or duplicated. A module name cannot repair this: the running GHCi's
+        // package graph predates the new module. Restart so Cabal reconstructs that graph from
+        // current package metadata, assigning every object to its proper home unit.
+        if self.opts.restart_on_add && !actions.needs_add.is_empty() {
+            actions.needs_restart.append(&mut actions.needs_add);
         }
         Ok(actions)
     }
@@ -1031,7 +1043,6 @@ impl Ghci {
         paths: &[NormalPath],
         log: &mut CompilationLog,
     ) -> eyre::Result<()> {
-        let mut modules = Vec::with_capacity(paths.len());
         for path in paths {
             if self.targets.contains_source_path(path) {
                 return Err(eyre!(
@@ -1039,64 +1050,33 @@ impl Ghci {
                     This is a ghciwatch bug; please report it upstream"
                 ));
             }
-            let name = self
-                .search_paths
-                .path_to_module(path)
-                .wrap_err_with(|| format!("Failed to determine module name for {path}"))?;
-            modules.push(LoadedModule::with_name(path.clone(), name));
         }
 
-        // Prefer module names: in a Cabal multi-home-unit session this lets GHC associate a target
-        // with its existing home unit instead of assigning a path target to the interactive unit.
-        // `:show paths`, however, flattens the import paths from all home units and loses their unit
-        // association. A name derived from that output can consequently be valid yet unresolvable
-        // from GHCi's current unit. Keep the failed attempt out of the final compilation log if we
-        // can recover by adding those targets by path.
-        let mut name_log = CompilationLog::default();
-        self.add_loaded_modules(&modules, paths, &mut name_log).await?;
+        // Newly discovered files are absent from the running package graph, so adding a derived
+        // module name usually cannot resolve them. Interpreted sessions can safely add paths;
+        // object-code package sessions must use `--restart-on-add` instead.
+        let modules = paths
+            .iter()
+            .cloned()
+            .map(LoadedModule::new)
+            .collect::<Vec<_>>();
+        self.add_loaded_modules(&modules, paths, log).await?;
         self.refresh_targets().await?;
 
-        let missing_paths = paths
+        let unresolved_paths = paths
             .iter()
             .filter(|path| !self.targets.contains_source_path(*path))
-            .cloned()
             .collect::<Vec<_>>();
-        if missing_paths.is_empty() {
-            // GHCi command errors such as "Module not found" do not necessarily emit a
-            // compilation summary. Do not let an earlier successful operation's summary make this
-            // addition look successful.
-            name_log.fill_empty_summary();
-            log.summary = name_log.summary;
-            log.diagnostics.extend(name_log.diagnostics);
+        if unresolved_paths.is_empty() {
+            // GHCi command errors do not necessarily emit a compilation summary. Do not let an
+            // earlier successful operation's summary make this addition look successful.
+            log.fill_empty_summary();
         } else {
             tracing::warn!(
-                "GHCi could not resolve some added modules by name; retrying by path:\n{}",
-                format_bulleted_list(&missing_paths)
+                "GHCi did not add some modules by path:\n{}",
+                format_bulleted_list(unresolved_paths)
             );
-            let fallback_modules = missing_paths
-                .iter()
-                .cloned()
-                .map(LoadedModule::new)
-                .collect::<Vec<_>>();
-            let mut fallback_log = CompilationLog::default();
-            self.add_loaded_modules(&fallback_modules, &missing_paths, &mut fallback_log)
-                .await?;
-            self.refresh_targets().await?;
-            let unresolved_paths = missing_paths
-                .iter()
-                .filter(|path| !self.targets.contains_source_path(*path))
-                .collect::<Vec<_>>();
-            if unresolved_paths.is_empty() {
-                fallback_log.fill_empty_summary();
-            } else {
-                tracing::warn!(
-                    "GHCi did not add some modules even by path:\n{}",
-                    format_bulleted_list(unresolved_paths)
-                );
-                fallback_log.mark_failed();
-            }
-            log.summary = fallback_log.summary;
-            log.diagnostics.extend(fallback_log.diagnostics);
+            log.mark_failed();
         }
 
         self.refresh_eval_commands_for_paths(paths).await?;

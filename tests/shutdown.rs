@@ -227,11 +227,7 @@ async fn startup_retry_file_already_watched() {
 
     session
         .fs()
-        .replace(
-            session.path("src/MyLib.hs"),
-            "\"someFunc",
-            "\"someFunc\"",
-        )
+        .replace(session.path("src/MyLib.hs"), "\"someFunc", "\"someFunc\"")
         .await
         .expect("can fix watched source file");
 

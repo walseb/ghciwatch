@@ -218,7 +218,7 @@ fn startup_retry_debouncer<T: notify::Watcher>(
         files: files.clone(),
         baseline_states: file_states(&baseline_events)?,
     };
-    let mut debouncer = notify_debouncer_full::new_debouncer_opt(
+    let mut debouncer: Debouncer<T, FileIdMap> = notify_debouncer_full::new_debouncer_opt(
         debounce,
         None,
         event_handler,
@@ -304,9 +304,7 @@ impl DebounceEventHandler for StartupRetryEventHandler {
     }
 }
 
-fn process_debounced_events(
-    event: DebounceEventResult,
-) -> eyre::Result<BTreeSet<FileEvent>> {
+fn process_debounced_events(event: DebounceEventResult) -> eyre::Result<BTreeSet<FileEvent>> {
     let events = match event {
         Ok(events) => events,
         Err(errors) => {

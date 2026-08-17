@@ -12,8 +12,8 @@ use tracing::instrument;
 use crate::aho_corasick::AhoCorasickExt;
 use crate::incremental_reader::FindAt;
 use crate::incremental_reader::IncrementalReader;
-use crate::incremental_reader::ReadUntilStatus;
 use crate::incremental_reader::ReadOpts;
+use crate::incremental_reader::ReadUntilStatus;
 use crate::incremental_reader::WriteBehavior;
 
 use super::parse::parse_ghc_messages;

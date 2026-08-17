@@ -647,11 +647,7 @@ mod tests {
     async fn compiling_progress_resets_timeout_even_when_split_across_reads() {
         let (input, mut output) = tokio::io::duplex(64);
         tokio::spawn(async move {
-            for chunk in [
-                &b"[1 of 2] Comp"[..],
-                &b"iling Main\n"[..],
-                &b"prompt"[..],
-            ] {
+            for chunk in [&b"[1 of 2] Comp"[..], &b"iling Main\n"[..], &b"prompt"[..]] {
                 tokio::time::sleep(Duration::from_millis(25)).await;
                 output.write_all(chunk).await.unwrap();
             }
