@@ -304,11 +304,9 @@ pub struct Ghci {
     pub(crate) stdin: GhciStdin,
     /// The stdout reader.
     pub(crate) stdout: GhciStdout,
-    /// Sender for notifying the process watching job ([`GhciProcess`]) that we're shutting down
-    /// the `ghci` session on purpose. If the process watcher sees `ghci` exit, usually it will
-    /// trigger a shutdown of the entire program. This is bad if we're restarting `ghci` on
-    /// purpose, so this channel helps us avoid that.
-    restart_sender: mpsc::Sender<()>,
+    /// Requests intentional shutdown from [`GhciProcess`]. Its acknowledgement guarantees the
+    /// process tree has exited before this session drops its stdout/stderr readers.
+    restart_sender: mpsc::Sender<oneshot::Sender<()>>,
     /// Sender for notifying [`run_ghci`][manager::run_ghci] when `ghci` exits unexpectedly.
     /// Cloned into each new [`GhciProcess`] on construction; kept alive here so the channel is
     /// never closed while this session is live.
@@ -327,6 +325,9 @@ pub struct Ghci {
     targets: ModuleSet,
     /// Last filesystem snapshot successfully applied to GHCi's target set.
     known_haskell_files: BTreeSet<NormalPath>,
+    /// A replacement may return to its prompt after failing to compile. Retain that failure so
+    /// the next relevant edit restarts the incomplete session even with `--no-auto-reload`.
+    initialization_failure: Option<CompilationLog>,
     /// Eval commands, if `opts.enable_eval` is set.
     eval_commands: BTreeMap<NormalPath, Vec<EvalCommand>>,
     /// Search paths / current working directory for this `ghci` session.
@@ -538,6 +539,7 @@ impl Ghci {
             classifier,
             targets: Default::default(),
             known_haskell_files: Default::default(),
+            initialization_failure: None,
             eval_commands: Default::default(),
             search_paths: ShowPaths {
                 cwd: crate::current_dir_utf8()?,
@@ -582,6 +584,8 @@ impl Ghci {
         //
         // Note: We ONLY want to do this on startup.
         log.fill_empty_summary();
+        self.initialization_failure =
+            matches!(log.result(), Some(CompilationResult::Err)).then(|| log.clone());
         self.finish_compilation(start_instant, log, events).await?;
 
         result
@@ -625,7 +629,21 @@ impl Ghci {
                 })
             })
             .collect::<eyre::Result<BTreeSet<_>>>()?;
+        let recovery_paths = if self.initialization_failure.is_some() {
+            events
+                .iter()
+                .filter(|event| is_haskell_source_file(event.as_path()))
+                .map(|event| self.classifier.relative_path(event.as_path()))
+                .collect::<eyre::Result<Vec<_>>>()?
+        } else {
+            Vec::new()
+        };
         let mut actions = self.classifier.classify(events, &self.targets)?;
+        for path in recovery_paths {
+            if !actions.needs_restart.contains(&path) {
+                actions.needs_restart.push(path);
+            }
+        }
         if !self.opts.auto_reload {
             actions.needs_reload.clear();
             // Keep target additions/removals and restart-glob actions intact.
@@ -1259,10 +1277,15 @@ impl Ghci {
     /// Stop this `ghci` session and cancel the async tasks associated with it.
     #[instrument(skip_all, level = "debug")]
     async fn stop(&mut self) -> eyre::Result<()> {
-        // Tell the `GhciProcess` to shut down `ghci` without requesting a shutdown for
-        // `ghciwatch`.
-        let _ = self.restart_sender.try_send(());
-
+        // Do not replace `self` until the old process exits: dropping its readers early makes
+        // shutdown-time output fail with misleading `hPutChar: resource vanished (Broken pipe)`.
+        let (ack, done) = oneshot::channel();
+        self.restart_sender
+            .send(ack)
+            .await
+            .wrap_err("GHCi process watcher stopped before intentional shutdown")?;
+        done.await
+            .wrap_err("GHCi process watcher dropped intentional shutdown acknowledgement")?;
         Ok(())
     }
 

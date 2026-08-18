@@ -17,10 +17,8 @@ use tracing::instrument;
 use crate::event_filter::FileEvent;
 use crate::event_filter::FileState;
 use crate::ghci::CompilationLog;
-use crate::haskell_source_file::is_haskell_source_file;
 use crate::hooks;
 use crate::hooks::LifecycleEvent;
-use crate::normal_path::NormalPath;
 use crate::shutdown::ShutdownHandle;
 use crate::watcher::WatcherCommand;
 
@@ -210,9 +208,7 @@ pub async fn run_ghci(
             &mut handle,
             &mut watcher_receiver,
             &mut exited_receiver,
-            &watcher_command_sender,
             &classifier,
-            &log,
             status,
             "during initial GHCi startup",
             &mut RestartStrategy::Startup(&mut ghci),
@@ -236,7 +232,7 @@ pub async fn run_ghci(
         handle,
         watcher_receiver,
         exited_receiver,
-        watcher_command_sender,
+        _watcher_command_sender: watcher_command_sender,
         classifier,
         interrupt_reloads,
         memory_watchdog,
@@ -304,7 +300,8 @@ struct GhciManager {
     handle: ShutdownHandle,
     watcher_receiver: mpsc::Receiver<WatcherEvent>,
     exited_receiver: mpsc::Receiver<ExitStatus>,
-    watcher_command_sender: mpsc::Sender<WatcherCommand>,
+    // Keep the watcher command channel alive; configured watches now own startup recovery.
+    _watcher_command_sender: mpsc::Sender<WatcherCommand>,
     classifier: FileClassifier,
     interrupt_reloads: bool,
     memory_watchdog: tokio::time::Interval,
@@ -758,14 +755,11 @@ impl GhciManager {
         detected_phase: &'static str,
         affected_paths: Option<String>,
     ) -> eyre::Result<RetryResult> {
-        let log = CompilationLog::default();
         wait_and_restart(
             &mut self.handle,
             &mut self.watcher_receiver,
             &mut self.exited_receiver,
-            &self.watcher_command_sender,
             &self.classifier,
-            &log,
             status,
             detected_phase,
             &mut RestartStrategy::Runtime(self.ghci.clone()),
@@ -881,155 +875,6 @@ enum RestartRace {
     ExitPending,
 }
 
-async fn configure_startup_retry_files(
-    watcher_command_sender: &mpsc::Sender<WatcherCommand>,
-    log: &CompilationLog,
-) {
-    let diagnostics = log
-        .diagnostics
-        .iter()
-        .filter_map(|diagnostic| diagnostic.path.clone())
-        .filter(|path| is_haskell_source_file(path))
-        .collect::<BTreeSet<_>>();
-    if diagnostics.is_empty() {
-        // A replacement can exit before its final diagnostics are parsed. Keep any previously
-        // installed retry files rather than losing the only useful wake-up source.
-        return;
-    }
-    let files = match resolve_diagnostic_files(diagnostics).await {
-        Ok(files) if !files.is_empty() => files,
-        Ok(_) => {
-            tracing::warn!("Could not resolve any startup diagnostic source files");
-            return;
-        }
-        Err(error) => {
-            tracing::warn!(?error, "Failed to resolve startup diagnostic files");
-            return;
-        }
-    };
-    let (ack, reply) = oneshot::channel();
-    if watcher_command_sender
-        .send(WatcherCommand::SetStartupRetryFiles {
-            files: files.clone(),
-            ack,
-        })
-        .await
-        .is_err()
-    {
-        tracing::warn!("Filesystem watcher stopped before startup-retry watches were installed");
-        return;
-    }
-    match reply.await {
-        Ok(Ok(())) => {
-            tracing::info!(?files, "Watching diagnosed source files for startup retry");
-        }
-        Ok(Err(error)) => {
-            tracing::warn!(%error, "Failed to install startup-retry watches");
-        }
-        Err(error) => {
-            tracing::warn!(%error, "Startup-retry watcher acknowledgement was dropped");
-        }
-    }
-}
-
-async fn resolve_diagnostic_files(
-    diagnostics: BTreeSet<Utf8PathBuf>,
-) -> eyre::Result<BTreeSet<Utf8PathBuf>> {
-    let cwd = crate::current_dir_utf8()?;
-    tokio::task::spawn_blocking(move || -> eyre::Result<BTreeSet<Utf8PathBuf>> {
-        let mut resolved = BTreeSet::new();
-        let mut unresolved = BTreeSet::new();
-        for diagnostic in diagnostics {
-            if diagnostic.is_absolute() {
-                resolved.insert(NormalPath::new(&diagnostic, &cwd)?.into_absolute());
-                continue;
-            }
-            let candidate = cwd.join(&diagnostic);
-            if candidate.is_file() {
-                resolved.insert(NormalPath::new(&candidate, &cwd)?.into_absolute());
-            } else {
-                unresolved.insert(diagnostic);
-            }
-        }
-
-        if !unresolved.is_empty() {
-            let mut directories = vec![cwd.clone()];
-            while let Some(directory) = directories.pop() {
-                for diagnostic in &unresolved {
-                    let candidate = directory.join(diagnostic);
-                    if candidate.is_file() {
-                        resolved.insert(NormalPath::new(&candidate, &cwd)?.into_absolute());
-                    }
-                }
-                let entries = match std::fs::read_dir(&directory) {
-                    Ok(entries) => entries,
-                    Err(error) => {
-                        tracing::debug!(
-                            %directory,
-                            %error,
-                            "Could not scan directory for startup diagnostic file"
-                        );
-                        continue;
-                    }
-                };
-                for entry in entries {
-                    let entry = match entry {
-                        Ok(entry) => entry,
-                        Err(error) => {
-                            tracing::debug!(
-                                %directory,
-                                %error,
-                                "Could not read directory entry while resolving startup diagnostic file"
-                            );
-                            continue;
-                        }
-                    };
-                    let file_type = match entry.file_type() {
-                        Ok(file_type) => file_type,
-                        Err(error) => {
-                            tracing::debug!(
-                                path = ?entry.path(),
-                                %error,
-                                "Could not inspect path while resolving startup diagnostic file"
-                            );
-                            continue;
-                        }
-                    };
-                    if file_type.is_dir() && !file_type.is_symlink() {
-                        match Utf8PathBuf::try_from(entry.path()) {
-                            Ok(path) => directories.push(path),
-                            Err(error) => {
-                                tracing::debug!(
-                                    ?error,
-                                    "Skipping non-UTF-8 directory while resolving startup diagnostic file"
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        Ok(resolved)
-    })
-    .await
-    .wrap_err("Startup diagnostic path resolver task failed")?
-}
-
-async fn clear_startup_retry_files(watcher_command_sender: &mpsc::Sender<WatcherCommand>) {
-    let (ack, reply) = oneshot::channel();
-    if watcher_command_sender
-        .send(WatcherCommand::ClearStartupRetryFiles { ack })
-        .await
-        .is_err()
-    {
-        tracing::debug!("Filesystem watcher stopped before startup-retry watches were cleared");
-        return;
-    }
-    if let Err(error) = reply.await {
-        tracing::debug!(%error, "Startup-retry watcher clear acknowledgement was dropped");
-    }
-}
-
 /// Wait for a relevant file change, then attempt to restart ghci.
 ///
 /// If ghci also dies during the restart attempt, keeps waiting for file changes and retrying
@@ -1039,28 +884,25 @@ async fn wait_and_restart(
     handle: &mut ShutdownHandle,
     watcher_receiver: &mut mpsc::Receiver<WatcherEvent>,
     exited_receiver: &mut mpsc::Receiver<ExitStatus>,
-    watcher_command_sender: &mpsc::Sender<WatcherCommand>,
     classifier: &FileClassifier,
-    initial_log: &CompilationLog,
     mut status: ExitStatus,
     detected_phase: &'static str,
     strategy: &mut RestartStrategy<'_>,
     affected_paths: Option<String>,
 ) -> eyre::Result<RetryResult> {
-    configure_startup_retry_files(watcher_command_sender, initial_log).await;
     let context = strategy.context();
     let affected_paths = affected_paths
         .map(|paths| format!("\nAffected paths:\n{paths}"))
         .unwrap_or_default();
     let details = format!(
-        "Detected phase: {detected_phase}\n{}\n{}{affected_paths}\nRecovery: waiting for a diagnosed source file or a relevant file under a configured --watch path to change, then starting a fresh GHCi session",
+        "Detected phase: {detected_phase}\n{}\n{}{affected_paths}\nRecovery: waiting for a relevant change under a configured --watch path, then starting a fresh GHCi session",
         exit_status_diagnostic(status),
         strategy.diagnostic_context().await,
     );
     print_ghciwatch_error("GHCi exited unexpectedly", &details);
     tracing::warn!(
         %status,
-        "ghci exited {context}; waiting for a diagnosed or configured file change to restart",
+        "ghci exited {context}; waiting for a configured file change to restart",
     );
     let mut attempted_states = BTreeMap::new();
     let mut attempted_haskell_files = None;
@@ -1111,10 +953,7 @@ async fn wait_and_restart(
         let new_status = match race {
             RestartRace::Restarted => match exited_receiver.try_recv() {
                 Ok(new_status) => new_status,
-                Err(_) => {
-                    clear_startup_retry_files(watcher_command_sender).await;
-                    return Ok(RetryResult::Restarted(event));
-                }
+                Err(_) => return Ok(RetryResult::Restarted(event)),
             },
             RestartRace::Exited(new_status) => new_status,
             RestartRace::ExitPending => {
@@ -1131,16 +970,15 @@ async fn wait_and_restart(
         // This exact filesystem state already triggered a complete replacement attempt. Delayed
         // duplicate notifications must not immediately retry it, while a newer edit remains dirty.
         event.mark_applied(&mut attempted_states, &mut attempted_haskell_files);
-        configure_startup_retry_files(watcher_command_sender, &restart_log).await;
         let details = format!(
-            "Detected phase: while starting a replacement GHCi session\n{}\n{}{affected_paths}\nRecovery: waiting for a diagnosed source file or a relevant file under a configured --watch path to change, then retrying with a fresh GHCi session",
+            "Detected phase: while starting a replacement GHCi session\n{}\n{}{affected_paths}\nRecovery: waiting for a relevant change under a configured --watch path, then retrying with a fresh GHCi session",
             exit_status_diagnostic(status),
             strategy.diagnostic_context().await,
         );
         print_ghciwatch_error("GHCi exited again while restarting", &details);
         tracing::warn!(
             %status,
-            "ghci exited {context}; waiting for a diagnosed or configured file change to restart",
+            "ghci exited {context}; waiting for a configured file change to restart",
         );
     }
 }

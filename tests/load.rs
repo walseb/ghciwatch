@@ -72,3 +72,55 @@ async fn can_restart_for_new_module() {
         .await
         .expect("ghciwatch restarts for a new module");
 }
+
+/// A replacement can return to its prompt after a home-module error. Such a partial session must
+/// restart on the fixing edit even when ordinary automatic reloads are disabled.
+#[test]
+async fn failed_add_restart_recovers_with_no_auto_reload() {
+    let mut session = GhciWatchBuilder::new("tests/data/simple")
+        .with_args(["--restart-on-add", "--no-auto-reload"])
+        .start()
+        .await
+        .expect("ghciwatch starts");
+    session
+        .wait_until_ready()
+        .await
+        .expect("ghciwatch loads ghci");
+    session.clear_events();
+    session
+        .fs()
+        .replace(
+            session.path("src/MyLib.hs"),
+            "example = \"example\"",
+            "example = missingName",
+        )
+        .await
+        .expect("can break a home module");
+    session
+        .fs()
+        .write(
+            session.path("src/NewPackageModule.hs"),
+            "module NewPackageModule where\nnewValue = ()\n",
+        )
+        .await
+        .expect("can add a module");
+    session
+        .wait_for_log("Restarting failed")
+        .await
+        .expect("replacement reaches its prompt with a compilation failure");
+
+    session.clear_events();
+    session
+        .fs()
+        .replace(
+            session.path("src/MyLib.hs"),
+            "example = missingName",
+            "example = \"example\"",
+        )
+        .await
+        .expect("can fix the home module");
+    session
+        .wait_for_log("All good! Finished restarting")
+        .await
+        .expect("fixing edit replaces the incomplete session");
+}

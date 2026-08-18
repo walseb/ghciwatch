@@ -31,6 +31,43 @@ async fn can_shutdown_gracefully() {
     assert!(status.success(), "ghciwatch exits successfully");
 }
 
+/// Intentional replacement keeps the old output readers alive until its process tree exits.
+#[test]
+async fn replacement_keeps_old_output_pipe_alive() {
+    let mut session = GhciWatchBuilder::new("tests/data/simple")
+        .with_args([
+            "--restart-glob",
+            "src/MyLib.hs",
+            "--before-restart-ghci",
+            ":m + Control.Concurrent",
+            "--before-restart-ghci",
+            "forkIO (threadDelay 200000 >> putStrLn \"late shutdown output\")",
+            "--before-kill",
+            "sleep 1",
+        ])
+        .start()
+        .await
+        .expect("ghciwatch starts");
+    session
+        .wait_until_ready()
+        .await
+        .expect("ghciwatch loads ghci");
+    session.clear_events();
+    session
+        .fs()
+        .touch(session.path("src/MyLib.hs"))
+        .await
+        .expect("can trigger an intentional replacement");
+    session
+        .wait_for_startup_log(BaseMatcher::ghci_started())
+        .await
+        .expect("ghciwatch completes the replacement");
+    assert!(
+        session.assert_logged("resource vanished").is_err(),
+        "old GHCi wrote to a pipe whose reader was dropped before shutdown"
+    );
+}
+
 fn extract_pid(event: &test_harness::Event) -> i32 {
     match event.fields.get("pid").unwrap() {
         JsonValue::Number(pid) => pid,
@@ -142,28 +179,25 @@ async fn does_not_restart_on_irrelevant_file_change() {
         .expect("ghciwatch restarts ghci after relevant file change");
 }
 
-/// Test that when ghci fails to start repeatedly (e.g. a dependency won't compile), ghciwatch
-/// keeps waiting for file changes and retrying rather than crashing after the first attempt.
+/// Under `--no-auto-reload`, startup recovery follows every configured watch root rather than
+/// only the file named by the compiler diagnostic.
 #[test]
-async fn handles_repeated_startup_failures() {
+async fn handles_upstream_startup_repair_from_configured_watch() {
     let mut session = GhciWatchBuilder::new("tests/data/with-dep")
         .before_start(move |path| {
-            // A version of SimpleDep.hs with an unclosed string literal — cabal will refuse to build it.
+            // The dependent module remains valid, but no longer exports MyLib's imported name.
             async move {
                 Fs::new()
-                    .replace(
-                        path.join("simple-dep/src/SimpleDep.hs"),
-                        "\"depFunc\"",
-                        "\"depFunc",
-                    )
+                    .replace(path.join("simple-dep/src/SimpleDep.hs"), "(depFunc)", "()")
                     .await
             }
         })
+        .with_args(["--watch", "simple-dep/src", "--no-auto-reload"])
         .start()
         .await
         .expect("ghciwatch starts");
 
-    // First startup fails because simple-dep won't compile.
+    // Startup fails in MyLib because its upstream dependency no longer exports depFunc.
     session
         .wait_for_startup_log("ghci exited during startup")
         .await
@@ -185,14 +219,13 @@ async fn handles_repeated_startup_failures() {
         .await
         .expect("ghciwatch detects second startup failure");
 
-    // Fixing the diagnosed dependency itself triggers another restart even though the test
-    // harness only configures `--watch src` and the package file.
+    // The diagnostic points at MyLib's import, but changing the watched upstream module must retry.
     session
         .fs()
         .replace(
             session.path("simple-dep/src/SimpleDep.hs"),
-            "\"depFunc",
-            "\"depFunc\"",
+            "()",
+            "(depFunc)",
         )
         .await
         .expect("can fix simple-dep");
@@ -206,9 +239,9 @@ async fn handles_repeated_startup_failures() {
         .expect("ghciwatch restarts ghci after dependency is fixed");
 }
 
-/// A diagnosed source already covered by `--watch` also triggers exactly the same startup retry.
+/// A source covered by `--watch` triggers startup recovery without a diagnostic-specific watcher.
 #[test]
-async fn startup_retry_file_already_watched() {
+async fn startup_retry_from_configured_watch() {
     let mut session = GhciWatchBuilder::new("tests/data/with-dep")
         .before_start(move |path| async move {
             Fs::new()
@@ -234,7 +267,7 @@ async fn startup_retry_file_already_watched() {
     session
         .wait_for_startup_log(BaseMatcher::ghci_started())
         .await
-        .expect("ghciwatch retries after diagnosed watched source changes");
+        .expect("ghciwatch retries after a configured watched source changes");
 }
 
 /// Check that startup failures are handled correctly with `--before-restart-ghci` hooks.

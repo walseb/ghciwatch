@@ -20,6 +20,7 @@ use tracing::instrument;
 
 use crate::clonable_command::ClonableCommand;
 use crate::shutdown::ShutdownHandle;
+use tokio::sync::oneshot;
 
 const BEFORE_SIGNAL_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -29,10 +30,10 @@ pub struct GhciProcess {
     /// PID of the process created directly from `--command`. Unlike the process-group ID, this
     /// anchors descendant discovery even when a child creates a new process group.
     pub process_id: Pid,
-    /// Notifies this task to _not_ request a shutdown for the entire program when `ghci` exits.
-    /// This is used for the graceful shutdown implementation and for routine `ghci` session
-    /// restarts.
-    pub restart_receiver: mpsc::Receiver<()>,
+    /// Requests intentional shutdown and acknowledges only after the process tree exits. Keeping
+    /// the old pipe readers alive until acknowledgement prevents shutdown output from hitting a
+    /// closed stdout pipe.
+    pub restart_receiver: mpsc::Receiver<oneshot::Sender<()>>,
     /// Notifies [`run_ghci`][crate::ghci::manager::run_ghci] when `ghci` exits unexpectedly so
     /// it can restart the session. Only sent on the unexpected-exit path; intentional restarts
     /// go through [`restart_receiver`][GhciProcess::restart_receiver] instead and do not send
@@ -52,9 +53,12 @@ impl GhciProcess {
             _ = self.shutdown.on_shutdown_requested() => {
                 self.stop(wait).await?;
             }
-            _ = self.restart_receiver.recv() => {
+            ack = self.restart_receiver.recv() => {
                 tracing::debug!("ghci is being shut down");
                 self.stop(wait).await?;
+                if let Some(ack) = ack {
+                    let _ = ack.send(());
+                }
             }
             result = &mut wait => {
                 tracing::debug!(?result, "ghci exited");
