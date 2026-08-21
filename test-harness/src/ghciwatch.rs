@@ -36,6 +36,7 @@ pub struct GhciWatchBuilder {
     ghc_args: Vec<String>,
     cabal_args: Vec<String>,
     cabal_target: String,
+    repl_command: Option<String>,
     #[allow(clippy::type_complexity)]
     before_start: Option<Box<dyn FnOnce(PathBuf) -> BoxFuture<'static, eyre::Result<()>> + Send>>,
     default_timeout: Duration,
@@ -53,6 +54,7 @@ impl GhciWatchBuilder {
             ghc_args: Default::default(),
             cabal_args: Default::default(),
             cabal_target: "my-simple-package".into(),
+            repl_command: None,
             before_start: None,
             // Note: These will be scaled by `timeout_mult` later.
             default_timeout: Duration::from_secs(7),
@@ -104,6 +106,12 @@ impl GhciWatchBuilder {
     /// Set the Cabal target to open a `cabal v2-repl` for.
     pub fn with_cabal_target(mut self, target: impl AsRef<str>) -> Self {
         self.cabal_target = target.as_ref().to_owned();
+        self
+    }
+
+    /// Replace the default Cabal repl command used as ghciwatch's `--command`.
+    pub fn with_repl_command(mut self, command: impl Into<String>) -> Self {
+        self.repl_command = Some(command.into());
         self
     }
 
@@ -329,16 +337,21 @@ impl GhciWatch {
         let log_path = tempdir.join(LOG_FILENAME);
 
         tracing::info!("Starting ghciwatch");
-        let mut repl_command = vec!["cabal".into(), format!("--with-compiler=ghc-{ghc_version}")];
-        repl_command.extend(builder.cabal_args.iter().cloned());
-        repl_command.push(format!(
-            "--repl-options={}",
-            shell_words::join(&builder.ghc_args)
-        ));
-        repl_command.push("v2-repl".into());
-        repl_command.push(builder.cabal_target.clone());
-
-        let repl_command = shell_words::join(repl_command);
+        let repl_command = match &builder.repl_command {
+            Some(command) => command.clone(),
+            None => {
+                let mut repl_command =
+                    vec!["cabal".into(), format!("--with-compiler=ghc-{ghc_version}")];
+                repl_command.extend(builder.cabal_args.iter().cloned());
+                repl_command.push(format!(
+                    "--repl-options={}",
+                    shell_words::join(&builder.ghc_args)
+                ));
+                repl_command.push("v2-repl".into());
+                repl_command.push(builder.cabal_target.clone());
+                shell_words::join(repl_command)
+            }
+        };
 
         let command = ClonableCommand::new(test_bin::get_test_bin("ghciwatch").get_program())
             .arg("--log-json")

@@ -400,6 +400,7 @@ where
                     writer.write_all(self.line.as_bytes()).await?;
                     // We'll just pretend this is the end of the line...
                     writer.write_all(b"\n").await?;
+                    writer.flush().await?;
                 }
                 WriteBehavior::NoFinalLine | WriteBehavior::Hide => {}
             }
@@ -419,6 +420,10 @@ where
                 WriteBehavior::Write | WriteBehavior::NoFinalLine => {
                     writer.write_all(self.line.as_bytes()).await?;
                     writer.write_all(b"\n").await?;
+                    // Tokio/std writers may be block-buffered when output is redirected. Flushing
+                    // each completed line also drives wrappers such as ProgressWriter whose inner
+                    // write may have become pending after accepting the line.
+                    writer.flush().await?;
                 }
                 WriteBehavior::Hide => {}
             }

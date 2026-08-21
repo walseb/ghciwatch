@@ -122,6 +122,17 @@ impl GhciStdout {
         Ok(())
     }
 
+    /// Collect stderr when the command exits before GHCi can install a prompt and emit a marker.
+    pub async fn drain_stderr_after_exit(&self, log: &mut CompilationLog) -> eyre::Result<()> {
+        let (sender, receiver) = oneshot::channel();
+        self.stderr_sender
+            .send(StderrEvent::DrainBuffer { sender })
+            .await?;
+        let data = receiver.await?;
+        log.extend(parse_ghc_messages(&data).wrap_err("Failed to parse compiler output")?);
+        Ok(())
+    }
+
     /// Clear stderr diagnostics from the preceding GHCi operation.
     ///
     /// This must complete before the next command is written. Otherwise a fast

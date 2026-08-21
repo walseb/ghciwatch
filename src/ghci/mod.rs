@@ -166,8 +166,12 @@ pub struct GhciOpts {
     pub interrupt_reloads: bool,
     /// Whether watched changes automatically issue `:reload`.
     pub auto_reload: bool,
+    /// Whether watched source additions and removals automatically update GHCi targets.
+    pub auto_targets: bool,
     /// Whether discovering a Haskell module restarts the package-managed session.
     pub restart_on_add: bool,
+    /// Whether an unexpected process exit immediately starts a replacement session.
+    pub restart_on_exit: bool,
     /// Where to write what `ghci` emits to `stdout`. Inherits parent's `stdout` by default.
     pub stdout_writer: GhciWriter,
     /// Where to write what `ghci` emits to `stderr`. Inherits parent's `stderr` by default.
@@ -258,7 +262,9 @@ impl GhciOpts {
                 reload_globs: opts.watch.reload_globs()?,
                 interrupt_reloads: opts.interrupt_reloads(),
                 auto_reload: !opts.no_auto_reload,
+                auto_targets: !opts.no_auto_targets,
                 restart_on_add: opts.restart_on_add,
+                restart_on_exit: opts.restart_on_exit,
                 stdout_writer,
                 stderr_writer,
                 clear: opts.clear,
@@ -574,6 +580,13 @@ impl Ghci {
         }
         .await;
         if let Err(err) = result.as_ref() {
+            // If the command dies before GHCi boots, no prompt exists for normal marker-based
+            // stderr synchronization. The pipe has closed, so EOF provides the ordering boundary.
+            if error_is_broken_pipe(err) {
+                if let Err(drain_error) = self.stdout.drain_stderr_after_exit(log).await {
+                    tracing::debug!("Failed to collect startup stderr: {drain_error}");
+                }
+            }
             // If writing the compilation log or running hooks fails, we should log this error so
             // it's not lost forever.
             tracing::debug!("Initializing failed: {err}");
@@ -669,6 +682,10 @@ impl Ghci {
         // current package metadata, assigning every object to its proper home unit.
         if self.opts.restart_on_add && !actions.needs_add.is_empty() {
             actions.needs_restart.append(&mut actions.needs_add);
+        }
+        if !self.opts.auto_targets {
+            actions.needs_add.clear();
+            actions.needs_remove.clear();
         }
         Ok(actions)
     }
@@ -1550,6 +1567,14 @@ impl Ghci {
     async fn write_error_log(&mut self, log: &CompilationLog) -> eyre::Result<()> {
         self.error_log.write(log).await
     }
+}
+
+fn error_is_broken_pipe(err: &eyre::Report) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::BrokenPipe)
+    })
 }
 
 /// How a [`Ghci`] session responds to a reload event.

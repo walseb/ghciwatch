@@ -261,6 +261,83 @@ async fn preserves_error_log_paths() {
     expected.assert_eq(&error_contents);
 }
 
+/// Diagnostics written only to stderr are captured when the command exits before GHCi boots.
+#[test]
+async fn error_log_pre_ghci_stderr_failure() {
+    let error_path = "ghcid.txt";
+    let command = r#"sh -c 'printf "%s\n" "src/Early.hs:1:1: error:" "    plugin failed before GHCi startup" >&2; exit 1'"#;
+    let mut session = GhciWatchBuilder::new("tests/data/simple")
+        .with_args(["--errors", error_path])
+        .with_repl_command(command)
+        .start()
+        .await
+        .expect("ghciwatch starts");
+    let error_path = session.path(error_path);
+
+    session
+        .wait_for_startup_log("ghci exited during startup")
+        .await
+        .expect("ghciwatch detects the pre-GHCi startup failure");
+
+    let error_contents = session
+        .fs()
+        .read(&error_path)
+        .await
+        .expect("ghciwatch writes ghcid.txt");
+    expect![[r#"
+        src/Early.hs:1:1: error:
+            plugin failed before GHCi startup
+    "#]]
+    .assert_eq(&error_contents);
+}
+
+/// A restart-time Cabal build failure updates the error file before exit handling continues.
+#[test]
+async fn error_log_restart_failure_before_ghci() {
+    let error_path = "ghcid.txt";
+    let mut session = GhciWatchBuilder::new("tests/data/with-dep")
+        .with_args([
+            "--errors",
+            error_path,
+            "--watch",
+            "simple-dep/src",
+            "--restart-glob",
+            "simple-dep/src/*.hs",
+        ])
+        .start()
+        .await
+        .expect("ghciwatch starts");
+    let error_path = session.path(error_path);
+    session
+        .wait_until_ready()
+        .await
+        .expect("ghciwatch loads ghci");
+
+    session
+        .fs()
+        .replace(
+            session.path("simple-dep/src/SimpleDep.hs"),
+            "\"depFunc\"",
+            "\"depFunc",
+        )
+        .await
+        .expect("can break the dependency before restart");
+    session
+        .wait_for_log("ghci exited unexpectedly")
+        .await
+        .expect("ghciwatch detects the failed restart");
+
+    let error_contents = session
+        .fs()
+        .read(&error_path)
+        .await
+        .expect("ghciwatch updates ghcid.txt after the failed restart");
+    assert!(
+        error_contents.contains("src/SimpleDep.hs:4:") && error_contents.contains("lexical error"),
+        "restart diagnostic missing from error log: {error_contents:?}"
+    );
+}
+
 #[test]
 async fn error_log_startup_failure() {
     let error_path = "ghcid.txt";

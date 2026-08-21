@@ -26,6 +26,10 @@ pub enum StderrEvent {
         ready: oneshot::Sender<()>,
         sender: oneshot::Sender<String>,
     },
+
+    /// The GHCi command exited before a synchronization marker could be submitted. Drain stderr
+    /// through EOF and return all buffered startup output.
+    DrainBuffer { sender: oneshot::Sender<String> },
 }
 
 pub struct GhciStderr {
@@ -95,6 +99,9 @@ impl GhciStderr {
                 let _ = ready.send(());
                 self.get_buffer_through(&marker, sender).await?;
             }
+            StderrEvent::DrainBuffer { sender } => {
+                self.drain_buffer(sender).await?;
+            }
         }
 
         Ok(())
@@ -106,6 +113,9 @@ impl GhciStderr {
         line.push('\n');
         self.buffer.push_str(&line);
         self.writer.write_all(line.as_bytes()).await?;
+        // Do not rely on terminal line buffering: output may be redirected to a block-buffered
+        // destination, and callers expect diagnostics to become visible one line at a time.
+        self.writer.flush().await?;
         Ok(())
     }
 
@@ -134,6 +144,21 @@ impl GhciStderr {
             if line == marker {
                 break;
             }
+            self.ingest_line(line).await?;
+        }
+        let _ = sender.send(self.buffer.clone());
+        Ok(())
+    }
+
+    /// Drain the command's stderr after its stdout/stdin pipes have already closed.
+    #[instrument(skip(self, sender), level = "debug")]
+    async fn drain_buffer(&mut self, sender: oneshot::Sender<String>) -> eyre::Result<()> {
+        while let Some(line) = self
+            .reader
+            .next_line()
+            .await
+            .wrap_err("Failed to drain stderr after GHCi exited")?
+        {
             self.ingest_line(line).await?;
         }
         let _ = sender.send(self.buffer.clone());

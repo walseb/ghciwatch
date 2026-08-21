@@ -96,6 +96,13 @@ pub struct Opts {
     #[arg(long)]
     pub no_auto_reload: bool,
 
+    /// Don't automatically add or remove GHCi targets for watched source files.
+    ///
+    /// The files remain watched, allowing another control path to decide when a replacement
+    /// package session should incorporate target-set changes.
+    #[arg(long)]
+    pub no_auto_targets: bool,
+
     /// Restart the GHCi command rather than using path-based `:add` for a new Haskell module.
     ///
     /// Use this for object-code package sessions. `:add` assigns a path target to GHCi's
@@ -103,6 +110,12 @@ pub struct Opts {
     /// Restarting lets the package command rebuild its home-unit target set from current metadata.
     #[arg(long)]
     pub restart_on_add: bool,
+
+    /// Immediately replace an unexpectedly exited GHCi session instead of waiting for a file edit.
+    ///
+    /// Useful for services whose clients are already waiting for the session to return.
+    #[arg(long)]
+    pub restart_on_exit: bool,
 
     /// A shell command to run synchronously immediately before GHCi is sent `SIGINT`.
     ///

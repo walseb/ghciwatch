@@ -124,6 +124,33 @@ async fn restarts_after_ghci_killed() {
         .expect("ghciwatch restarts ghci after unexpected exit");
 }
 
+/// Persistent services must recover without requiring an unrelated source edit.
+#[test]
+async fn restart_on_exit_replaces_ghci_immediately() {
+    let mut session = GhciWatchBuilder::new("tests/data/simple")
+        .with_arg("--restart-on-exit")
+        .start()
+        .await
+        .expect("ghciwatch starts");
+
+    let event = session
+        .wait_for_startup_log(BaseMatcher::message("^Started ghci$"))
+        .await
+        .expect("ghciwatch starts ghci");
+    let pid = extract_pid(&event);
+    session
+        .wait_until_ready()
+        .await
+        .expect("ghciwatch loads ghci");
+
+    session.clear_events();
+    signal::kill(Pid::from_raw(pid), Signal::SIGKILL).expect("Failed to kill ghci");
+    session
+        .wait_for_startup_log(BaseMatcher::ghci_started())
+        .await
+        .expect("ghciwatch immediately replaces ghci");
+}
+
 /// Test that when ghci is killed, irrelevant file changes (non-Haskell, non-glob-matched) do not
 /// trigger a restart, but a relevant Haskell file change does.
 #[test]

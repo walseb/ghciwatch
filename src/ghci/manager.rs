@@ -33,6 +33,7 @@ use super::GhciReloadKind;
 use super::ModuleSet;
 
 /// Recheck often enough to catch leaks without continuously walking `/proc`.
+const PERSISTENT_RESTART_DELAY: Duration = Duration::from_secs(5);
 const MEMORY_WATCHDOG_INTERVAL: Duration = Duration::from_secs(30);
 /// Resident-memory limit for the persistent interactive GHC and its immediate Cabal parent.
 const GHCI_MEMORY_LIMIT_BYTES: u64 = 28 * 1024 * 1024 * 1024;
@@ -163,6 +164,7 @@ pub async fn run_ghci(
 
     let eval_socket = opts.eval_socket.clone().into_std_path_buf();
     let interrupt_reloads = opts.interrupt_reloads;
+    let restart_on_exit = opts.restart_on_exit;
     let classifier = opts.file_classifier()?;
     let (exited_sender, mut exited_receiver) = mpsc::channel::<ExitStatus>(1);
     let mut ghci = Ghci::new(handle.clone(), opts, exited_sender)
@@ -235,6 +237,7 @@ pub async fn run_ghci(
         _watcher_command_sender: watcher_command_sender,
         classifier,
         interrupt_reloads,
+        restart_on_exit,
         memory_watchdog,
         applied_states: BTreeMap::new(),
         applied_haskell_files: None,
@@ -304,6 +307,7 @@ struct GhciManager {
     _watcher_command_sender: mpsc::Sender<WatcherCommand>,
     classifier: FileClassifier,
     interrupt_reloads: bool,
+    restart_on_exit: bool,
     memory_watchdog: tokio::time::Interval,
     /// File states represented by the last successfully completed dispatch.
     applied_states: BTreeMap<Utf8PathBuf, FileState>,
@@ -415,18 +419,27 @@ impl GhciManager {
                     }
                 }
                 Wake::GhciExited(status) => {
-                    // Failed SIGINT recovery deliberately kills the session. Unlike an
-                    // unrelated crash, replace it immediately without waiting for a file event.
+                    // Failed SIGINT recovery and explicitly persistent services replace a dead
+                    // session without waiting for a source edit. A short delay prevents a crashing
+                    // command from becoming a tight restart loop.
                     let recovered = {
                         let _operation = self.eval_barrier.begin_operation().await;
                         let mut ghci = self.ghci.lock().await;
-                        if ghci.recovery_restart_required() {
-                            tracing::warn!(%status, "Restarting GHCi immediately after failed interrupt recovery");
+                        let recovery_kill = ghci.recovery_restart_required();
+                        if recovery_kill || self.restart_on_exit {
+                            if !recovery_kill {
+                                let details = format!(
+                                    "Detected phase: while waiting for filesystem events\n{}\n{}\nRecovery: starting a fresh GHCi session after {PERSISTENT_RESTART_DELAY:?}",
+                                    exit_status_diagnostic(status),
+                                    ghci.diagnostic_context(),
+                                );
+                                print_ghciwatch_error("GHCi exited unexpectedly", &details);
+                                tracing::warn!(%status, "Restarting GHCi after persistent-service delay");
+                                tokio::time::sleep(PERSISTENT_RESTART_DELAY).await;
+                            }
                             ghci.restart_after_recovery_kill_with_known_files()
                                 .await
-                                .wrap_err(
-                                    "Failed to restart GHCi after unsuccessful interrupt recovery",
-                                )?;
+                                .wrap_err("Failed to restart GHCi after unexpected exit")?;
                             true
                         } else {
                             false
@@ -511,9 +524,26 @@ impl GhciManager {
                     return Ok(HandleResult::Shutdown);
                 }
                 Some(status) = exited_receiver.recv() => {
-                    // Prefer process death over queued watcher traffic so a busy filesystem cannot
-                    // indefinitely delay the crash report. Abort the dispatch to release its mutex.
-                    task.abort();
+                    // The command can exit while a restart is still collecting pre-GHCi build
+                    // diagnostics. Let dispatch finish draining the closed pipes and writing the
+                    // error file before releasing its mutex. This mirrors initial startup, where
+                    // process exit likewise does not cancel initialization.
+                    let dispatch_result = tokio::select! {
+                        _ = handle.on_shutdown_requested() => {
+                            task.abort();
+                            return Ok(HandleResult::Shutdown);
+                        }
+                        ret = &mut task => ret?,
+                    };
+                    if let Err(err) = dispatch_result {
+                        if is_recovery_failure(&err) {
+                            restart_after_recovery_kill = true;
+                            preserve_recovery_event(&event, &mut pending_event);
+                        } else if !is_broken_pipe(&err) {
+                            return Err(err);
+                        }
+                        tracing::debug!("ghci exited while dispatching: {err}");
+                    }
                     if ghci.lock().await.recovery_restart_required() {
                         restart_after_recovery_kill = true;
                         preserve_recovery_event(&event, &mut pending_event);
@@ -648,9 +678,30 @@ impl GhciManager {
                     .restart_after_recovery_kill(haskell_files)
                     .await
                     .wrap_err("Failed to restart GHCi after unsuccessful interrupt recovery")?;
+            } else if self.restart_on_exit {
+                let affected_paths = event
+                    .affected_paths()
+                    .map(|paths| format!("\nAffected paths:\n{paths}"))
+                    .unwrap_or_default();
+                let ghci = self.ghci.lock().await;
+                let details = format!(
+                    "Detected phase: while dispatching a reload/restart event\n{}\n{}{affected_paths}\nRecovery: starting a fresh GHCi session after {PERSISTENT_RESTART_DELAY:?}",
+                    exit_status_diagnostic(status),
+                    ghci.diagnostic_context(),
+                );
+                print_ghciwatch_error("GHCi exited unexpectedly", &details);
+                drop(ghci);
+                tracing::warn!(%status, "Restarting GHCi after persistent-service delay");
+                tokio::time::sleep(PERSISTENT_RESTART_DELAY).await;
+                self.ghci
+                    .lock()
+                    .await
+                    .restart_after_recovery_kill_with_known_files()
+                    .await
+                    .wrap_err("Failed to restart persistent GHCi after dispatch exit")?;
             } else {
-                // An unrelated unexpected exit retains the established policy: wait for a
-                // relevant file event before attempting a replacement.
+                // Ordinary sessions retain the established policy: a relevant source event
+                // controls when another replacement attempt is useful.
                 let affected_paths = event.affected_paths();
                 match self
                     .wait_and_restart_runtime(
