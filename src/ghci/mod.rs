@@ -1535,10 +1535,17 @@ impl Ghci {
                     .await?;
                 continue;
             }
-            // Failed reloads must not run commands against modules GHCi just unloaded.
+            // Failed reloads must not run commands against modules GHCi just unloaded, but shell
+            // hooks are external lifecycle notifications/cleanup and must still run. This also
+            // balances a before-reload shell hook when a before-reload GHCi hook produced the
+            // compilation error.
             if matches!(log.result(), Some(CompilationResult::Err))
                 && matches!(event, LifecycleEvent::Reload(hooks::When::After))
             {
+                self.opts
+                    .hooks
+                    .run_shell_hooks(event, &mut self.command_handles)
+                    .await?;
                 continue;
             }
             self.run_hooks(event, log).await?;
@@ -1593,15 +1600,27 @@ impl Ghci {
             match &hook.command {
                 hooks::Command::Ghci(command) => {
                     let start_time = Instant::now();
-                    self.stdin
-                        .run_command(&mut self.stdout, command, log)
-                        .await?;
-                    if let LifecycleEvent::Test = &hook.event {
+                    if matches!(hook.event, LifecycleEvent::Test) {
+                        self.stdin
+                            .run_command(&mut self.stdout, command, log)
+                            .await?;
                         tracing::info!("Finished running tests in {:.2?}", start_time.elapsed());
+                    } else {
+                        // Hook diagnostics are advisory and must not turn the surrounding reload
+                        // into a failed compilation or suppress its after-hooks.
+                        let mut hook_log = CompilationLog::default();
+                        self.stdin
+                            .run_command(&mut self.stdout, command, &mut hook_log)
+                            .await?;
+                        if matches!(hook_log.result(), Some(CompilationResult::Err)) {
+                            tracing::error!(%command, "Ignoring {hook} command error");
+                        }
                     }
                 }
                 hooks::Command::Shell(command) => {
-                    command.run_on(&mut self.command_handles).await?;
+                    if let Err(err) = command.run_on(&mut self.command_handles).await {
+                        tracing::error!(%command, "Ignoring {hook} command error: {err}");
+                    }
                 }
             }
         }

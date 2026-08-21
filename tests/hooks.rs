@@ -27,6 +27,8 @@ async fn can_run_hooks() {
             "putStrLn \"after-startup-2\"",
             // ---
             "--before-reload-ghci",
+            "Definitely.Not.In.Scope.beforeReload",
+            "--before-reload-ghci",
             "putStrLn \"before-reload-1\"",
             "--before-reload-ghci",
             "putStrLn \"before-reload-2\"",

@@ -316,7 +316,11 @@ impl HookOpts {
         for hook in self.select(event) {
             if let Command::Shell(command) = &hook.command {
                 tracing::info!(%command, "Running {hook} command");
-                command.run_on(handles).await?;
+                if let Err(err) = command.run_on(handles).await {
+                    // Hook failures are advisory. They must not prevent the lifecycle operation or
+                    // suppress later hooks (especially paired after-hooks used for cleanup).
+                    tracing::error!(%command, "Ignoring {hook} command error: {err}");
+                }
             }
         }
         Ok(())
