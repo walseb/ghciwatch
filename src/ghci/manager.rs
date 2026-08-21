@@ -915,14 +915,11 @@ impl RestartStrategy<'_> {
     }
 }
 
-/// Outcome of racing a restart attempt against the exit channel in [`wait_and_restart`].
+/// Outcome of a replacement initialization attempt in [`wait_and_restart`].
 enum RestartRace {
     /// The restart completed successfully.
     Restarted,
-    /// ghci exited and the status has already landed on the exit channel.
-    Exited(ExitStatus),
-    /// ghci exited during the restart (seen as a broken pipe), but the exit status
-    /// hasn't landed on the exit channel yet.
+    /// Initialization observed the process exit (usually as a broken pipe); its status is pending.
     ExitPending,
 }
 
@@ -989,24 +986,22 @@ async fn wait_and_restart(
             .unwrap_or_default();
         tracing::debug!("Restarting ghci");
         let mut restart_log = CompilationLog::default();
-        let race = tokio::select! {
-            biased;
-            Some(new_status) = exited_receiver.recv() => RestartRace::Exited(new_status),
-            result = strategy.restart(haskell_files, &mut restart_log) => match result {
-                Ok(()) => RestartRace::Restarted,
-                Err(err) if is_broken_pipe(&err) || is_recovery_failure(&err) => {
-                    tracing::debug!("ghci exited while restarting: {err}");
-                    RestartRace::ExitPending
-                }
-                Err(err) => return Err(err),
-            },
+        // Do not race replacement initialization against the process-exit notification. The
+        // initializer must drain startup diagnostics and run shell-only after-hooks before it is
+        // cancelled; the already-buffered exit status is consumed below.
+        let race = match strategy.restart(haskell_files, &mut restart_log).await {
+            Ok(()) => RestartRace::Restarted,
+            Err(err) if is_broken_pipe(&err) || is_recovery_failure(&err) => {
+                tracing::debug!("ghci exited while restarting: {err}");
+                RestartRace::ExitPending
+            }
+            Err(err) => return Err(err),
         };
         let new_status = match race {
             RestartRace::Restarted => match exited_receiver.try_recv() {
                 Ok(new_status) => new_status,
                 Err(_) => return Ok(RetryResult::Restarted(event)),
             },
-            RestartRace::Exited(new_status) => new_status,
             RestartRace::ExitPending => {
                 tokio::select! {
                     _ = handle.on_shutdown_requested() => return Ok(RetryResult::Shutdown),

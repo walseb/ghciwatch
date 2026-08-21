@@ -313,7 +313,14 @@ async fn handles_repeated_startup_failures_before_restart_ghci_hook() {
                     .await
             }
         })
-        .with_args(["--before-restart-ghci", "putStrLn \"hello\""])
+        .with_args([
+            "--before-restart-ghci",
+            "putStrLn \"hello\"",
+            "--before-reload-shell",
+            "touch before-reload-shell",
+            "--after-reload-shell",
+            "touch after-reload-shell",
+        ])
         .start()
         .await
         .expect("ghciwatch starts");
@@ -333,6 +340,21 @@ async fn handles_repeated_startup_failures_before_restart_ghci_hook() {
         .touch(session.path("src/MyLib.hs"))
         .await
         .expect("can touch source file");
+
+    // The shell reload hooks bracket the failed replacement even though no GHCi prompt exists.
+    session
+        .fs()
+        .wait_for_path(
+            session.startup_timeout,
+            &session.path("before-reload-shell"),
+        )
+        .await
+        .expect("before-reload shell hook runs");
+    session
+        .fs()
+        .wait_for_path(session.startup_timeout, &session.path("after-reload-shell"))
+        .await
+        .expect("after-reload shell hook runs");
 
     // The second failure confirms the retry loop re-enters rather than crashing.
     session

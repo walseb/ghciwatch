@@ -599,7 +599,8 @@ impl Ghci {
         log.fill_empty_summary();
         self.initialization_failure =
             matches!(log.result(), Some(CompilationResult::Err)).then(|| log.clone());
-        self.finish_compilation(start_instant, log, events).await?;
+        self.finish_compilation(start_instant, log, events, result.is_ok())
+            .await?;
 
         result
     }
@@ -792,6 +793,7 @@ impl Ghci {
                 start_instant,
                 &mut log,
                 [LifecycleEvent::Reload(hooks::When::After)],
+                true,
             )
             .await?;
         }
@@ -801,12 +803,10 @@ impl Ghci {
         Ok(())
     }
 
-    /// Restart the `ghci` session without triggering restart hooks.
+    /// Restart the `ghci` session after an unsuccessful startup attempt.
     ///
-    /// This is meant to be used when starting the `ghci` session itself fails; in this case, we
-    /// don't have a prompt to write (e.g.) before-restart GHCi command hooks into, and we aren't
-    /// really "restarting" a session so much as starting it again. That is, this method avoids
-    /// "broken pipe" errors with `--before-restart-ghci` hooks.
+    /// There is no GHCi prompt during an early startup failure, so only shell reload hooks can be
+    /// run. They still bracket the replacement attempt just like hooks around an ordinary reload.
     #[instrument(skip_all, level = "debug")]
     async fn startup_restart(
         &mut self,
@@ -818,9 +818,30 @@ impl Ghci {
             .map(|path| self.classifier.relative_path(path))
             .collect::<eyre::Result<BTreeSet<_>>>()?;
 
-        self.restart_inner(
+        self.opts
+            .hooks
+            .run_shell_hooks(
+                LifecycleEvent::Reload(hooks::When::Before),
+                &mut self.command_handles,
+            )
+            .await?;
+
+        // The previous command process has already exited, so its process watcher cannot
+        // acknowledge `stop()`. Replace it directly, then let initialization drain diagnostics and
+        // run the shell-only after-hooks if this attempt also exits before GHCi boots.
+        let new = Self::new(
+            self.shutdown.clone(),
+            self.opts.clone(),
+            self.exited_sender.clone(),
+        )
+        .await?;
+        let _ = std::mem::replace(self, new);
+        self.initialize(
             log,
-            [LifecycleEvent::Startup(hooks::When::After)],
+            [
+                LifecycleEvent::Startup(hooks::When::After),
+                LifecycleEvent::Reload(hooks::When::After),
+            ],
             Some(haskell_files),
         )
         .await?;
@@ -1498,11 +1519,22 @@ impl Ghci {
         compilation_start: Instant,
         log: &mut CompilationLog,
         events: [LifecycleEvent; N],
+        ghci_available: bool,
     ) -> eyre::Result<()> {
         // Allow hooks to consume the error log by updating it before running the hooks.
         self.write_error_log(log).await?;
 
         for event in events {
+            if !ghci_available {
+                // The configured command can fail before GHCi provides a prompt (for example while
+                // Cabal builds a plugin). Lifecycle shell hooks still apply, but GHCi hooks cannot
+                // be submitted.
+                self.opts
+                    .hooks
+                    .run_shell_hooks(event, &mut self.command_handles)
+                    .await?;
+                continue;
+            }
             // Failed reloads must not run commands against modules GHCi just unloaded.
             if matches!(log.result(), Some(CompilationResult::Err))
                 && matches!(event, LifecycleEvent::Reload(hooks::When::After))
@@ -1542,7 +1574,21 @@ impl Ghci {
         event: LifecycleEvent,
         log: &mut CompilationLog,
     ) -> eyre::Result<()> {
+        // Before-hooks must not lose their shell commands merely because the GHCi prompt has
+        // disappeared. Run shell commands first; if a subsequent GHCi hook encounters a broken
+        // pipe, the external lifecycle notification has already happened.
+        let shell_first = matches!(event, LifecycleEvent::Reload(hooks::When::Before));
+        if shell_first {
+            self.opts
+                .hooks
+                .run_shell_hooks(event, &mut self.command_handles)
+                .await?;
+        }
+
         for hook in self.opts.hooks.select(event) {
+            if shell_first && matches!(&hook.command, hooks::Command::Shell(_)) {
+                continue;
+            }
             tracing::info!(command = %hook.command, "Running {hook} command");
             match &hook.command {
                 hooks::Command::Ghci(command) => {
