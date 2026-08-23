@@ -170,7 +170,7 @@ pub struct GhciOpts {
     pub auto_targets: bool,
     /// Whether discovering a Haskell module restarts the package-managed session.
     pub restart_on_add: bool,
-    /// Whether an unexpected process exit immediately starts a replacement session.
+    /// Whether unexpected exits keep starting delayed replacements despite an unchanged crash loop.
     pub restart_on_exit: bool,
     /// Where to write what `ghci` emits to `stdout`. Inherits parent's `stdout` by default.
     pub stdout_writer: GhciWriter,
@@ -374,6 +374,14 @@ impl Ghci {
 
     pub(crate) fn recovery_restart_required(&self) -> bool {
         self.recovery_restart_required
+    }
+
+    /// Absolute watched-source snapshot last synchronized with this session.
+    pub(crate) fn known_haskell_files_absolute(&self) -> BTreeSet<Utf8PathBuf> {
+        self.known_haskell_files
+            .iter()
+            .map(|path| path.absolute().to_owned())
+            .collect()
     }
 }
 
@@ -599,7 +607,7 @@ impl Ghci {
         log.fill_empty_summary();
         self.initialization_failure =
             matches!(log.result(), Some(CompilationResult::Err)).then(|| log.clone());
-        self.finish_compilation(start_instant, log, events, result.is_ok())
+        self.finish_compilation(start_instant, log, events, result.is_ok(), result.is_ok())
             .await?;
 
         result
@@ -710,9 +718,9 @@ impl Ghci {
             .map(|path| self.classifier.relative_path(path))
             .collect::<eyre::Result<BTreeSet<_>>>()?;
         let actions = self.get_reload_actions(events, &haskell_files)?;
-        let _ = kind_sender.send(actions.kind());
 
         if actions.needs_restart() {
+            let _ = kind_sender.send(GhciReloadKind::Restart);
             self.opts.clear();
             tracing::info!(
                 "Restarting ghci:\n{}",
@@ -724,83 +732,126 @@ impl Ghci {
             return Ok(());
         }
 
-        let mut log = CompilationLog::default();
+        if !actions.needs_modify() {
+            let _ = kind_sender.send(GhciReloadKind::None);
+            self.known_haskell_files = haskell_files;
+            self.prune_command_handles();
+            return Ok(());
+        }
 
-        if actions.needs_modify() {
-            self.opts.clear();
+        let mut log = CompilationLog::default();
+        self.opts.clear();
+
+        // Once the before-hooks start, always balance them with after-hooks. A protocol or
+        // bookkeeping error may make GHCi unavailable, but shell hooks can still publish the
+        // completed attempt and GHCi hooks are attempted whenever the prompt remains usable.
+        let reload_result: eyre::Result<()> = async {
             self.run_hooks(LifecycleEvent::Reload(hooks::When::Before), &mut log)
                 .await?;
-        }
+            // An interrupt decision can only cancel us after the paired before-hooks completed.
+            let _ = kind_sender.send(GhciReloadKind::Reload);
 
-        if !actions.needs_remove.is_empty() {
-            tracing::info!(
-                "Removing modules from ghci:\n{}",
-                format_bulleted_list(&actions.needs_remove)
-            );
-            self.remove_modules(&actions.needs_remove, &mut log).await?;
-        }
-
-        if !actions.needs_add.is_empty() {
-            tracing::info!(
-                "Adding modules to ghci:\n{}",
-                format_bulleted_list(&actions.needs_add)
-            );
-            self.add_modules(&actions.needs_add, &mut log).await?;
-        }
-
-        // Commit only after all target-set commands have completed. If this
-        // future is interrupted earlier, the previous snapshot remains dirty.
-        self.known_haskell_files = haskell_files;
-
-        if !actions.needs_reload.is_empty() {
-            tracing::info!(
-                "Reloading ghci:\n{}",
-                format_bulleted_list(&actions.needs_reload)
-            );
-            // Like `:unadd`, an ordinary reload can wedge inside GHC. It is not an executable
-            // eval, so monitor the output read itself and interrupt only if compilation goes quiet.
-            let completed = self
-                .stdin
-                .reload(&mut self.stdout, &mut log, COMPILATION_INACTIVITY_TIMEOUT)
-                .await?;
-            if completed {
-                self.refresh_eval_commands_for_paths(&actions.needs_reload)
-                    .await?;
-            } else {
-                print_ghciwatch_error(
-                    "GHCi reload stopped reporting compilation progress",
-                    &format!(
-                        "Component: reload (:reload)\nInactivity timeout: {COMPILATION_INACTIVITY_TIMEOUT:?}\nProcess group ID: {}\nWorking directory: {}\nCommand: {}\nChanged paths:\n{}\nRecovery: interrupting GHCi with process-group SIGINT, then retrying :reload with a {RECOVERY_COMPILATION_INACTIVITY_TIMEOUT:?} inactivity timeout",
-                        self.process_group_id,
-                        self.search_paths.cwd,
-                        self.opts.command,
-                        format_bulleted_list(&actions.needs_reload),
-                    ),
+            if !actions.needs_remove.is_empty() {
+                tracing::info!(
+                    "Removing modules from ghci:\n{}",
+                    format_bulleted_list(&actions.needs_remove)
                 );
-                tracing::warn!(
-                    "GHCi reported no reload compilation progress for {COMPILATION_INACTIVITY_TIMEOUT:?}; interrupting reload"
-                );
-                self.interrupt_and_retry_reload(&mut log, "reload (:reload)")
-                    .await
-                    .wrap_err("Failed to recover from inactive reload")?;
-                self.refresh_eval_commands_for_paths(&actions.needs_reload)
-                    .await?;
+                self.remove_modules(&actions.needs_remove, &mut log).await?;
             }
-        }
 
-        if actions.needs_modify() {
-            self.finish_compilation(
+            if !actions.needs_add.is_empty() {
+                tracing::info!(
+                    "Adding modules to ghci:\n{}",
+                    format_bulleted_list(&actions.needs_add)
+                );
+                self.add_modules(&actions.needs_add, &mut log).await?;
+            }
+
+            // Commit only after all target-set commands have completed. If this
+            // future is interrupted earlier, the previous snapshot remains dirty.
+            self.known_haskell_files = haskell_files;
+
+            if !actions.needs_reload.is_empty() {
+                tracing::info!(
+                    "Reloading ghci:\n{}",
+                    format_bulleted_list(&actions.needs_reload)
+                );
+                // Like `:unadd`, an ordinary reload can wedge inside GHC. It is not an executable
+                // eval, so monitor the output read itself and interrupt only if compilation goes quiet.
+                let completed = self
+                    .stdin
+                    .reload(&mut self.stdout, &mut log, COMPILATION_INACTIVITY_TIMEOUT)
+                    .await?;
+                if completed {
+                    self.refresh_eval_commands_for_paths(&actions.needs_reload)
+                        .await?;
+                } else {
+                    print_ghciwatch_error(
+                        "GHCi reload stopped reporting compilation progress",
+                        &format!(
+                            "Component: reload (:reload)\nInactivity timeout: {COMPILATION_INACTIVITY_TIMEOUT:?}\nProcess group ID: {}\nWorking directory: {}\nCommand: {}\nChanged paths:\n{}\nRecovery: interrupting GHCi with process-group SIGINT, then retrying :reload with a {RECOVERY_COMPILATION_INACTIVITY_TIMEOUT:?} inactivity timeout",
+                            self.process_group_id,
+                            self.search_paths.cwd,
+                            self.opts.command,
+                            format_bulleted_list(&actions.needs_reload),
+                        ),
+                    );
+                    tracing::warn!(
+                        "GHCi reported no reload compilation progress for {COMPILATION_INACTIVITY_TIMEOUT:?}; interrupting reload"
+                    );
+                    self.interrupt_and_retry_reload(&mut log, "reload (:reload)")
+                        .await
+                        .wrap_err("Failed to recover from inactive reload")?;
+                    self.refresh_eval_commands_for_paths(&actions.needs_reload)
+                        .await?;
+                }
+            }
+            Ok(())
+        }
+        .await;
+
+        let ghci_available = match &reload_result {
+            Ok(()) => true,
+            Err(err) => !error_is_broken_pipe(err) && !self.recovery_restart_required,
+        };
+        let operation_succeeded = reload_result.is_ok();
+        let finish_result = self
+            .finish_compilation(
                 start_instant,
                 &mut log,
                 [LifecycleEvent::Reload(hooks::When::After)],
-                true,
+                ghci_available,
+                operation_succeeded,
             )
-            .await?;
-        }
+            .await;
 
         self.prune_command_handles();
 
+        // Prefer the error that interrupted the operation, but never return it until after-hooks
+        // have had their chance to publish completion.
+        reload_result?;
+        finish_result?;
+
         Ok(())
+    }
+
+    /// Balance a reload attempt cancelled by a newer filesystem event.
+    pub(crate) async fn finish_interrupted_reload(
+        &mut self,
+        ghci_available: bool,
+    ) -> eyre::Result<()> {
+        let event = LifecycleEvent::Reload(hooks::When::After);
+        let mut log = CompilationLog::default();
+        let result = if ghci_available {
+            self.run_hooks(event, &mut log).await
+        } else {
+            self.opts
+                .hooks
+                .run_shell_hooks(event, &mut self.command_handles)
+                .await
+        };
+        self.prune_command_handles();
+        result
     }
 
     /// Restart the `ghci` session after an unsuccessful startup attempt.
@@ -850,17 +901,39 @@ impl Ghci {
     }
 
     /// Restart the `ghci` session and synchronize its target set.
+    ///
+    /// A restart is also a reload attempt from the watcher's perspective, so reload hooks bracket
+    /// it as well as restart hooks. This is especially important when command startup/compilation
+    /// fails: external after-reload hooks still need to publish completion of the attempt.
     #[instrument(skip_all, level = "debug")]
     async fn restart(&mut self, haskell_files: BTreeSet<NormalPath>) -> eyre::Result<()> {
         let mut log = CompilationLog::default();
 
-        self.run_hooks(LifecycleEvent::Restart(hooks::When::Before), &mut log)
+        if let Err(err) = self
+            .run_hooks(LifecycleEvent::Reload(hooks::When::Before), &mut log)
+            .await
+        {
+            self.run_shell_lifecycle_events([LifecycleEvent::Reload(hooks::When::After)])
+                .await?;
+            return Err(err);
+        }
+        if let Err(err) = self
+            .run_hooks(LifecycleEvent::Restart(hooks::When::Before), &mut log)
+            .await
+        {
+            self.run_shell_lifecycle_events([
+                LifecycleEvent::Restart(hooks::When::After),
+                LifecycleEvent::Reload(hooks::When::After),
+            ])
             .await?;
+            return Err(err);
+        }
         self.restart_inner(
             &mut log,
             [
                 LifecycleEvent::Startup(hooks::When::After),
                 LifecycleEvent::Restart(hooks::When::After),
+                LifecycleEvent::Reload(hooks::When::After),
             ],
             Some(haskell_files),
         )
@@ -876,14 +949,27 @@ impl Ghci {
         events: [LifecycleEvent; N],
         haskell_files: Option<BTreeSet<NormalPath>>,
     ) -> eyre::Result<()> {
-        self.stop().await?;
-        let new = Self::new(
+        if let Err(err) = self.stop().await {
+            self.run_shell_lifecycle_events(events).await?;
+            return Err(err);
+        }
+        let new = match Self::new(
             self.shutdown.clone(),
             self.opts.clone(),
             self.exited_sender.clone(),
         )
-        .await?;
+        .await
+        {
+            Ok(new) => new,
+            Err(err) => {
+                // There is no usable new prompt, but shell hooks must still close the lifecycle
+                // attempt that began before the old session was stopped.
+                self.run_shell_lifecycle_events(events).await?;
+                return Err(err);
+            }
+        };
         let _ = std::mem::replace(self, new);
+        // `initialize` itself balances all events on both compilation and protocol failures.
         self.initialize(log, events, haskell_files).await?;
 
         Ok(())
@@ -1520,40 +1606,44 @@ impl Ghci {
         log: &mut CompilationLog,
         events: [LifecycleEvent; N],
         ghci_available: bool,
+        operation_succeeded: bool,
     ) -> eyre::Result<()> {
-        // Allow hooks to consume the error log by updating it before running the hooks.
-        self.write_error_log(log).await?;
+        // Allow hooks to consume the error log by updating it before running the hooks. A failure
+        // to publish the log must not suppress lifecycle completion notifications.
+        let error_log_result = self.write_error_log(log).await;
 
+        let mut hooks_have_ghci = ghci_available;
+        let mut hook_result = Ok(());
         for event in events {
-            if !ghci_available {
+            let result = if hooks_have_ghci {
+                // Lifecycle hooks describe the attempt, not only successful compilation. GHCi may
+                // have unloaded modules after a failure, but hook diagnostics are isolated by
+                // `run_hooks`, so unavailable module-based hooks do not suppress remaining hooks.
+                self.run_hooks(event, log).await
+            } else {
                 // The configured command can fail before GHCi provides a prompt (for example while
-                // Cabal builds a plugin). Lifecycle shell hooks still apply, but GHCi hooks cannot
-                // be submitted.
+                // Cabal builds a plugin). Shell hooks still apply, but GHCi hooks cannot be sent.
                 self.opts
                     .hooks
                     .run_shell_hooks(event, &mut self.command_handles)
-                    .await?;
-                continue;
+                    .await
+            };
+            if let Err(err) = result {
+                // Continue with shell hooks for later lifecycle events even if the prompt failed
+                // while running a GHCi hook for an earlier event.
+                hooks_have_ghci = false;
+                if hook_result.is_ok() {
+                    hook_result = Err(err);
+                }
             }
-            // Failed reloads must not run commands against modules GHCi just unloaded, but shell
-            // hooks are external lifecycle notifications/cleanup and must still run. This also
-            // balances a before-reload shell hook when a before-reload GHCi hook produced the
-            // compilation error.
-            if matches!(log.result(), Some(CompilationResult::Err))
-                && matches!(event, LifecycleEvent::Reload(hooks::When::After))
-            {
-                self.opts
-                    .hooks
-                    .run_shell_hooks(event, &mut self.command_handles)
-                    .await?;
-                continue;
-            }
-            self.run_hooks(event, log).await?;
         }
 
         let event = events[N - 1];
+        let compilation_succeeded = operation_succeeded
+            && ghci_available
+            && !matches!(log.result(), Some(CompilationResult::Err));
 
-        if let Some(CompilationResult::Err) = log.result() {
+        if !compilation_succeeded {
             tracing::error!(
                 "{} failed in {:.2?}",
                 event.event_noun().first_char_to_ascii_uppercase(),
@@ -1566,12 +1656,31 @@ impl Ghci {
                 event.event_noun(),
                 compilation_start.elapsed()
             );
+        }
+
+        error_log_result?;
+        hook_result?;
+        if compilation_succeeded {
             // Run the eval commands, if any.
             self.eval(log).await?;
             // Run the user-provided test command, if any.
             self.test(log).await?;
         }
 
+        Ok(())
+    }
+
+    async fn run_shell_lifecycle_events<const N: usize>(
+        &mut self,
+        events: [LifecycleEvent; N],
+    ) -> eyre::Result<()> {
+        for event in events {
+            self.opts
+                .hooks
+                .run_shell_hooks(event, &mut self.command_handles)
+                .await?;
+        }
+        self.prune_command_handles();
         Ok(())
     }
 

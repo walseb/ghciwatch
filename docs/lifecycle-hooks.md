@@ -110,20 +110,24 @@ commands](comment-evaluation.md) will not run.
 Hooks: [`--before-reload-shell`](cli.md#--before-reload-shell),
 [`--before-reload-ghci`](cli.md#--before-reload-ghci).
 
-When: After file changes are detected but before a `:reload` or `:add` command
-is sent to the GHCi session.
-
-Note that the before-reload hooks are not executed [before a
-restart](#before-restart).
+When: After file changes are detected but before a `:reload`, `:add`, or full
+GHCi restart attempt. A restart runs both reload and restart hook pairs because it is
+the build/reload attempt for the triggering filesystem change.
 
 ### After reload
 
 Hooks: [`--after-reload-shell`](cli.md#--after-reload-shell),
 [`--after-reload-ghci`](cli.md#--after-reload-ghci).
 
-When: After a reload has completed, after the [error log](cli.md#--error-file)
-has been written, but before [eval commands](comment-evaluation.md) and [test
-suites](#test) are executed.
+When: After a reload attempt has completed, after ghciwatch has attempted to write
+the [error log](cli.md#--error-file), but before [eval
+commands](comment-evaluation.md) and [test suites](#test) are executed.
+
+After-reload hooks run exactly once for successful, failed, and interrupted reload
+or restart attempts whose before-reload hooks ran. A missing GHCi prompt prevents
+GHCi hooks from being submitted, but shell hooks still run. Errors from unloaded
+modules in a GHCi hook are reported without suppressing the remaining lifecycle
+hooks.
 
 ### Before restart
 

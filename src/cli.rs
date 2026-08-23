@@ -111,7 +111,7 @@ pub struct Opts {
     #[arg(long)]
     pub restart_on_add: bool,
 
-    /// Immediately replace an unexpectedly exited GHCi session instead of waiting for a file edit.
+    /// Keep replacing unexpectedly exited GHCi sessions after the crash delay, even without edits.
     ///
     /// Useful for services whose clients are already waiting for the session to return.
     #[arg(long)]

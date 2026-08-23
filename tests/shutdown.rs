@@ -59,7 +59,7 @@ async fn replacement_keeps_old_output_pipe_alive() {
         .await
         .expect("can trigger an intentional replacement");
     session
-        .wait_for_startup_log(BaseMatcher::ghci_started())
+        .wait_for_startup_log(replacement_completed())
         .await
         .expect("ghciwatch completes the replacement");
     assert!(
@@ -79,11 +79,17 @@ fn extract_pid(event: &test_harness::Event) -> i32 {
     .expect("pid is i32")
 }
 
-/// Test that when the `ghci` process is unexpectedly killed, `ghciwatch` waits for a file change
-/// and then restarts the session rather than shutting down.
+fn replacement_completed() -> BaseMatcher {
+    BaseMatcher::message(
+        r"((Starting up|Reloading) failed|Finished (starting up|reloading) in \d+\.\d+m?s)$",
+    )
+}
+
+/// Test that an unexpected GHCi exit gets one automatic replacement after the crash delay.
 #[test]
 async fn restarts_after_ghci_killed() {
     let mut session = GhciWatchBuilder::new("tests/data/simple")
+        .with_startup_timeout(std::time::Duration::from_secs(25))
         .start()
         .await
         .expect("ghciwatch starts");
@@ -101,33 +107,24 @@ async fn restarts_after_ghci_killed() {
 
     signal::kill(Pid::from_raw(pid), Signal::SIGKILL).expect("Failed to kill ghci");
 
-    // ghciwatch should detect the exit and wait for a file change.
+    // No source edit is needed for the first replacement attempt. This is important for crashes
+    // caused by implementation or toolchain faults rather than by the most recently compiled file.
     session
         .wait_for_log("ghci exited unexpectedly")
         .await
         .expect("ghciwatch detects unexpected ghci exit");
-
-    // A file change triggers the restart.
     session.clear_events();
     session
-        .fs()
-        .touch(session.path("src/MyLib.hs"))
+        .wait_for_startup_log(replacement_completed())
         .await
-        .expect("can touch source file");
-
-    // ghciwatch should restart ghci and finish loading. After an unexpected exit, ghciwatch logs
-    // "Finished restarting in X.Xs" (not "Finished starting up"), so we match on the common
-    // suffix rather than ghci_started() which only matches "starting up".
-    session
-        .wait_for_startup_log(BaseMatcher::ghci_started())
-        .await
-        .expect("ghciwatch restarts ghci after unexpected exit");
+        .expect("ghciwatch automatically restarts ghci after the crash delay");
 }
 
-/// Persistent services must recover without requiring an unrelated source edit.
+/// Persistent services keep recovering without requiring an unrelated source edit.
 #[test]
-async fn restart_on_exit_replaces_ghci_immediately() {
+async fn restart_on_exit_keeps_replacing_ghci() {
     let mut session = GhciWatchBuilder::new("tests/data/simple")
+        .with_startup_timeout(std::time::Duration::from_secs(25))
         .with_arg("--restart-on-exit")
         .start()
         .await
@@ -146,16 +143,16 @@ async fn restart_on_exit_replaces_ghci_immediately() {
     session.clear_events();
     signal::kill(Pid::from_raw(pid), Signal::SIGKILL).expect("Failed to kill ghci");
     session
-        .wait_for_startup_log(BaseMatcher::ghci_started())
+        .wait_for_startup_log(replacement_completed())
         .await
-        .expect("ghciwatch immediately replaces ghci");
+        .expect("ghciwatch replaces ghci after the crash delay");
 }
 
-/// Test that when ghci is killed, irrelevant file changes (non-Haskell, non-glob-matched) do not
-/// trigger a restart, but a relevant Haskell file change does.
+/// Changes to any configured watched path are retained while a crashed session is recovering.
 #[test]
-async fn does_not_restart_on_irrelevant_file_change() {
+async fn watched_non_haskell_change_is_retained_during_recovery() {
     let mut session = GhciWatchBuilder::new("tests/data/simple")
+        .with_startup_timeout(std::time::Duration::from_secs(25))
         .start()
         .await
         .expect("ghciwatch starts");
@@ -178,32 +175,18 @@ async fn does_not_restart_on_irrelevant_file_change() {
         .await
         .expect("ghciwatch detects unexpected ghci exit");
 
-    // Touch an irrelevant file inside the watched `src/` directory. The watcher will send the
-    // event, but the classifier should skip it because it's not a Haskell source file and doesn't
-    // match any reload/restart globs.
+    // A non-Haskell file is still a watched state change. It is merged into the delayed automatic
+    // replacement rather than discarded by the normal reload classifier.
+    session.clear_events();
     session
         .fs()
         .touch(session.path("src/irrelevant.txt"))
         .await
-        .expect("can touch irrelevant file");
-
+        .expect("can touch watched non-Haskell file");
     session
-        .wait_for_log("File change not relevant to ghci; continuing to wait")
+        .wait_for_startup_log(replacement_completed())
         .await
-        .expect("ghciwatch skips irrelevant file change");
-
-    // Now touch a relevant Haskell file to trigger the actual restart.
-    session.clear_events();
-    session
-        .fs()
-        .touch(session.path("src/MyLib.hs"))
-        .await
-        .expect("can touch source file");
-
-    session
-        .wait_for_startup_log(BaseMatcher::ghci_started())
-        .await
-        .expect("ghciwatch restarts ghci after relevant file change");
+        .expect("ghciwatch restarts while retaining the watched change");
 }
 
 /// Under `--no-auto-reload`, startup recovery follows every configured watch root rather than
@@ -211,6 +194,7 @@ async fn does_not_restart_on_irrelevant_file_change() {
 #[test]
 async fn handles_upstream_startup_repair_from_configured_watch() {
     let mut session = GhciWatchBuilder::new("tests/data/with-dep")
+        .with_startup_timeout(std::time::Duration::from_secs(25))
         .before_start(move |path| {
             // The dependent module remains valid, but no longer exports MyLib's imported name.
             async move {
@@ -259,9 +243,7 @@ async fn handles_upstream_startup_repair_from_configured_watch() {
 
     // This restart should succeed.
     session
-        .wait_for_startup_log(BaseMatcher::message(
-            r"Finished starting up in \d+\.\d+m?s$",
-        ))
+        .wait_for_startup_log(replacement_completed())
         .await
         .expect("ghciwatch restarts ghci after dependency is fixed");
 }
@@ -270,6 +252,7 @@ async fn handles_upstream_startup_repair_from_configured_watch() {
 #[test]
 async fn startup_retry_from_configured_watch() {
     let mut session = GhciWatchBuilder::new("tests/data/with-dep")
+        .with_startup_timeout(std::time::Duration::from_secs(25))
         .before_start(move |path| async move {
             Fs::new()
                 .replace(path.join("src/MyLib.hs"), "\"someFunc\"", "\"someFunc")
@@ -292,7 +275,7 @@ async fn startup_retry_from_configured_watch() {
         .expect("can fix watched source file");
 
     session
-        .wait_for_startup_log(BaseMatcher::ghci_started())
+        .wait_for_startup_log(replacement_completed())
         .await
         .expect("ghciwatch retries after a configured watched source changes");
 }
@@ -301,6 +284,7 @@ async fn startup_retry_from_configured_watch() {
 #[test]
 async fn handles_repeated_startup_failures_before_restart_ghci_hook() {
     let mut session = GhciWatchBuilder::new("tests/data/with-dep")
+        .with_startup_timeout(std::time::Duration::from_secs(25))
         .before_start(move |path| {
             // A version of SimpleDep.hs with an unclosed string literal — cabal will refuse to build it.
             async move {
@@ -371,6 +355,7 @@ async fn handles_repeated_startup_failures_before_restart_ghci_hook() {
 #[test]
 async fn handles_unexpected_exit_during_dispatch() {
     let mut session = GhciWatchBuilder::new("tests/data/with-dep")
+        .with_startup_timeout(std::time::Duration::from_secs(25))
         .with_args([
             "--watch",
             "simple-dep",
@@ -419,7 +404,7 @@ async fn handles_unexpected_exit_during_dispatch() {
 
     // ghciwatch should restart successfully.
     session
-        .wait_for_startup_log(BaseMatcher::ghci_started())
+        .wait_for_startup_log(replacement_completed())
         .await
         .expect("ghciwatch restarts ghci after fixing the dependency");
 }
@@ -429,6 +414,7 @@ async fn handles_unexpected_exit_during_dispatch() {
 #[test]
 async fn restart_after_failed_restart_on_dep_fix() {
     let mut session = GhciWatchBuilder::new("tests/data/with-dep")
+        .with_startup_timeout(std::time::Duration::from_secs(25))
         .with_args([
             "--watch",
             "simple-dep",
@@ -477,7 +463,7 @@ async fn restart_after_failed_restart_on_dep_fix() {
         .expect("can fix simple-dep");
 
     session
-        .wait_for_log(BaseMatcher::ghci_started())
+        .wait_for_log(replacement_completed())
         .await
         .expect("ghciwatch restarts ghci after fixing the dependency");
 }

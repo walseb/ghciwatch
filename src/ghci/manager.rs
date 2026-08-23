@@ -25,15 +25,13 @@ use crate::watcher::WatcherCommand;
 use super::memory::format_bytes;
 use super::memory::repl_resident_memory;
 use super::print_ghciwatch_error;
-use super::FileClassifier;
 use super::Ghci;
 use super::GhciOpts;
 use super::GhciRecoveryFailed;
 use super::GhciReloadKind;
-use super::ModuleSet;
-
-/// Recheck often enough to catch leaks without continuously walking `/proc`.
-const PERSISTENT_RESTART_DELAY: Duration = Duration::from_secs(5);
+/// Delay before retrying a crashed command. This makes one automatic retry visible and prevents
+/// an immediate hot loop while still recovering implementation/toolchain failures without an edit.
+const CRASH_RESTART_DELAY: Duration = Duration::from_secs(10);
 const MEMORY_WATCHDOG_INTERVAL: Duration = Duration::from_secs(30);
 /// Resident-memory limit for the persistent interactive GHC and its immediate Cabal parent.
 const GHCI_MEMORY_LIMIT_BYTES: u64 = 28 * 1024 * 1024 * 1024;
@@ -49,7 +47,7 @@ pub enum WatcherEvent {
         states: BTreeMap<Utf8PathBuf, FileState>,
         /// A stable snapshot of Haskell files under all watch roots.
         haskell_files: BTreeSet<Utf8PathBuf>,
-        /// Whether a diagnosed source file produced this event while GHCi was unavailable.
+        /// Whether a temporary startup-retry watch produced this event.
         startup_retry: bool,
     },
 }
@@ -165,7 +163,6 @@ pub async fn run_ghci(
     let eval_socket = opts.eval_socket.clone().into_std_path_buf();
     let interrupt_reloads = opts.interrupt_reloads;
     let restart_on_exit = opts.restart_on_exit;
-    let classifier = opts.file_classifier()?;
     let (exited_sender, mut exited_receiver) = mpsc::channel::<ExitStatus>(1);
     let mut ghci = Ghci::new(handle.clone(), opts, exited_sender)
         .await
@@ -210,15 +207,15 @@ pub async fn run_ghci(
             &mut handle,
             &mut watcher_receiver,
             &mut exited_receiver,
-            &classifier,
             status,
             "during initial GHCi startup",
             &mut RestartStrategy::Startup(&mut ghci),
             None,
+            restart_on_exit,
         )
         .await?
         {
-            RetryResult::Restarted(event) => startup_applied_event = Some(event),
+            RetryResult::Restarted(event) => startup_applied_event = event,
             RetryResult::Shutdown => return Ok(()),
         }
     }
@@ -235,7 +232,6 @@ pub async fn run_ghci(
         watcher_receiver,
         exited_receiver,
         _watcher_command_sender: watcher_command_sender,
-        classifier,
         interrupt_reloads,
         restart_on_exit,
         memory_watchdog,
@@ -305,7 +301,6 @@ struct GhciManager {
     exited_receiver: mpsc::Receiver<ExitStatus>,
     // Keep the watcher command channel alive; configured watches now own startup recovery.
     _watcher_command_sender: mpsc::Sender<WatcherCommand>,
-    classifier: FileClassifier,
     interrupt_reloads: bool,
     restart_on_exit: bool,
     memory_watchdog: tokio::time::Interval,
@@ -419,24 +414,13 @@ impl GhciManager {
                     }
                 }
                 Wake::GhciExited(status) => {
-                    // Failed SIGINT recovery and explicitly persistent services replace a dead
-                    // session without waiting for a source edit. A short delay prevents a crashing
-                    // command from becoming a tight restart loop.
-                    let recovered = {
+                    // Failed SIGINT recovery immediately replaces a session that was killed while
+                    // restoring protocol synchronization. Other exits use the common delayed retry
+                    // loop, including persistent services, so watcher snapshots are not lost.
+                    let recovery_kill = {
                         let _operation = self.eval_barrier.begin_operation().await;
                         let mut ghci = self.ghci.lock().await;
-                        let recovery_kill = ghci.recovery_restart_required();
-                        if recovery_kill || self.restart_on_exit {
-                            if !recovery_kill {
-                                let details = format!(
-                                    "Detected phase: while waiting for filesystem events\n{}\n{}\nRecovery: starting a fresh GHCi session after {PERSISTENT_RESTART_DELAY:?}",
-                                    exit_status_diagnostic(status),
-                                    ghci.diagnostic_context(),
-                                );
-                                print_ghciwatch_error("GHCi exited unexpectedly", &details);
-                                tracing::warn!(%status, "Restarting GHCi after persistent-service delay");
-                                tokio::time::sleep(PERSISTENT_RESTART_DELAY).await;
-                            }
+                        if ghci.recovery_restart_required() {
                             ghci.restart_after_recovery_kill_with_known_files()
                                 .await
                                 .wrap_err("Failed to restart GHCi after unexpected exit")?;
@@ -445,7 +429,7 @@ impl GhciManager {
                             false
                         }
                     };
-                    if recovered {
+                    if recovery_kill {
                         return Ok(WaitResult::Restarted);
                     }
                     return match self
@@ -456,13 +440,14 @@ impl GhciManager {
                         )
                         .await?
                     {
-                        RetryResult::Restarted(event) => {
+                        RetryResult::Restarted(Some(event)) => {
                             event.mark_applied(
                                 &mut self.applied_states,
                                 &mut self.applied_haskell_files,
                             );
                             Ok(WaitResult::Restarted)
                         }
+                        RetryResult::Restarted(None) => Ok(WaitResult::Restarted),
                         RetryResult::Shutdown => Ok(WaitResult::Shutdown),
                     };
                 }
@@ -588,13 +573,19 @@ impl GhciManager {
 
                                 // Send a SIGINT to interrupt the reload.
                                 // NB: This may take a couple seconds to register.
-                                match ghci.lock().await.send_sigint().await {
-                                    Ok(()) => return Ok(HandleResult::Interrupted(event)),
+                                let mut ghci = ghci.lock().await;
+                                match ghci.send_sigint().await {
+                                    Ok(()) => {
+                                        ghci.finish_interrupted_reload(true).await?;
+                                        return Ok(HandleResult::Interrupted(event));
+                                    }
                                     Err(e) => {
                                         // `send_sigint` force-kills the session if prompt
-                                        // synchronization cannot be restored. Consume its exit
-                                        // status, then immediately initialize a replacement with
-                                        // the merged event's filesystem snapshot.
+                                        // synchronization cannot be restored. Shell after-hooks can
+                                        // still balance the completed attempt.
+                                        ghci.finish_interrupted_reload(false).await?;
+                                        // Consume the exit status, then immediately initialize a
+                                        // replacement with the merged event's filesystem snapshot.
                                         tracing::warn!(
                                             error = ?e,
                                             "Failed to interrupt ghci; session was killed for restart",
@@ -678,45 +669,24 @@ impl GhciManager {
                     .restart_after_recovery_kill(haskell_files)
                     .await
                     .wrap_err("Failed to restart GHCi after unsuccessful interrupt recovery")?;
-            } else if self.restart_on_exit {
-                let affected_paths = event
-                    .affected_paths()
-                    .map(|paths| format!("\nAffected paths:\n{paths}"))
-                    .unwrap_or_default();
-                let ghci = self.ghci.lock().await;
-                let details = format!(
-                    "Detected phase: while dispatching a reload/restart event\n{}\n{}{affected_paths}\nRecovery: starting a fresh GHCi session after {PERSISTENT_RESTART_DELAY:?}",
-                    exit_status_diagnostic(status),
-                    ghci.diagnostic_context(),
-                );
-                print_ghciwatch_error("GHCi exited unexpectedly", &details);
-                drop(ghci);
-                tracing::warn!(%status, "Restarting GHCi after persistent-service delay");
-                tokio::time::sleep(PERSISTENT_RESTART_DELAY).await;
-                self.ghci
-                    .lock()
-                    .await
-                    .restart_after_recovery_kill_with_known_files()
-                    .await
-                    .wrap_err("Failed to restart persistent GHCi after dispatch exit")?;
             } else {
-                // Ordinary sessions retain the established policy: a relevant source event
-                // controls when another replacement attempt is useful.
-                let affected_paths = event.affected_paths();
+                // Retry the exact filesystem state once. Only a second crash with no newer
+                // watcher event is treated as a crash loop, unless persistent recovery is enabled.
                 match self
                     .wait_and_restart_runtime(
                         status,
                         "while dispatching a reload/restart event",
-                        affected_paths,
+                        Some(event.clone()),
                     )
                     .await?
                 {
-                    RetryResult::Restarted(restart_event) => {
+                    RetryResult::Restarted(Some(restart_event)) => {
                         restart_event.mark_applied(
                             &mut self.applied_states,
                             &mut self.applied_haskell_files,
                         );
                     }
+                    RetryResult::Restarted(None) => {}
                     RetryResult::Shutdown => return Ok(HandleResult::Shutdown),
                 }
             }
@@ -798,23 +768,23 @@ impl GhciManager {
         Ok(true)
     }
 
-    /// Wait for a relevant file change, then attempt to restart ghci.
+    /// Retry a crashed session once, then wait for a watched change if it crashes again.
     #[instrument(level = "debug", skip_all)]
     async fn wait_and_restart_runtime(
         &mut self,
         status: ExitStatus,
         detected_phase: &'static str,
-        affected_paths: Option<String>,
+        initial_event: Option<WatcherEvent>,
     ) -> eyre::Result<RetryResult> {
         wait_and_restart(
             &mut self.handle,
             &mut self.watcher_receiver,
             &mut self.exited_receiver,
-            &self.classifier,
             status,
             detected_phase,
             &mut RestartStrategy::Runtime(self.ghci.clone()),
-            affected_paths,
+            initial_event,
+            self.restart_on_exit,
         )
         .await
     }
@@ -835,39 +805,10 @@ fn preserve_recovery_event(event: &WatcherEvent, pending_event: &mut Option<Watc
     *pending_event = Some(recovery_event);
 }
 
-/// Drain all pending events, merge them, and return the complete event when it is relevant.
-/// Keeping the event preserves its newest filesystem snapshot for replacement initialization.
-fn drain_and_classify(
-    initial: WatcherEvent,
-    watcher_receiver: &mut mpsc::Receiver<WatcherEvent>,
-    classifier: &FileClassifier,
-    attempted_states: &BTreeMap<Utf8PathBuf, FileState>,
-    attempted_haskell_files: Option<&BTreeSet<Utf8PathBuf>>,
-) -> eyre::Result<Option<WatcherEvent>> {
-    let mut event = initial;
-    drain_pending(&mut event, watcher_receiver);
-    if event.discard_applied(attempted_states, attempted_haskell_files) {
-        return Ok(None);
-    }
-    let (events, startup_retry) = match &event {
-        WatcherEvent::Reload {
-            events,
-            startup_retry,
-            ..
-        } => (events.clone(), *startup_retry),
-    };
-    let kind = classifier.classify(events, &ModuleSet::default())?.kind();
-    if startup_retry || !matches!(kind, GhciReloadKind::None) {
-        Ok(Some(event))
-    } else {
-        Ok(None)
-    }
-}
-
 /// Outcome of [`wait_and_restart`].
 enum RetryResult {
-    /// GHCi was successfully restarted by the contained triggering event.
-    Restarted(WatcherEvent),
+    /// GHCi was successfully restarted, optionally using a triggering watcher event.
+    Restarted(Option<WatcherEvent>),
     /// A shutdown was requested while waiting.
     Shutdown,
 }
@@ -890,20 +831,25 @@ impl RestartStrategy<'_> {
 
     async fn restart(
         &mut self,
-        haskell_files: BTreeSet<Utf8PathBuf>,
+        haskell_files: Option<BTreeSet<Utf8PathBuf>>,
         log: &mut CompilationLog,
     ) -> eyre::Result<()> {
         match self {
-            Self::Startup(ghci) => ghci
-                .startup_restart(haskell_files, log)
-                .await
-                .wrap_err("Failed to restart ghci after startup failure"),
-            Self::Runtime(ghci) => ghci
-                .lock()
-                .await
-                .startup_restart(haskell_files, log)
-                .await
-                .wrap_err("Failed to restart ghci after unexpected exit"),
+            Self::Startup(ghci) => {
+                let haskell_files =
+                    haskell_files.unwrap_or_else(|| ghci.known_haskell_files_absolute());
+                ghci.startup_restart(haskell_files, log)
+                    .await
+                    .wrap_err("Failed to restart ghci after startup failure")
+            }
+            Self::Runtime(ghci) => {
+                let mut ghci = ghci.lock().await;
+                let haskell_files =
+                    haskell_files.unwrap_or_else(|| ghci.known_haskell_files_absolute());
+                ghci.startup_restart(haskell_files, log)
+                    .await
+                    .wrap_err("Failed to restart ghci after unexpected exit")
+            }
         }
     }
 
@@ -923,72 +869,105 @@ enum RestartRace {
     ExitPending,
 }
 
-/// Wait for a relevant file change, then attempt to restart ghci.
-///
-/// If ghci also dies during the restart attempt, keeps waiting for file changes and retrying
-/// rather than crashing. Returns [`RetryResult::Shutdown`] if a shutdown is requested while
-/// waiting.
+/// Retry a crashed command after a fixed delay. If that replacement crashes with no watched
+/// changes, treat it as a crash loop and wait until any watched path changes before trying again,
+/// unless persistent recovery was requested. Changes received during the delay or replacement are
+/// merged so initialization always gets the newest complete source snapshot.
 async fn wait_and_restart(
     handle: &mut ShutdownHandle,
     watcher_receiver: &mut mpsc::Receiver<WatcherEvent>,
     exited_receiver: &mut mpsc::Receiver<ExitStatus>,
-    classifier: &FileClassifier,
     mut status: ExitStatus,
     detected_phase: &'static str,
     strategy: &mut RestartStrategy<'_>,
-    affected_paths: Option<String>,
+    initial_event: Option<WatcherEvent>,
+    restart_unchanged: bool,
 ) -> eyre::Result<RetryResult> {
     let context = strategy.context();
-    let affected_paths = affected_paths
+    let initial_affected_paths = initial_event
+        .as_ref()
+        .and_then(WatcherEvent::affected_paths)
         .map(|paths| format!("\nAffected paths:\n{paths}"))
         .unwrap_or_default();
+    let recovery = if restart_unchanged {
+        format!(
+            "persistently retrying with a fresh GHCi session after {CRASH_RESTART_DELAY:?}, using the newest queued watched state"
+        )
+    } else {
+        format!(
+            "retrying with a fresh GHCi session after {CRASH_RESTART_DELAY:?}; if the unchanged replacement also crashes, waiting for any configured watched path to change"
+        )
+    };
     let details = format!(
-        "Detected phase: {detected_phase}\n{}\n{}{affected_paths}\nRecovery: waiting for a relevant change under a configured --watch path, then starting a fresh GHCi session",
+        "Detected phase: {detected_phase}\n{}\n{}{initial_affected_paths}\nRecovery: {recovery}",
         exit_status_diagnostic(status),
         strategy.diagnostic_context().await,
     );
     print_ghciwatch_error("GHCi exited unexpectedly", &details);
     tracing::warn!(
         %status,
-        "ghci exited {context}; waiting for a configured file change to restart",
+        restart_unchanged,
+        "ghci exited {context}; retrying after crash delay"
     );
+
+    let mut pending_event = initial_event;
     let mut attempted_states = BTreeMap::new();
     let mut attempted_haskell_files = None;
+    let mut first_retry = true;
+
     loop {
-        let event = loop {
-            let event = tokio::select! {
-                _ = handle.on_shutdown_requested() => {
-                    return Ok(RetryResult::Shutdown);
-                }
-                ret = watcher_receiver.recv() => {
-                    let Some(event) = ret else {
+        // Every observed crash gets a quiet period. Watcher events continue to accumulate during it.
+        let delay = tokio::time::sleep(CRASH_RESTART_DELAY);
+        tokio::pin!(delay);
+        loop {
+            tokio::select! {
+                _ = handle.on_shutdown_requested() => return Ok(RetryResult::Shutdown),
+                _ = &mut delay => break,
+                event = watcher_receiver.recv() => {
+                    let Some(event) = event else {
                         tracing::debug!("Watcher event channel closed; shutting down");
                         return Ok(RetryResult::Shutdown);
                     };
-                    event
+                    match &mut pending_event {
+                        Some(pending) => pending.merge(event),
+                        None => pending_event = Some(event),
+                    }
                 }
-            };
-            match drain_and_classify(
-                event,
-                watcher_receiver,
-                classifier,
-                &attempted_states,
-                attempted_haskell_files.as_ref(),
-            )? {
-                Some(event) => break event,
-                None => tracing::debug!("File change not relevant to ghci; continuing to wait"),
             }
-        };
-        let haskell_files = event.haskell_files();
-        let affected_paths = event
-            .affected_paths()
-            .map(|paths| format!("\nAffected paths:\n{paths}"))
-            .unwrap_or_default();
+        }
+
+        if !first_retry && !restart_unchanged {
+            // A replacement has already crashed. Delayed duplicate notifications do not break the
+            // crash loop; any genuinely newer watched state does, regardless of file classification.
+            loop {
+                if let Some(mut event) = pending_event.take() {
+                    drain_pending(&mut event, watcher_receiver);
+                    if !event.discard_applied(&attempted_states, attempted_haskell_files.as_ref()) {
+                        pending_event = Some(event);
+                        break;
+                    }
+                    tracing::debug!("Discarding watched change already used by failed replacement");
+                }
+                let event = tokio::select! {
+                    _ = handle.on_shutdown_requested() => return Ok(RetryResult::Shutdown),
+                    event = watcher_receiver.recv() => {
+                        let Some(event) = event else {
+                            tracing::debug!("Watcher event channel closed; shutting down");
+                            return Ok(RetryResult::Shutdown);
+                        };
+                        event
+                    }
+                };
+                pending_event = Some(event);
+            }
+        }
+        first_retry = false;
+
+        let haskell_files = pending_event.as_ref().map(WatcherEvent::haskell_files);
         tracing::debug!("Restarting ghci");
         let mut restart_log = CompilationLog::default();
-        // Do not race replacement initialization against the process-exit notification. The
-        // initializer must drain startup diagnostics and run shell-only after-hooks before it is
-        // cancelled; the already-buffered exit status is consumed below.
+        // Initialization must drain startup diagnostics and run shell-only after-hooks before the
+        // already-buffered process-exit status is consumed below.
         let race = match strategy.restart(haskell_files, &mut restart_log).await {
             Ok(()) => RestartRace::Restarted,
             Err(err) if is_broken_pipe(&err) || is_recovery_failure(&err) => {
@@ -1000,7 +979,7 @@ async fn wait_and_restart(
         let new_status = match race {
             RestartRace::Restarted => match exited_receiver.try_recv() {
                 Ok(new_status) => new_status,
-                Err(_) => return Ok(RetryResult::Restarted(event)),
+                Err(_) => return Ok(RetryResult::Restarted(pending_event)),
             },
             RestartRace::ExitPending => {
                 tokio::select! {
@@ -1013,19 +992,60 @@ async fn wait_and_restart(
             }
         };
         status = new_status;
-        // This exact filesystem state already triggered a complete replacement attempt. Delayed
-        // duplicate notifications must not immediately retry it, while a newer edit remains dirty.
-        event.mark_applied(&mut attempted_states, &mut attempted_haskell_files);
+
+        let affected_paths = pending_event
+            .as_ref()
+            .and_then(WatcherEvent::affected_paths)
+            .map(|paths| format!("\nAffected paths:\n{paths}"))
+            .unwrap_or_default();
+        if let Some(event) = pending_event.take() {
+            // This exact watched state already produced a complete replacement attempt.
+            event.mark_applied(&mut attempted_states, &mut attempted_haskell_files);
+        }
+
+        // Events can arrive while replacement initialization owns the GHCi protocol. Pull all of
+        // them in before describing whether we are waiting or already have newer work to retry.
+        while let Ok(event) = watcher_receiver.try_recv() {
+            match &mut pending_event {
+                Some(pending) => pending.merge(event),
+                None => pending_event = Some(event),
+            }
+        }
+        if pending_event.as_mut().is_some_and(|event| {
+            event.discard_applied(&attempted_states, attempted_haskell_files.as_ref())
+        }) {
+            pending_event = None;
+        }
+
+        let (recovery, warning) = if restart_unchanged {
+            (
+                format!(
+                    "persistent recovery enabled; retrying after {CRASH_RESTART_DELAY:?} with the newest queued watched state"
+                ),
+                "persistent recovery will retry unchanged state",
+            )
+        } else if pending_event.is_some() {
+            (
+                format!(
+                    "a newer watched state is already queued; retrying after {CRASH_RESTART_DELAY:?}"
+                ),
+                "newer watched state queued for retry",
+            )
+        } else {
+            (
+                format!(
+                    "crash loop detected; waiting for any configured watched path to change, then retrying after the {CRASH_RESTART_DELAY:?} crash delay"
+                ),
+                "no newer watched state; waiting for a configured file change",
+            )
+        };
         let details = format!(
-            "Detected phase: while starting a replacement GHCi session\n{}\n{}{affected_paths}\nRecovery: waiting for a relevant change under a configured --watch path, then retrying with a fresh GHCi session",
+            "Detected phase: while starting a replacement GHCi session\n{}\n{}{affected_paths}\nRecovery: {recovery}",
             exit_status_diagnostic(status),
             strategy.diagnostic_context().await,
         );
         print_ghciwatch_error("GHCi exited again while restarting", &details);
-        tracing::warn!(
-            %status,
-            "ghci exited {context}; waiting for a configured file change to restart",
-        );
+        tracing::warn!(%status, "ghci exited {context}; {warning}");
     }
 }
 

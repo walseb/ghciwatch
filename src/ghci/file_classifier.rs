@@ -11,7 +11,6 @@ use crate::ignore::GlobMatcher;
 use crate::normal_path::NormalPath;
 
 use super::module_set::ModuleSet;
-use super::GhciReloadKind;
 
 /// Classifies file events into reload actions based on glob patterns
 /// and the current state of loaded modules.
@@ -166,16 +165,5 @@ impl ReloadActions {
     /// Is a session restart needed?
     pub fn needs_restart(&self) -> bool {
         !self.needs_restart.is_empty()
-    }
-
-    /// Get the kind of reload we'll perform.
-    pub fn kind(&self) -> GhciReloadKind {
-        if self.needs_restart() {
-            GhciReloadKind::Restart
-        } else if self.needs_modify() {
-            GhciReloadKind::Reload
-        } else {
-            GhciReloadKind::None
-        }
     }
 }

@@ -118,6 +118,95 @@ async fn can_run_hooks() {
     ghci_hook(&mut session, "after-restart", "2").await;
 }
 
+/// A restart is one reload attempt, even when the replacement command fails before GHCi is usable.
+#[test]
+async fn failed_restart_runs_reload_hooks_once() {
+    let hook_log = "restart-reload-hooks.log";
+    let before = shell_requote(&format!("sh -c 'echo before >> {hook_log}'"));
+    let after = shell_requote(&format!("sh -c 'echo after >> {hook_log}'"));
+    let mut session = GhciWatchBuilder::new("tests/data/simple")
+        .with_args([
+            "--before-reload-shell",
+            &before,
+            "--after-reload-shell",
+            &after,
+        ])
+        .start()
+        .await
+        .expect("ghciwatch starts");
+
+    session.wait_until_ready().await.unwrap();
+    session.clear_events();
+    {
+        session.fs_mut().disable_load_bearing_sleep();
+        session
+            .fs()
+            .replace(
+                session.path("src/MyLib.hs"),
+                "example = \"example\"",
+                "example = ()",
+            )
+            .await
+            .expect("can introduce a compilation error");
+        session
+            .fs()
+            .append(session.path("my-simple-package.cabal"), "\n")
+            .await
+            .expect("can trigger a full restart");
+        session.fs_mut().reset_load_bearing_sleep();
+    }
+
+    session
+        .wait_for_log(BaseMatcher::message("Running after-reload command"))
+        .await
+        .expect("failed restart runs after-reload hook");
+    let hooks = session.fs().read(session.path(hook_log)).await.unwrap();
+    assert_eq!(
+        hooks, "before\nafter\n",
+        "each reload hook must run exactly once for the failed restart attempt"
+    );
+}
+/// Reload hooks describe every reload attempt, including one that fails compilation.
+#[test]
+async fn failed_reload_runs_before_and_after_hooks() {
+    let mut session = GhciWatchBuilder::new("tests/data/simple")
+        .with_args([
+            "--before-reload-shell",
+            "touch before-reload-shell",
+            "--before-reload-ghci",
+            "putStrLn \"before-reload-ghci\"",
+            "--after-reload-shell",
+            "touch after-reload-shell",
+            "--after-reload-ghci",
+            "Definitely.Not.In.Scope.afterFailedReload",
+            "--after-reload-ghci",
+            "putStrLn \"after-reload-ghci\"",
+        ])
+        .start()
+        .await
+        .expect("ghciwatch starts");
+
+    session.wait_until_ready().await.unwrap();
+    session
+        .fs()
+        .replace(
+            session.path("src/MyLib.hs"),
+            "example = \"example\"",
+            "example = ()",
+        )
+        .await
+        .expect("can introduce a compilation error");
+
+    shell_hook(&mut session, "before-reload", "shell").await;
+    ghci_hook(&mut session, "before-reload", "ghci").await;
+    shell_hook(&mut session, "after-reload", "shell").await;
+    ghci_hook(&mut session, "after-reload", "ghci").await;
+    session
+        .wait_for_log(BaseMatcher::reload_completes())
+        .await
+        .expect("failed reload completes after running its lifecycle hooks");
+}
+
 fn hook_timeout(session: &GhciWatch, hook: &str) -> Duration {
     if hook.ends_with("-startup") || hook.ends_with("-restart") {
         session.startup_timeout
