@@ -99,3 +99,88 @@ async fn can_remove_multiple_modules_at_once() {
         .await
         .expect("ghciwatch finishes reloading");
 }
+
+/// A filesystem event received during an after-reload hook must be queued, not treated as an
+/// interruption of the compilation that has already finished. Otherwise the hook is run twice for
+/// the interrupted attempt and target removal can be delayed or lost if cleanup fails.
+#[test]
+async fn removes_module_deleted_during_after_reload_hook() {
+    let hook = "sh -c 'echo hook >> after-reload.log; touch after-reload-started; while test ! -e release-after-reload; do sleep 0.05; done; false'";
+    let mut session = GhciWatchBuilder::new("tests/data/simple")
+        .before_start(|project| async move {
+            let fs = Fs::new();
+            fs.replace(
+                project.join("my-simple-package.cabal"),
+                "exposed-modules: MyLib",
+                "exposed-modules: MyLib, MyModule",
+            )
+            .await?;
+            fs.write(
+                project.join("src/MyModule.hs"),
+                indoc!(
+                    r#"
+                    module MyModule (myFunc) where
+
+                    myFunc :: IO ()
+                    myFunc = putStrLn "hello!"
+                    "#
+                ),
+            )
+            .await?;
+            Ok(())
+        })
+        .with_args(["--after-reload-shell", hook])
+        .start()
+        .await
+        .expect("ghciwatch starts");
+
+    session.wait_until_ready().await.unwrap();
+    session
+        .fs()
+        .touch(session.path("src/MyLib.hs"))
+        .await
+        .unwrap();
+    session
+        .fs()
+        .wait_for_path(
+            session.startup_timeout,
+            &session.path("after-reload-started"),
+        )
+        .await
+        .expect("after-reload hook starts");
+
+    session
+        .fs()
+        .remove(session.path("src/MyModule.hs"))
+        .await
+        .unwrap();
+    session
+        .wait_for_log(BaseMatcher::message(
+            "Received ghci event from watcher while reloading",
+        ))
+        .await
+        .expect("deletion is queued while the after-reload hook runs");
+    session
+        .fs()
+        .touch(session.path("release-after-reload"))
+        .await
+        .unwrap();
+
+    session
+        .wait_for_log(BaseMatcher::ghci_remove())
+        .await
+        .expect("deleted module is removed from GHCi");
+    session
+        .wait_for_log(BaseMatcher::reload_completes())
+        .await
+        .expect("deletion reload completes");
+    let hooks = session
+        .fs()
+        .read(session.path("after-reload.log"))
+        .await
+        .unwrap();
+    assert_eq!(
+        hooks, "hook\nhook\n",
+        "after-reload runs once for the initial edit and once for the deletion"
+    );
+}

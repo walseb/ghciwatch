@@ -17,6 +17,7 @@ use std::time::Duration;
 use std::time::Instant;
 use tokio::io::DuplexStream;
 use tokio::sync::oneshot;
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use aho_corasick::AhoCorasick;
@@ -710,7 +711,7 @@ impl Ghci {
         &mut self,
         events: BTreeSet<FileEvent>,
         haskell_files: BTreeSet<Utf8PathBuf>,
-        kind_sender: oneshot::Sender<GhciReloadKind>,
+        kind_sender: watch::Sender<GhciReloadKind>,
     ) -> eyre::Result<()> {
         let start_instant = Instant::now();
         let haskell_files = haskell_files
@@ -809,6 +810,10 @@ impl Ghci {
             Ok(())
         }
         .await;
+
+        // Target synchronization/compilation is over. Do not let a later filesystem event
+        // interrupt error publication or after-reload hooks; queue it for the next dispatch.
+        let _ = kind_sender.send(GhciReloadKind::None);
 
         let ghci_available = match &reload_result {
             Ok(()) => true,
@@ -1752,9 +1757,11 @@ fn error_is_broken_pipe(err: &eyre::Report) -> bool {
 }
 
 /// How a [`Ghci`] session responds to a reload event.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub enum GhciReloadKind {
-    /// Noop. No actions needed.
+    /// Reload classification and before-hooks have not completed yet.
+    Pending,
+    /// No interruptible work remains. This includes post-compilation hooks.
     None,
     /// Reload, add, and/or remove modules. Can be interrupted.
     Reload,

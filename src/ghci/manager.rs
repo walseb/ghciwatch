@@ -10,7 +10,7 @@ use std::time::Duration;
 use camino::Utf8PathBuf;
 use eyre::Context;
 use tokio::sync::mpsc;
-use tokio::sync::oneshot;
+use tokio::sync::watch;
 use tokio::sync::Mutex;
 use tracing::instrument;
 
@@ -247,11 +247,11 @@ pub async fn run_ghci(
     manager.run().await
 }
 
-#[instrument(level = "debug", skip(ghci, reload_sender))]
+#[instrument(level = "debug", skip(ghci, reload_state_sender))]
 async fn dispatch(
     ghci: Arc<Mutex<Ghci>>,
     event: WatcherEvent,
-    reload_sender: oneshot::Sender<GhciReloadKind>,
+    reload_state_sender: watch::Sender<GhciReloadKind>,
 ) -> eyre::Result<()> {
     match event {
         WatcherEvent::Reload {
@@ -261,7 +261,7 @@ async fn dispatch(
         } => {
             ghci.lock()
                 .await
-                .reload(events, haskell_files, reload_sender)
+                .reload(events, haskell_files, reload_state_sender)
                 .await?;
         }
     }
@@ -270,24 +270,26 @@ async fn dispatch(
 
 /// Should we interrupt a reload with a new event?
 #[instrument(level = "debug", skip_all)]
-async fn should_interrupt(reload_receiver: oneshot::Receiver<GhciReloadKind>) -> bool {
-    let reload_kind = match reload_receiver.await {
-        Ok(kind) => kind,
-        Err(err) => {
-            tracing::debug!("Failed to receive reload kind from ghci: {err}");
-            return false;
-        }
-    };
-
-    match reload_kind {
-        GhciReloadKind::None | GhciReloadKind::Restart => {
-            // Nothing to do, wait for the task to finish.
-            tracing::debug!(?reload_kind, "Not interrupting reload");
-            false
-        }
-        GhciReloadKind::Reload => {
-            tracing::debug!(?reload_kind, "Interrupting reload");
-            true
+async fn should_interrupt(mut reload_state_receiver: watch::Receiver<GhciReloadKind>) -> bool {
+    loop {
+        let reload_kind = *reload_state_receiver.borrow_and_update();
+        match reload_kind {
+            GhciReloadKind::Pending => {
+                if let Err(err) = reload_state_receiver.changed().await {
+                    tracing::debug!("Failed to receive reload state from ghci: {err}");
+                    return false;
+                }
+            }
+            GhciReloadKind::None | GhciReloadKind::Restart => {
+                // Nothing to do, wait for the task to finish. `None` also marks the
+                // post-compilation hooks, which must not be interrupted by a later edit.
+                tracing::debug!(?reload_kind, "Not interrupting reload");
+                return false;
+            }
+            GhciReloadKind::Reload => {
+                tracing::debug!(?reload_kind, "Interrupting reload");
+                return true;
+            }
         }
     }
 }
@@ -466,16 +468,16 @@ impl GhciManager {
         // Queue behind any active eval and prevent later evals from entering GHCi
         // until this complete dispatch (including interruption cleanup) is done.
         let _eval_reload_guard = self.eval_barrier.begin_operation().await;
-        let (reload_sender, reload_receiver) = oneshot::channel();
+        let (reload_state_sender, reload_state_receiver) = watch::channel(GhciReloadKind::Pending);
         let mut task = Box::pin(tokio::task::spawn(dispatch(
             self.ghci.clone(),
             event.clone(),
-            reload_sender,
+            reload_state_sender,
         )));
 
-        // `should_interrupt` consumes the oneshot receiver, so we wrap it in an Option
-        // to track whether it's been used.
-        let mut reload_receiver = Some(reload_receiver);
+        // We only need one interrupt decision. The watch receiver also lets GHCi mark the
+        // post-compilation hook phase as non-interruptible without racing a watcher event.
+        let mut reload_state_receiver = Some(reload_state_receiver);
         // Events that arrive while we're waiting for a non-interruptible dispatch
         // (e.g. a restart) to complete. Returned as `Interrupted` for retry.
         let mut pending_event: Option<WatcherEvent> = None;
@@ -555,11 +557,11 @@ impl GhciManager {
                     // source snapshot remains dirty for one follow-up cycle.
 
                     // Check if we should interrupt the in-progress reload. We can only
-                    // check once (the oneshot is consumed), and only for interruptible
+                    // check once (the state receiver is consumed), and only for interruptible
                     // reloads.
                     if interrupt_reloads {
-                        if let Some(reload_receiver) = reload_receiver.take() {
-                            if should_interrupt(reload_receiver).await {
+                        if let Some(reload_state_receiver) = reload_state_receiver.take() {
+                            if should_interrupt(reload_state_receiver).await {
                                 // Merge everything: any previously accumulated events
                                 // plus the newest event.
                                 if let Some(pending_event) = pending_event.take() {
@@ -607,8 +609,8 @@ impl GhciManager {
                         }
                     }
 
-                    // Either `interrupt_reloads` is `false`, the `reload_receiver` was already
-                    // consumed, or `should_interrupt` returned false. Accumulate the event
+                    // Either `interrupt_reloads` is `false`, the state receiver was already
+                    // consumed, or the operation is non-interruptible. Accumulate the event
                     // and keep waiting for the dispatch task to finish.
                     match pending_event {
                         Some(ref mut pending_event) => pending_event.merge(new_event),
