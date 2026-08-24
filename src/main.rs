@@ -21,8 +21,13 @@ use ghciwatch::WatcherCommand;
 use ghciwatch::WatcherOpts;
 use tokio::sync::mpsc;
 
+const PARENT_CHECK_INTERVAL: Duration = Duration::from_millis(250);
+
 #[tokio::main]
 async fn main() -> eyre::Result<()> {
+    // Capture this before initialization can block or yield. If the launcher disappears while
+    // options, tracing, or GHCi are starting, the monitor still recognizes the reparenting.
+    let original_parent = nix::unistd::getppid();
     color_eyre::install()?;
     let mut opts = cli::Opts::parse();
     opts.init()?;
@@ -94,7 +99,40 @@ async fn main() -> eyre::Result<()> {
             run_watcher(handle, ghci_sender, watcher_command_receiver, watcher_opts)
         })
         .await;
+    // Subscribe this last so every long-running task is already able to receive its shutdown
+    // broadcast if the original parent disappeared during initialization.
+    manager
+        .spawn("watch_parent", move |handle| {
+            watch_parent(handle, original_parent)
+        })
+        .await;
     let ret = manager.wait_for_shutdown().await;
     tracing::debug!("main() finished");
     ret
+}
+
+/// Request normal graceful shutdown once this process is no longer owned by its launch parent.
+async fn watch_parent(
+    mut handle: ghciwatch::ShutdownHandle,
+    original_parent: nix::unistd::Pid,
+) -> eyre::Result<()> {
+    loop {
+        let current_parent = nix::unistd::getppid();
+        if current_parent != original_parent {
+            tracing::info!(
+                original_parent = original_parent.as_raw(),
+                current_parent = current_parent.as_raw(),
+                "Parent process exited; shutting down ghciwatch"
+            );
+            // The manager itself keeps a broadcast receiver alive. Ignore a send error anyway: it
+            // means shutdown has already progressed far enough that no receiver remains.
+            let _ = handle.request_shutdown();
+            return Ok(());
+        }
+
+        tokio::select! {
+            _ = tokio::time::sleep(PARENT_CHECK_INTERVAL) => {}
+            _ = handle.on_shutdown_requested() => return Ok(()),
+        }
+    }
 }

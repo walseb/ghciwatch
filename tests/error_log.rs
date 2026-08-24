@@ -291,6 +291,49 @@ async fn error_log_pre_ghci_stderr_failure() {
     .assert_eq(&error_contents);
 }
 
+/// Plain Cabal failures before the GHCi banner become errors and are visible to startup hooks.
+#[test]
+async fn error_log_pre_ghci_plain_failure_runs_hook() {
+    let error_path = "ghcid.txt";
+    let command = r#"sh -c 'printf "%s\n" "Error: [Cabal-7125]" "configure failed before GHCi startup" >&2; exit 1'"#;
+    let mut session = GhciWatchBuilder::new("tests/data/simple")
+        .with_args([
+            "--errors",
+            error_path,
+            "--after-startup-shell",
+            "sh -c 'grep -q Cabal-7125 ghcid.txt && touch early-startup-hook'",
+        ])
+        .with_repl_command(command)
+        .start()
+        .await
+        .expect("ghciwatch starts");
+
+    session
+        .wait_for_startup_log("ghci exited during startup")
+        .await
+        .expect("ghciwatch detects the plain pre-GHCi failure");
+    session
+        .fs()
+        .wait_for_path(
+            session.startup_timeout,
+            &session.path("early-startup-hook"),
+        )
+        .await
+        .expect("after-startup hook observes the early error log");
+
+    let error_contents = session
+        .fs()
+        .read(session.path(error_path))
+        .await
+        .expect("ghciwatch writes the plain startup failure");
+    assert!(
+        error_contents.contains("<no location info>: error:")
+            && error_contents.contains("Cabal-7125")
+            && error_contents.contains("configure failed before GHCi startup"),
+        "plain startup diagnostic missing from error log: {error_contents:?}"
+    );
+}
+
 /// A restart-time Cabal build failure updates the error file before exit handling continues.
 #[test]
 async fn error_log_restart_failure_before_ghci() {

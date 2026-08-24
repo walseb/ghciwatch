@@ -589,13 +589,32 @@ impl Ghci {
         }
         .await;
         if let Err(err) = result.as_ref() {
-            // If the command dies before GHCi boots, no prompt exists for normal marker-based
-            // stderr synchronization. The pipe has closed, so EOF provides the ordering boundary.
-            if error_is_broken_pipe(err) {
-                if let Err(drain_error) = self.stdout.drain_stderr_after_exit(log).await {
-                    tracing::debug!("Failed to collect startup stderr: {drain_error}");
+            let failure_message = if error_is_broken_pipe(err) {
+                // If the command dies before GHCi boots, no prompt exists for normal marker-based
+                // stderr synchronization. The pipe has closed, so EOF is the ordering boundary.
+                let startup_output = match self.stdout.drain_stderr_after_exit(log).await {
+                    Ok(output) => output,
+                    Err(drain_error) => {
+                        tracing::debug!("Failed to collect startup stderr: {drain_error}");
+                        String::new()
+                    }
+                };
+                let startup_output = startup_output.trim();
+                if startup_output.is_empty() {
+                    "Configured GHCi command exited before startup completed".to_owned()
+                } else {
+                    format!(
+                        "Configured GHCi command exited before startup completed:\n{startup_output}"
+                    )
                 }
-            }
+            } else {
+                // Initialization can also fail while the command remains alive, for example on a
+                // target bookkeeping or pipe-protocol error. Do not misreport that as process exit.
+                format!("GHCi initialization failed: {err:#}")
+            };
+            // Cabal configure/plugin failures are often plain prose rather than GHC diagnostics.
+            // Preserve that output as a no-location error instead of publishing an empty success log.
+            log.mark_failed_with_diagnostic(failure_message);
             // If writing the compilation log or running hooks fails, we should log this error so
             // it's not lost forever.
             tracing::debug!("Initializing failed: {err}");
@@ -672,8 +691,11 @@ impl Ghci {
             // Keep target additions/removals and restart-glob actions intact.
         }
 
-        // Notification streams are hints, not transactions. Diff a complete
-        // filesystem snapshot so event reordering or omission cannot hide targets.
+        // Notification streams are hints, not transactions. Diff the complete snapshot against
+        // the last accepted snapshot, then confirm the target is still absent. Rejected additions
+        // are deliberately omitted from `known_haskell_files`, so later events retry them without
+        // repeatedly adding command-provided targets whose Cabal-relative paths GHCi reports
+        // differently from the watched path.
         for path in haskell_files.difference(&self.known_haskell_files) {
             if !self.targets.contains_source_path(path) && !actions.needs_add.contains(path) {
                 actions.needs_add.push(path.clone());
@@ -741,6 +763,7 @@ impl Ghci {
         }
 
         let mut log = CompilationLog::default();
+        let mut synchronized_haskell_files = haskell_files.clone();
         self.opts.clear();
 
         // Once the before-hooks start, always balance them with after-hooks. A protocol or
@@ -765,12 +788,15 @@ impl Ghci {
                     "Adding modules to ghci:\n{}",
                     format_bulleted_list(&actions.needs_add)
                 );
-                self.add_modules(&actions.needs_add, &mut log).await?;
+                for path in self.add_modules(&actions.needs_add, &mut log).await? {
+                    // Keep a rejected target dirty so a later filesystem event retries it.
+                    synchronized_haskell_files.remove(&path);
+                }
             }
 
-            // Commit only after all target-set commands have completed. If this
-            // future is interrupted earlier, the previous snapshot remains dirty.
-            self.known_haskell_files = haskell_files;
+            // Commit only targets that GHCi actually accepted. If this future is interrupted
+            // earlier, the previous snapshot remains dirty.
+            self.known_haskell_files = synchronized_haskell_files;
 
             if !actions.needs_reload.is_empty() {
                 tracing::info!(
@@ -861,8 +887,8 @@ impl Ghci {
 
     /// Restart the `ghci` session after an unsuccessful startup attempt.
     ///
-    /// There is no GHCi prompt during an early startup failure, so only shell reload hooks can be
-    /// run. They still bracket the replacement attempt just like hooks around an ordinary reload.
+    /// There is no GHCi prompt during an early startup failure, so only shell reload/restart hooks
+    /// can run. They still bracket the replacement attempt like hooks around an ordinary restart.
     #[instrument(skip_all, level = "debug")]
     async fn startup_restart(
         &mut self,
@@ -881,21 +907,50 @@ impl Ghci {
                 &mut self.command_handles,
             )
             .await?;
+        self.opts
+            .hooks
+            .run_shell_hooks(
+                LifecycleEvent::Restart(hooks::When::Before),
+                &mut self.command_handles,
+            )
+            .await?;
 
         // The previous command process has already exited, so its process watcher cannot
         // acknowledge `stop()`. Replace it directly, then let initialization drain diagnostics and
         // run the shell-only after-hooks if this attempt also exits before GHCi boots.
-        let new = Self::new(
+        let new = match Self::new(
             self.shutdown.clone(),
             self.opts.clone(),
             self.exited_sender.clone(),
         )
-        .await?;
+        .await
+        {
+            Ok(new) => new,
+            Err(err) => {
+                log.mark_failed_with_diagnostic(format!(
+                    "Failed to start configured GHCi command: {err:#}"
+                ));
+                self.finish_compilation(
+                    Instant::now(),
+                    log,
+                    [
+                        LifecycleEvent::Startup(hooks::When::After),
+                        LifecycleEvent::Restart(hooks::When::After),
+                        LifecycleEvent::Reload(hooks::When::After),
+                    ],
+                    false,
+                    false,
+                )
+                .await?;
+                return Err(err);
+            }
+        };
         let _ = std::mem::replace(self, new);
         self.initialize(
             log,
             [
                 LifecycleEvent::Startup(hooks::When::After),
+                LifecycleEvent::Restart(hooks::When::After),
                 LifecycleEvent::Reload(hooks::When::After),
             ],
             Some(haskell_files),
@@ -967,9 +1022,13 @@ impl Ghci {
         {
             Ok(new) => new,
             Err(err) => {
-                // There is no usable new prompt, but shell hooks must still close the lifecycle
-                // attempt that began before the old session was stopped.
-                self.run_shell_lifecycle_events(events).await?;
+                // A spawn/setup failure has no new prompt, but still publishes a failed compilation
+                // and closes every lifecycle attempt using shell hooks.
+                log.mark_failed_with_diagnostic(format!(
+                    "Failed to start configured GHCi command: {err:#}"
+                ));
+                self.finish_compilation(Instant::now(), log, events, false, false)
+                    .await?;
                 return Err(err);
             }
         };
@@ -992,8 +1051,10 @@ impl Ghci {
             .filter(|path| self.targets.contains_source_path(*path))
             .cloned()
             .collect::<Vec<_>>();
+        // This may be a fresh replacement session, so compare every watched source with the actual
+        // target set rather than relying on bookkeeping inherited from the previous process.
         let needs_add = haskell_files
-            .difference(&self.known_haskell_files)
+            .iter()
             .filter(|path| !self.targets.contains_source_path(*path))
             .cloned()
             .collect::<Vec<_>>();
@@ -1001,10 +1062,15 @@ impl Ghci {
         if !needs_remove.is_empty() {
             self.remove_modules(&needs_remove, log).await?;
         }
-        if !needs_add.is_empty() {
-            self.add_modules(&needs_add, log).await?;
-        }
-        self.known_haskell_files = haskell_files;
+        let unresolved_adds = if needs_add.is_empty() {
+            Vec::new()
+        } else {
+            self.add_modules(&needs_add, log).await?
+        };
+        self.known_haskell_files = haskell_files
+            .into_iter()
+            .filter(|path| !unresolved_adds.contains(path))
+            .collect();
         Ok(())
     }
 
@@ -1184,35 +1250,80 @@ impl Ghci {
     }
 
     /// `:add` a module or modules to the GHCi session.
+    ///
+    /// Returns paths which GHCi did not accept into its target set.
     #[instrument(skip(self), level = "debug")]
     async fn add_modules(
         &mut self,
         paths: &[NormalPath],
         log: &mut CompilationLog,
-    ) -> eyre::Result<()> {
+    ) -> eyre::Result<Vec<NormalPath>> {
         for path in paths {
             if self.targets.contains_source_path(path) {
                 return Err(eyre!(
                     "Attempting to add already-loaded module: {path}\n\
-                    This is a ghciwatch bug; please report it upstream"
+                     This is a ghciwatch bug; please report it upstream"
                 ));
             }
         }
 
-        // Newly discovered files are absent from the running package graph, so adding a derived
-        // module name usually cannot resolve them. Interpreted sessions can safely add paths;
-        // object-code package sessions must use `--restart-on-add` instead.
-        let modules = paths
+        // Prefer module names when GHCi's current package graph can resolve them. This keeps Cabal
+        // home-unit modules in their configured unit instead of creating duplicate interactive-unit
+        // targets. A genuinely new module is often absent from that graph, so refresh the targets
+        // and retry every unresolved name by source path.
+        let named_modules = paths
             .iter()
-            .cloned()
-            .map(LoadedModule::new)
+            .filter_map(|path| {
+                self.search_paths
+                    .path_to_module(path)
+                    .ok()
+                    .map(|name| LoadedModule::with_name(path.clone(), name))
+            })
             .collect::<Vec<_>>();
-        self.add_loaded_modules(&modules, paths, log).await?;
-        self.refresh_targets().await?;
+        let mut named_log = CompilationLog::default();
+        if !named_modules.is_empty() {
+            let named_paths = named_modules
+                .iter()
+                .map(|module| module.path().clone())
+                .collect::<Vec<_>>();
+            self.add_loaded_modules(&named_modules, &named_paths, &mut named_log)
+                .await?;
+            self.refresh_targets().await?;
+        }
+
+        let unresolved_after_names = paths
+            .iter()
+            .filter(|path| !self.targets.contains_source_path(*path))
+            .cloned()
+            .collect::<Vec<_>>();
+        if unresolved_after_names.is_empty() {
+            // The named attempt is the final compilation result, including legitimate source
+            // diagnostics from modules which entered the target set but failed to compile.
+            log.diagnostics.append(&mut named_log.diagnostics);
+            if named_log.summary.is_some() {
+                log.summary = named_log.summary;
+            }
+        } else {
+            tracing::debug!(
+                "Retrying modules unresolved by named :add as source paths:\n{}",
+                format_bulleted_list(&unresolved_after_names)
+            );
+            let path_modules = unresolved_after_names
+                .iter()
+                .cloned()
+                .map(LoadedModule::new)
+                .collect::<Vec<_>>();
+            // Discard lookup diagnostics from the speculative named attempt. The path command
+            // recompiles the complete target set and supplies the authoritative final log.
+            self.add_loaded_modules(&path_modules, &unresolved_after_names, log)
+                .await?;
+            self.refresh_targets().await?;
+        }
 
         let unresolved_paths = paths
             .iter()
             .filter(|path| !self.targets.contains_source_path(*path))
+            .cloned()
             .collect::<Vec<_>>();
         if unresolved_paths.is_empty() {
             // GHCi command errors do not necessarily emit a compilation summary. Do not let an
@@ -1220,15 +1331,20 @@ impl Ghci {
             log.fill_empty_summary();
         } else {
             tracing::warn!(
-                "GHCi did not add some modules by path:\n{}",
-                format_bulleted_list(unresolved_paths)
+                "GHCi did not add some modules:\n{}",
+                format_bulleted_list(&unresolved_paths)
             );
             log.mark_failed();
         }
 
-        self.refresh_eval_commands_for_paths(paths).await?;
+        let accepted_paths = paths
+            .iter()
+            .filter(|path| self.targets.contains_source_path(*path))
+            .cloned()
+            .collect::<Vec<_>>();
+        self.refresh_eval_commands_for_paths(accepted_paths).await?;
 
-        Ok(())
+        Ok(unresolved_paths)
     }
 
     /// Submit one monitored `:add` command.
@@ -1409,12 +1525,21 @@ impl Ghci {
         // Do not replace `self` until the old process exits: dropping its readers early makes
         // shutdown-time output fail with misleading `hPutChar: resource vanished (Broken pipe)`.
         let (ack, done) = oneshot::channel();
-        self.restart_sender
-            .send(ack)
-            .await
-            .wrap_err("GHCi process watcher stopped before intentional shutdown")?;
-        done.await
-            .wrap_err("GHCi process watcher dropped intentional shutdown acknowledgement")?;
+        if let Err(err) = self.restart_sender.send(ack).await {
+            // On global shutdown the process watcher receives the same broadcast and may win the
+            // race to stop the process before the manager sends this explicit request.
+            if self.shutdown.error_if_shutdown_requested().is_err() {
+                return Ok(());
+            }
+            return Err(err).wrap_err("GHCi process watcher stopped before intentional shutdown");
+        }
+        if let Err(err) = done.await {
+            if self.shutdown.error_if_shutdown_requested().is_err() {
+                return Ok(());
+            }
+            return Err(err)
+                .wrap_err("GHCi process watcher dropped intentional shutdown acknowledgement");
+        }
         Ok(())
     }
 
@@ -1613,6 +1738,9 @@ impl Ghci {
         ghci_available: bool,
         operation_succeeded: bool,
     ) -> eyre::Result<()> {
+        // Target synchronization followed by `:reload` may compile the same failure twice. Publish
+        // each distinct diagnostic once while retaining errors unique to either operation.
+        log.deduplicate_diagnostics();
         // Allow hooks to consume the error log by updating it before running the hooks. A failure
         // to publish the log must not suppress lifecycle completion notifications.
         let error_log_result = self.write_error_log(log).await;

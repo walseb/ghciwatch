@@ -20,7 +20,14 @@ async fn can_load() {
 /// Test that `ghciwatch` can load new modules.
 #[test]
 async fn can_load_new_module() {
-    let mut session = GhciWatch::new("tests/data/simple")
+    let mut session = GhciWatchBuilder::new("tests/data/simple")
+        .with_args([
+            "--after-reload-ghci",
+            ":show targets",
+            "--after-reload-shell",
+            "touch add-after-reload",
+        ])
+        .start()
         .await
         .expect("ghciwatch starts");
     session
@@ -44,6 +51,25 @@ async fn can_load_new_module() {
         .wait_until_add()
         .await
         .expect("ghciwatch loads new modules");
+    session
+        .wait_for_log(
+            BaseMatcher::message("Running after-reload command")
+                .with_field("command", "^:show targets$"),
+        )
+        .await
+        .expect("after-reload GHCi hook runs after adding a module");
+    session
+        .wait_for_log(
+            BaseMatcher::message("Read line")
+                .with_field("line", "^(My\\.Module|src/My/Module\\.hs)$"),
+        )
+        .await
+        .expect("after-reload GHCi hook sees the new target");
+    session
+        .fs()
+        .wait_for_path(session.startup_timeout, &session.path("add-after-reload"))
+        .await
+        .expect("after-reload shell hook runs after adding a module");
 }
 
 /// Package-managed sessions can rebuild their component graph instead of path-adding modules.
@@ -105,7 +131,7 @@ async fn failed_add_restart_recovers_with_no_auto_reload() {
         .await
         .expect("can add a module");
     session
-        .wait_for_log("Restarting failed")
+        .wait_for_log("Reloading failed")
         .await
         .expect("replacement reaches its prompt with a compilation failure");
 
@@ -120,7 +146,7 @@ async fn failed_add_restart_recovers_with_no_auto_reload() {
         .await
         .expect("can fix the home module");
     session
-        .wait_for_log("All good! Finished restarting")
+        .wait_for_log("All good! Finished reloading")
         .await
         .expect("fixing edit replaces the incomplete session");
 }

@@ -8,7 +8,6 @@ use winnow::token::take_until;
 use winnow::PResult;
 use winnow::Parser;
 
-use crate::ghci::parse::haskell_grammar::module_name;
 use crate::ghci::parse::lines::line_ending_or_eof;
 use crate::ghci::parse::lines::rest_of_line;
 use crate::ghci::parse::Severity;
@@ -40,10 +39,11 @@ pub fn module_import_cycle_diagnostic(input: &mut &str) -> PResult<Vec<GhcMessag
         let _ = opt("imports ").parse_next(input)?;
         let _ = "module ".parse_next(input)?;
         let _ = single_quote.parse_next(input)?;
-        let _name = module_name.parse_next(input)?;
-        let _ = single_quote.parse_next(input)?;
-        let _ = space1.parse_next(input)?;
-        let _ = "(".parse_next(input)?;
+        // ASCII GHC quotes use an apostrophe as the closing delimiter. A Haskell module-name
+        // parser can consume that apostrophe as part of an identifier, so delimit using the
+        // structural ` (` before the source path instead.
+        let _name_and_closing_quote = take_until(1.., " (").parse_next(input)?;
+        let _ = " (".parse_next(input)?;
         let path = take_until(1.., ")").parse_next(input)?;
         let _ = ")".parse_next(input)?;
         let _ = rest_of_line.parse_next(input)?;

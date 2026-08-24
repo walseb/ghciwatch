@@ -304,6 +304,10 @@ async fn handles_repeated_startup_failures_before_restart_ghci_hook() {
             "touch before-reload-shell",
             "--after-reload-shell",
             "touch after-reload-shell",
+            "--before-restart-shell",
+            "touch before-restart-shell",
+            "--after-restart-shell",
+            "touch after-restart-shell",
         ])
         .start()
         .await
@@ -339,6 +343,22 @@ async fn handles_repeated_startup_failures_before_restart_ghci_hook() {
         .wait_for_path(session.startup_timeout, &session.path("after-reload-shell"))
         .await
         .expect("after-reload shell hook runs");
+    session
+        .fs()
+        .wait_for_path(
+            session.startup_timeout,
+            &session.path("before-restart-shell"),
+        )
+        .await
+        .expect("before-restart shell hook runs");
+    session
+        .fs()
+        .wait_for_path(
+            session.startup_timeout,
+            &session.path("after-restart-shell"),
+        )
+        .await
+        .expect("after-restart shell hook runs");
 
     // The second failure confirms the retry loop re-enters rather than crashing.
     session
@@ -466,4 +486,84 @@ async fn restart_after_failed_restart_on_dep_fix() {
         .wait_for_log(replacement_completed())
         .await
         .expect("ghciwatch restarts ghci after fixing the dependency");
+}
+
+/// Ghciwatch should not become an orphan when the process which launched it exits.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn exits_when_parent_process_exits() {
+    use std::time::Duration;
+
+    let test_dir = std::env::temp_dir().join(format!(
+        "ghciwatch-parent-exit-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&test_dir).expect("can create parent-exit test directory");
+    let ready_path = test_dir.join("ready");
+    let pid_path = test_dir.join("pid");
+    let output_path = test_dir.join("output");
+
+    // Keep the short-lived shell alive until ghciwatch has entered startup. Its exit then reparents
+    // ghciwatch and should trigger the normal shutdown manager.
+    let script = r#"
+        "$GHCIWATCH" \
+          --before-startup-shell "touch $READY" \
+          --command "sleep 300" \
+          >"$OUTPUT" 2>&1 &
+        child=$!
+        printf '%s\n' "$child" >"$PID_FILE"
+        i=0
+        while [ ! -e "$READY" ]; do
+          if ! kill -0 "$child" 2>/dev/null; then exit 2; fi
+          i=$((i + 1))
+          if [ "$i" -gt 200 ]; then exit 3; fi
+          sleep 0.05
+        done
+    "#;
+    let status = tokio::process::Command::new("sh")
+        .arg("-c")
+        .arg(script)
+        .env("GHCIWATCH", env!("CARGO_BIN_EXE_ghciwatch"))
+        .env("READY", &ready_path)
+        .env("PID_FILE", &pid_path)
+        .env("OUTPUT", &output_path)
+        .status()
+        .await
+        .expect("can run the temporary parent process");
+    assert!(status.success(), "temporary parent failed: {status}");
+
+    let pid = std::fs::read_to_string(&pid_path)
+        .expect("parent records ghciwatch PID")
+        .trim()
+        .parse::<i32>()
+        .expect("ghciwatch PID is numeric");
+    let exited = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"));
+            let alive = stat
+                .ok()
+                .and_then(|stat| stat.rsplit_once(") ").map(|(_, fields)| fields.to_owned()))
+                .and_then(|fields| fields.chars().next())
+                .is_some_and(|state| state != 'Z' && state != 'X');
+            if !alive {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    if exited.is_err() {
+        let _ = signal::kill(Pid::from_raw(pid), Signal::SIGKILL);
+    }
+    assert!(
+        exited.is_ok(),
+        "ghciwatch remained alive after its parent exited; output:\n{}",
+        std::fs::read_to_string(&output_path).unwrap_or_default()
+    );
+
+    let _ = std::fs::remove_dir_all(test_dir);
 }

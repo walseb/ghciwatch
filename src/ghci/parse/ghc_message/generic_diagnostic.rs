@@ -1,5 +1,6 @@
 use winnow::ascii::space0;
 use winnow::ascii::space1;
+use winnow::combinator::opt;
 use winnow::PResult;
 use winnow::Parser;
 
@@ -25,7 +26,11 @@ use super::GhcDiagnostic;
 pub fn generic_diagnostic(input: &mut &str) -> PResult<GhcDiagnostic> {
     // TODO: Confirm that the input doesn't start with space?
     let path = path_colon.parse_next(input)?;
-    let span = position::parse_position_range.parse_next(input)?;
+    // Some whole-module diagnostics (notably import cycles in GHC 9.12) have a source path
+    // but no line/column range: `Foo.hs: error: ...`.
+    let span = opt(position::parse_position_range)
+        .parse_next(input)?
+        .unwrap_or_default();
     let _ = space1.parse_next(input)?;
     let severity = severity::parse_severity_colon.parse_next(input)?;
     let _ = space0.parse_next(input)?;
@@ -80,6 +85,21 @@ mod tests {
                     "
                 )
                 .into()
+            }
+        );
+
+        assert_eq!(
+            generic_diagnostic
+                .parse(
+                    "src/MyLib.hs: error: [GHC-92213]\n    Module graph contains a cycle:\n      module `MyLib' (src/MyLib.hs) imports itself\n",
+                )
+                .unwrap(),
+            GhcDiagnostic {
+                severity: Severity::Error,
+                path: Some("src/MyLib.hs".into()),
+                span: PositionRange::default(),
+                message: "[GHC-92213]\n    Module graph contains a cycle:\n      module `MyLib' (src/MyLib.hs) imports itself\n"
+                    .into(),
             }
         );
 

@@ -2,6 +2,7 @@ use crate::ghci::parse::CompilationResult;
 use crate::ghci::parse::CompilationSummary;
 use crate::ghci::parse::GhcDiagnostic;
 use crate::ghci::parse::GhcMessage;
+use crate::ghci::parse::PositionRange;
 use crate::ghci::parse::Severity;
 
 use super::parse::ModulesLoaded;
@@ -47,6 +48,38 @@ impl CompilationLog {
             result: CompilationResult::Err,
             modules_loaded: ModulesLoaded::Count(0),
         });
+    }
+
+    /// Record a failed operation, adding a no-location diagnostic when no error was parsed.
+    pub fn mark_failed_with_diagnostic(&mut self, message: impl Into<String>) {
+        self.mark_failed();
+        let has_error = self
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.severity == Severity::Error);
+        if !has_error {
+            let mut message = message.into();
+            if !message.ends_with('\n') {
+                message.push('\n');
+            }
+            self.diagnostics.push(GhcDiagnostic {
+                severity: Severity::Error,
+                path: None,
+                span: PositionRange::default(),
+                message,
+            });
+        }
+    }
+
+    /// Remove repeated diagnostics while preserving their first-seen order.
+    pub fn deduplicate_diagnostics(&mut self) {
+        let mut unique = Vec::with_capacity(self.diagnostics.len());
+        for diagnostic in self.diagnostics.drain(..) {
+            if !unique.contains(&diagnostic) {
+                unique.push(diagnostic);
+            }
+        }
+        self.diagnostics = unique;
     }
 
     /// Get the result of compilation.

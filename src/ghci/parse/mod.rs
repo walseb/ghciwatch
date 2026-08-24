@@ -22,6 +22,7 @@ pub use ghc_message::CompilingProgress;
 pub use ghc_message::GhcDiagnostic;
 pub use ghc_message::GhcMessage;
 pub use ghc_message::ModulesLoaded;
+pub use ghc_message::PositionRange;
 pub use ghc_message::Severity;
 pub use show_paths::parse_show_paths;
 pub use show_paths::ShowPaths;
