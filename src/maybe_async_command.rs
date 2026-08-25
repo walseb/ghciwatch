@@ -50,49 +50,36 @@ fn parse_maybe_async_command(input: &mut &str) -> PResult<MaybeAsyncCommand> {
     Ok(MaybeAsyncCommand { is_async, command })
 }
 
+/// Run lifecycle commands as children owned by ghciwatch. Hook output is intentionally inherited so
+/// it remains visible while the hook runs instead of being buffered in memory. Synchronous hooks
+/// are awaited; `async:` hooks remain tracked in the background. If either runner is cancelled,
+/// `kill_on_drop` prevents its child from outliving ghciwatch.
 impl MaybeAsyncCommand {
     #[instrument(skip(self), fields(%self), level = "debug")]
     pub async fn status(&self) -> MaybeAsyncCommandStatus {
         let program = self.command.program.to_string_lossy().into_owned();
         let mut command = self.command.as_tokio();
+        command.kill_on_drop(true);
         let command_formatted = self.display();
         let join_handle = tokio::task::spawn(
             async move {
                 tracing::info!("$ {command_formatted}");
-                let output = command
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .output()
+                // Let hook output stream directly rather than retaining the complete output in
+                // memory until the command exits.
+                let status = command
+                    .stdout(Stdio::inherit())
+                    .stderr(Stdio::inherit())
+                    .status()
                     .await
                     .wrap_err_with(|| format!("Failed to execute `{command_formatted}`"))?;
-
-                let status = output.status;
 
                 let mut message = shell_words::quote(&program).into_owned();
                 message.push(' ');
                 if status.success() {
                     message.push_str("finished successfully");
-                } else {
-                    write!(message, "failed: {status}").expect("Writing to a `String` never fails");
-                }
-
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                let stdout = stdout.trim();
-                if !stdout.is_empty() {
-                    write!(message, "\n\nStdout: {stdout}")
-                        .expect("Writing to a `String` never fails");
-                }
-
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                let stderr = stderr.trim();
-                if !stderr.is_empty() {
-                    write!(message, "\n\nStderr: {stderr}")
-                        .expect("Writing to a `String` never fails");
-                }
-
-                if status.success() {
                     tracing::debug!("{message}");
                 } else {
+                    write!(message, "failed: {status}").expect("Writing to a `String` never fails");
                     tracing::error!("{message}");
                 }
 

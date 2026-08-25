@@ -21,6 +21,7 @@ async fn can_load() {
 #[test]
 async fn can_load_new_module() {
     let mut session = GhciWatchBuilder::new("tests/data/simple")
+        .with_startup_timeout(std::time::Duration::from_secs(20))
         .with_args([
             "--after-reload-ghci",
             ":show targets",
@@ -40,7 +41,6 @@ async fn can_load_new_module() {
             session.path("src/My/Module.hs"),
             indoc!(
                 "module My.Module (myIdent) where
-            myIdent :: ()
             myIdent = ()
             "
             ),
@@ -51,6 +51,13 @@ async fn can_load_new_module() {
         .wait_until_add()
         .await
         .expect("ghciwatch loads new modules");
+    session
+        .wait_for_log(
+            BaseMatcher::message("Read suppressed stderr line")
+                .with_field("line", ".*Top-level binding with no type signature.*"),
+        )
+        .await
+        .expect("named-add diagnostics are captured before authoritative replay");
     session
         .wait_for_log(
             BaseMatcher::message("Running after-reload command")
@@ -70,6 +77,43 @@ async fn can_load_new_module() {
         .wait_for_path(session.startup_timeout, &session.path("add-after-reload"))
         .await
         .expect("after-reload shell hook runs after adding a module");
+}
+
+/// A name derived from an extra search path may not be resolvable in GHCi's current home unit.
+/// Such additions must be retried by source path.
+#[test]
+async fn falls_back_to_path_when_named_add_is_unresolved() {
+    let mut session = GhciWatchBuilder::new("tests/data/simple")
+        .before_start(|project| async move {
+            test_harness::Fs::new()
+                .create_dir(project.join("extra"))
+                .await
+        })
+        .with_startup_timeout(std::time::Duration::from_secs(20))
+        .with_args(["--watch", "extra", "--extra-module-search-path", "extra"])
+        .start()
+        .await
+        .expect("ghciwatch starts");
+    session.wait_until_ready().await.unwrap();
+
+    session
+        .fs()
+        .write(
+            session.path("extra/FallbackModule.hs"),
+            "module FallbackModule where\nfallbackValue = ()\n",
+        )
+        .await
+        .unwrap();
+    session
+        .wait_until_add()
+        .await
+        .expect("path fallback adds the module");
+    session
+        .wait_for_log(BaseMatcher::message(
+            "Retrying modules unresolved by named :add as source paths:\n",
+        ))
+        .await
+        .expect("unresolved name is retried by path");
 }
 
 /// Package-managed sessions can rebuild their component graph instead of path-adding modules.

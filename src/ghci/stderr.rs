@@ -19,6 +19,14 @@ pub enum StderrEvent {
     /// Clear the buffer contents and acknowledge when it has been cleared.
     ClearBuffer { sender: oneshot::Sender<()> },
 
+    /// Enable or disable forwarding while continuing to capture stderr for parsing.
+    SetForwarding {
+        enabled: bool,
+        /// When re-enabling, publish all output captured while forwarding was disabled.
+        replay_buffer: bool,
+        sender: oneshot::Sender<()>,
+    },
+
     /// Read through an exact marker line and return the preceding buffered output.
     /// Once the marker written by GHCi has been consumed, all earlier stderr is in the buffer.
     GetBufferThrough {
@@ -39,6 +47,10 @@ pub struct GhciStderr {
     pub receiver: mpsc::Receiver<StderrEvent>,
     /// Output buffer.
     pub buffer: String,
+    /// Whether newly ingested lines are forwarded to the configured stderr writer.
+    pub forwarding: bool,
+    /// Lines captured while forwarding is disabled, retained across per-command buffer clears.
+    pub suppressed_buffer: String,
 }
 
 impl GhciStderr {
@@ -91,6 +103,25 @@ impl GhciStderr {
                 self.clear_buffer().await;
                 let _ = sender.send(());
             }
+            StderrEvent::SetForwarding {
+                enabled,
+                replay_buffer,
+                sender,
+            } => {
+                if enabled && !self.forwarding {
+                    if replay_buffer {
+                        self.writer
+                            .write_all(self.suppressed_buffer.as_bytes())
+                            .await?;
+                        self.writer.flush().await?;
+                    }
+                    self.suppressed_buffer.clear();
+                } else if !enabled && self.forwarding {
+                    self.suppressed_buffer.clear();
+                }
+                self.forwarding = enabled;
+                let _ = sender.send(());
+            }
             StderrEvent::GetBufferThrough {
                 marker,
                 ready,
@@ -109,13 +140,22 @@ impl GhciStderr {
 
     #[instrument(skip(self), level = "trace")]
     async fn ingest_line(&mut self, mut line: String) -> eyre::Result<()> {
-        tracing::debug!(line, "Read stderr line");
+        if self.forwarding {
+            tracing::debug!(line, "Read stderr line");
+        } else {
+            tracing::debug!(line, "Read suppressed stderr line");
+        }
         line.push('\n');
         self.buffer.push_str(&line);
-        self.writer.write_all(line.as_bytes()).await?;
-        // Do not rely on terminal line buffering: output may be redirected to a block-buffered
-        // destination, and callers expect diagnostics to become visible one line at a time.
-        self.writer.flush().await?;
+        if !self.forwarding {
+            self.suppressed_buffer.push_str(&line);
+        }
+        if self.forwarding {
+            self.writer.write_all(line.as_bytes()).await?;
+            // Do not rely on terminal line buffering: output may be redirected to a block-buffered
+            // destination, and callers expect diagnostics to become visible one line at a time.
+            self.writer.flush().await?;
+        }
         Ok(())
     }
 

@@ -512,6 +512,8 @@ impl Ghci {
                     writer: opts.stderr_writer.clone(),
                     receiver: stderr_receiver,
                     buffer: String::with_capacity(LINE_BUFFER_CAPACITY),
+                    forwarding: true,
+                    suppressed_buffer: String::with_capacity(LINE_BUFFER_CAPACITY),
                 }
                 .run()
             })
@@ -1286,9 +1288,31 @@ impl Ghci {
                 .iter()
                 .map(|module| module.path().clone())
                 .collect::<Vec<_>>();
-            self.add_loaded_modules(&named_modules, &named_paths, &mut named_log)
+
+            // Name lookup is intentionally speculative: flattened `:show paths` output can derive
+            // a valid name which is not resolvable from GHCi's current home unit. Keep expected
+            // `cannot be found locally` diagnostics out of user output. If every name enters the
+            // target set, replay stderr because it may contain authoritative warnings or source
+            // errors. Otherwise the path fallback recompiles the complete target set and supplies
+            // the visible diagnostics.
+            self.stdout.set_stderr_forwarding(false, false).await?;
+            let named_result: eyre::Result<()> = async {
+                self.add_loaded_modules(&named_modules, &named_paths, &mut named_log)
+                    .await?;
+                self.refresh_targets().await
+            }
+            .await;
+            if let Err(err) = named_result {
+                // Preserve unexpected/protocol failure output before returning the failure.
+                self.stdout.set_stderr_forwarding(true, true).await?;
+                return Err(err);
+            }
+            let all_names_resolved = named_paths
+                .iter()
+                .all(|path| self.targets.contains_source_path(path));
+            self.stdout
+                .set_stderr_forwarding(true, all_names_resolved)
                 .await?;
-            self.refresh_targets().await?;
         }
 
         let unresolved_after_names = paths
@@ -1582,6 +1606,9 @@ impl Ghci {
     }
 
     async fn send_sigint_inner(&mut self) -> eyre::Result<()> {
+        // A cancelled speculative named `:add` may have disabled stderr forwarding. SIGINT is the
+        // cancellation recovery boundary, so restore normal forwarding before doing anything else.
+        self.stdout.set_stderr_forwarding(true, false).await?;
         let start_instant = Instant::now();
         process::run_before_signal_commands(
             &self.opts.before_interrupt,

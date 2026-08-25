@@ -123,10 +123,7 @@ impl GhciStdout {
     }
 
     /// Collect stderr when the command exits before GHCi can install a prompt and emit a marker.
-    pub async fn drain_stderr_after_exit(
-        &self,
-        log: &mut CompilationLog,
-    ) -> eyre::Result<String> {
+    pub async fn drain_stderr_after_exit(&self, log: &mut CompilationLog) -> eyre::Result<String> {
         let (sender, receiver) = oneshot::channel();
         self.stderr_sender
             .send(StderrEvent::DrainBuffer { sender })
@@ -144,6 +141,28 @@ impl GhciStdout {
         let (sender, receiver) = oneshot::channel();
         self.stderr_sender
             .send(StderrEvent::ClearBuffer { sender })
+            .await?;
+        receiver.await?;
+        Ok(())
+    }
+
+    /// Configure whether the stderr task forwards captured lines to the user.
+    ///
+    /// The task always buffers lines for compilation parsing. A speculative command can suppress
+    /// forwarding and either replay its buffer when the result is authoritative or discard the
+    /// expected lookup diagnostics before a fallback command.
+    pub async fn set_stderr_forwarding(
+        &self,
+        enabled: bool,
+        replay_buffer: bool,
+    ) -> eyre::Result<()> {
+        let (sender, receiver) = oneshot::channel();
+        self.stderr_sender
+            .send(StderrEvent::SetForwarding {
+                enabled,
+                replay_buffer,
+                sender,
+            })
             .await?;
         receiver.await?;
         Ok(())
