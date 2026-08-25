@@ -167,10 +167,10 @@ pub struct GhciOpts {
     pub interrupt_reloads: bool,
     /// Whether watched changes automatically issue `:reload`.
     pub auto_reload: bool,
-    /// Whether watched source additions and removals automatically update GHCi targets.
-    pub auto_targets: bool,
     /// Whether discovering a Haskell module restarts the package-managed session.
     pub restart_on_add: bool,
+    /// A synchronous shell command which replaces automatic `:add`, followed by `:reload`.
+    pub replace_auto_add_shell: Option<ClonableCommand>,
     /// Whether unexpected exits keep starting delayed replacements despite an unchanged crash loop.
     pub restart_on_exit: bool,
     /// Where to write what `ghci` emits to `stdout`. Inherits parent's `stdout` by default.
@@ -263,8 +263,8 @@ impl GhciOpts {
                 reload_globs: opts.watch.reload_globs()?,
                 interrupt_reloads: opts.interrupt_reloads(),
                 auto_reload: !opts.no_auto_reload,
-                auto_targets: !opts.no_auto_targets,
                 restart_on_add: opts.restart_on_add,
+                replace_auto_add_shell: opts.replace_auto_add_shell.clone(),
                 restart_on_exit: opts.restart_on_exit,
                 stdout_writer,
                 stderr_writer,
@@ -391,7 +391,7 @@ impl Ghci {
     pub(crate) async fn restart_for_memory_watchdog(&mut self) -> eyre::Result<()> {
         let haskell_files = self.known_haskell_files.clone();
         self.opts.clear();
-        self.restart(haskell_files).await
+        self.restart(haskell_files, false).await
     }
 
     /// Start a replacement after failed SIGINT recovery. The old session is dead, so
@@ -708,18 +708,24 @@ impl Ghci {
                 actions.needs_remove.push(path.clone());
             }
         }
-        // A path-based `:add` is correct for ordinary interpreted sessions, but in an
-        // object-code Cabal session it creates an interactive-unit target rather than extending
-        // the configured home unit. Symbols compiled under the package-qualified home unit can
-        // then be missing or duplicated. A module name cannot repair this: the running GHCi's
-        // package graph predates the new module. Restart so Cabal reconstructs that graph from
-        // current package metadata, assigning every object to its proper home unit.
-        if self.opts.restart_on_add && !actions.needs_add.is_empty() {
+        if self.opts.replace_auto_add_shell.is_some() {
+            // Paths handled by the replacement command intentionally remain non-target sources.
+            // Later edits should reload their aggregate target instead of rerunning the expensive
+            // replacement command as though each edit discovered the path again.
+            let (already_known, genuinely_new): (Vec<_>, Vec<_>) = actions
+                .needs_add
+                .drain(..)
+                .partition(|path| self.known_haskell_files.contains(path));
+            actions.needs_reload.extend(already_known);
+            actions.needs_add = genuinely_new;
+        } else if self.opts.restart_on_add && !actions.needs_add.is_empty() {
+            // A path-based `:add` is correct for ordinary interpreted sessions, but in an
+            // object-code Cabal session it creates an interactive-unit target rather than extending
+            // the configured home unit. Symbols compiled under the package-qualified home unit can
+            // then be missing or duplicated. A module name cannot repair this: the running GHCi's
+            // package graph predates the new module. Restart so Cabal reconstructs that graph from
+            // current package metadata, assigning every object to its proper home unit.
             actions.needs_restart.append(&mut actions.needs_add);
-        }
-        if !self.opts.auto_targets {
-            actions.needs_add.clear();
-            actions.needs_remove.clear();
         }
         Ok(actions)
     }
@@ -742,7 +748,7 @@ impl Ghci {
             .into_iter()
             .map(|path| self.classifier.relative_path(path))
             .collect::<eyre::Result<BTreeSet<_>>>()?;
-        let actions = self.get_reload_actions(events, &haskell_files)?;
+        let mut actions = self.get_reload_actions(events, &haskell_files)?;
 
         if actions.needs_restart() {
             let _ = kind_sender.send(GhciReloadKind::Restart);
@@ -753,15 +759,28 @@ impl Ghci {
             );
             // Carry the snapshot through the restart. A fresh GHCi initially knows
             // only the command's targets; synchronize before after-hooks run.
-            self.restart(haskell_files).await?;
+            self.restart(haskell_files, true).await?;
             return Ok(());
         }
 
         if !actions.needs_modify() {
             let _ = kind_sender.send(GhciReloadKind::None);
             self.known_haskell_files = haskell_files;
+            let mut log = CompilationLog::default();
+            // The manager has already run before-reload shell hooks for this accepted event. Even
+            // when classification finds no GHCi work, publish a fresh result and complete the
+            // reload lifecycle so external consumers cannot remain in a pending state.
+            let result = self
+                .finish_compilation(
+                    start_instant,
+                    &mut log,
+                    [LifecycleEvent::Reload(hooks::When::After)],
+                    true,
+                    true,
+                )
+                .await;
             self.prune_command_handles();
-            return Ok(());
+            return result;
         }
 
         let mut log = CompilationLog::default();
@@ -772,7 +791,26 @@ impl Ghci {
         // bookkeeping error may make GHCi unavailable, but shell hooks can still publish the
         // completed attempt and GHCi hooks are attempted whenever the prompt remains usable.
         let reload_result: eyre::Result<()> = async {
-            self.run_hooks(LifecycleEvent::Reload(hooks::When::Before), &mut log)
+            if !actions.needs_add.is_empty() && self.opts.replace_auto_add_shell.is_some() {
+                let command = self
+                    .opts
+                    .replace_auto_add_shell
+                    .clone()
+                    .expect("replacement command was checked above");
+                tracing::info!(%command, "Running replacement for automatic module addition");
+                crate::maybe_async_command::MaybeAsyncCommand {
+                    is_async: false,
+                    command,
+                }
+                .run_on(&mut self.command_handles)
+                .await?;
+                // The generator is expected to make these paths reachable from an existing target.
+                // Force `:reload` and never submit `:add` for this batch.
+                actions.needs_reload.append(&mut actions.needs_add);
+            }
+
+            // Watcher-triggered shell hooks already ran in the manager before waiting for GHCi.
+            self.run_ghci_hooks(LifecycleEvent::Reload(hooks::When::Before))
                 .await?;
             // An interrupt decision can only cancel us after the paired before-hooks completed.
             let _ = kind_sender.send(GhciReloadKind::Reload);
@@ -968,13 +1006,21 @@ impl Ghci {
     /// it as well as restart hooks. This is especially important when command startup/compilation
     /// fails: external after-reload hooks still need to publish completion of the attempt.
     #[instrument(skip_all, level = "debug")]
-    async fn restart(&mut self, haskell_files: BTreeSet<NormalPath>) -> eyre::Result<()> {
+    async fn restart(
+        &mut self,
+        haskell_files: BTreeSet<NormalPath>,
+        before_reload_shell_ran: bool,
+    ) -> eyre::Result<()> {
         let mut log = CompilationLog::default();
 
-        if let Err(err) = self
-            .run_hooks(LifecycleEvent::Reload(hooks::When::Before), &mut log)
-            .await
-        {
+        let before_reload_result = if before_reload_shell_ran {
+            self.run_ghci_hooks(LifecycleEvent::Reload(hooks::When::Before))
+                .await
+        } else {
+            self.run_hooks(LifecycleEvent::Reload(hooks::When::Before), &mut log)
+                .await
+        };
+        if let Err(err) = before_reload_result {
             self.run_shell_lifecycle_events([LifecycleEvent::Reload(hooks::When::After)])
                 .await?;
             return Err(err);
@@ -1894,6 +1940,24 @@ impl Ghci {
             }
         }
 
+        Ok(())
+    }
+
+    /// Run only the GHCi commands for an event whose shell hooks were run by the manager.
+    async fn run_ghci_hooks(&mut self, event: LifecycleEvent) -> eyre::Result<()> {
+        for hook in self.opts.hooks.select(event) {
+            let hooks::Command::Ghci(command) = &hook.command else {
+                continue;
+            };
+            tracing::info!(%command, "Running {hook} command");
+            let mut hook_log = CompilationLog::default();
+            self.stdin
+                .run_command(&mut self.stdout, command, &mut hook_log)
+                .await?;
+            if matches!(hook_log.result(), Some(CompilationResult::Err)) {
+                tracing::error!(%command, "Ignoring {hook} command error");
+            }
+        }
         Ok(())
     }
 

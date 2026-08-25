@@ -96,13 +96,6 @@ pub struct Opts {
     #[arg(long)]
     pub no_auto_reload: bool,
 
-    /// Don't automatically add or remove GHCi targets for watched source files.
-    ///
-    /// The files remain watched, allowing another control path to decide when a replacement
-    /// package session should incorporate target-set changes.
-    #[arg(long)]
-    pub no_auto_targets: bool,
-
     /// Restart the GHCi command rather than using path-based `:add` for a new Haskell module.
     ///
     /// Use this for object-code package sessions. `:add` assigns a path target to GHCi's
@@ -110,6 +103,14 @@ pub struct Opts {
     /// Restarting lets the package command rebuild its home-unit target set from current metadata.
     #[arg(long)]
     pub restart_on_add: bool,
+
+    /// Run a synchronous shell command instead of automatically `:add`ing new Haskell modules.
+    ///
+    /// After the command exits, ghciwatch issues `:reload`. This supports generators which make the
+    /// new module reachable from an existing home-unit target. The command is run once for each
+    /// debounced batch requiring additions. Non-zero exit statuses are logged but remain advisory.
+    #[arg(long, value_name = "SHELL_COMMAND", conflicts_with = "restart_on_add")]
+    pub replace_auto_add_shell: Option<ClonableCommand>,
 
     /// Keep replacing unexpectedly exited GHCi sessions after the crash delay, even without edits.
     ///
@@ -187,7 +188,7 @@ pub struct WatchOpts {
     /// Debounce file events; wait this duration after receiving an event before attempting to
     /// reload.
     ///
-    /// Defaults to 0.5 seconds.
+    /// Defaults to 100 milliseconds.
     // Why do we need to use `value_parser` with this argument but not with the `Utf8PathBuf`
     // arguments? I have no clue!
     #[arg(

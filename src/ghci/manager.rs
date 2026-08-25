@@ -163,6 +163,9 @@ pub async fn run_ghci(
     let eval_socket = opts.eval_socket.clone().into_std_path_buf();
     let interrupt_reloads = opts.interrupt_reloads;
     let restart_on_exit = opts.restart_on_exit;
+    // Keep a manager-side copy so watcher-triggered shell hooks can run before waiting for an
+    // active eval or for access to the GHCi session.
+    let hooks = opts.hooks.clone();
     let (exited_sender, mut exited_receiver) = mpsc::channel::<ExitStatus>(1);
     let mut ghci = Ghci::new(handle.clone(), opts, exited_sender)
         .await
@@ -234,6 +237,8 @@ pub async fn run_ghci(
         _watcher_command_sender: watcher_command_sender,
         interrupt_reloads,
         restart_on_exit,
+        hooks,
+        command_handles: Vec::new(),
         memory_watchdog,
         applied_states: BTreeMap::new(),
         applied_haskell_files: None,
@@ -305,6 +310,10 @@ struct GhciManager {
     _watcher_command_sender: mpsc::Sender<WatcherCommand>,
     interrupt_reloads: bool,
     restart_on_exit: bool,
+    /// Hook configuration copied out of GHCi so before-reload shell hooks do not wait on it.
+    hooks: crate::hooks::HookOpts,
+    /// Background `async:` before-reload shell hooks owned by the manager.
+    command_handles: Vec<tokio::task::JoinHandle<eyre::Result<ExitStatus>>>,
     memory_watchdog: tokio::time::Interval,
     /// File states represented by the last successfully completed dispatch.
     applied_states: BTreeMap<Utf8PathBuf, FileState>,
@@ -465,6 +474,16 @@ impl GhciManager {
     /// non-interruptible dispatch are accumulated into `pending_event` and returned as
     /// `Interrupted` for retry.
     async fn handle_event(&mut self, mut event: WatcherEvent) -> eyre::Result<HandleResult> {
+        // This event has passed debounce and the applied-state duplicate check. Notify external
+        // consumers now, before a slow eval or occupied GHCi session can delay the reload cycle.
+        self.command_handles.retain(|handle| !handle.is_finished());
+        self.hooks
+            .run_shell_hooks(
+                LifecycleEvent::Reload(hooks::When::Before),
+                &mut self.command_handles,
+            )
+            .await?;
+
         // Queue behind any active eval and prevent later evals from entering GHCi
         // until this complete dispatch (including interruption cleanup) is done.
         let _eval_reload_guard = self.eval_barrier.begin_operation().await;
