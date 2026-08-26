@@ -50,6 +50,28 @@ impl FileClassifier {
         NormalPath::new(path, &self.cwd)
     }
 
+    /// Return whether a filesystem event can produce a reload or restart action.
+    ///
+    /// This conservative check is used by the watcher before manager lifecycle hooks run. Removed
+    /// Haskell sources are retained because only the live GHCi target set can determine whether
+    /// they require `:unadd`.
+    pub(crate) fn is_potentially_relevant(&self, event: &FileEvent) -> eyre::Result<bool> {
+        let path = self.relative_path(event.as_path())?;
+        let restart_match = self.restart_globs.matched(&path);
+        let reload_match = self.reload_globs.matched(&path);
+        let default_restart = path.extension().is_some_and(|ext| ext == "cabal")
+            || path.file_name().is_some_and(|name| name == ".ghci");
+
+        if !restart_match.is_ignore() && (default_restart || restart_match.is_whitelist()) {
+            return Ok(true);
+        }
+        if reload_match.is_ignore() {
+            return Ok(false);
+        }
+
+        Ok(is_haskell_source_file(&path) || reload_match.is_whitelist())
+    }
+
     /// Classify a set of file events into reload actions.
     ///
     /// `targets` is the set of currently loaded modules. Pass `&ModuleSet::default()` when
@@ -165,5 +187,46 @@ impl ReloadActions {
     /// Is a session restart needed?
     pub fn needs_restart(&self) -> bool {
         !self.needs_restart.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn event(path: &str) -> FileEvent {
+        FileEvent::Remove(Utf8PathBuf::from(path))
+    }
+
+    fn classifier(restart_globs: &[&str], reload_globs: &[&str]) -> FileClassifier {
+        FileClassifier::new(
+            GlobMatcher::from_globs(restart_globs).unwrap(),
+            GlobMatcher::from_globs(reload_globs).unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn filters_irrelevant_non_haskell_paths() {
+        let classifier = classifier(&[], &[]);
+
+        assert!(classifier
+            .is_potentially_relevant(&event("Main.hs"))
+            .unwrap());
+        assert!(!classifier
+            .is_potentially_relevant(&event("README.md"))
+            .unwrap());
+    }
+
+    #[test]
+    fn retains_restart_defaults_and_explicit_globs() {
+        let classifier = classifier(&[], &["**/*.persistentmodels"]);
+
+        assert!(classifier
+            .is_potentially_relevant(&event("package.cabal"))
+            .unwrap());
+        assert!(classifier
+            .is_potentially_relevant(&event("config/schema.persistentmodels"))
+            .unwrap());
     }
 }

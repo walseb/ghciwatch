@@ -73,7 +73,7 @@ async fn main() -> eyre::Result<()> {
     let (watcher_command_sender, watcher_command_receiver) = mpsc::channel::<WatcherCommand>(8);
 
     let (ghci_opts, maybe_ghci_reader) = GhciOpts::from_cli(&opts)?;
-    let watcher_opts = WatcherOpts::from_cli(&opts);
+    let watcher_opts = WatcherOpts::from_cli(&opts)?;
 
     let mut manager = ShutdownManager::with_timeout(Duration::from_secs(1));
 

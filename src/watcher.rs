@@ -25,6 +25,7 @@ use crate::event_filter::file_states;
 use crate::event_filter::FileEvent;
 use crate::event_filter::FileState;
 use crate::ghci::manager::WatcherEvent;
+use crate::ghci::FileClassifier;
 use crate::haskell_source_file::is_haskell_source_file;
 use crate::normal_path::NormalPath;
 use crate::shutdown::ShutdownHandle;
@@ -58,6 +59,8 @@ pub struct WatcherOpts {
     pub debounce: Duration,
     /// If given, use the polling file watcher with the given duration as the poll interval.
     pub poll: Option<Duration>,
+    /// Classifies paths before they are sent to the GHCi manager.
+    pub file_classifier: FileClassifier,
 }
 
 impl WatcherOpts {
@@ -65,12 +68,16 @@ impl WatcherOpts {
     ///
     /// This extracts the bits of an [`Opts`] struct relevant to the [`run_watcher`] session
     /// without cloning or taking ownership of the entire thing.
-    pub fn from_cli(opts: &Opts) -> Self {
-        Self {
+    pub fn from_cli(opts: &Opts) -> eyre::Result<Self> {
+        Ok(Self {
             watch: opts.watch.paths.clone(),
             debounce: opts.watch.debounce,
             poll: opts.watch.poll,
-        }
+            file_classifier: FileClassifier::new(
+                opts.watch.restart_globs()?,
+                opts.watch.reload_globs()?,
+            )?,
+        })
     }
 }
 
@@ -106,6 +113,7 @@ async fn run_debouncer<T: notify::Watcher>(
         ghci_sender: ghci_sender.clone(),
         shutdown: handle.clone(),
         watch: opts.watch.clone(),
+        file_classifier: opts.file_classifier.clone(),
     };
 
     let cache = FileIdMap::new();
@@ -248,6 +256,7 @@ struct EventHandler {
     ghci_sender: mpsc::Sender<WatcherEvent>,
     shutdown: ShutdownHandle,
     watch: Vec<NormalPath>,
+    file_classifier: FileClassifier,
 }
 
 impl EventHandler {
@@ -260,7 +269,13 @@ impl EventHandler {
 
     async fn handle_event_inner(&self, event: DebounceEventResult) -> eyre::Result<()> {
         let events = process_debounced_events(event)?;
-        send_event(&self.ghci_sender, &self.watch, events, false).await
+        let mut relevant_events = BTreeSet::new();
+        for event in events {
+            if self.file_classifier.is_potentially_relevant(&event)? {
+                relevant_events.insert(event);
+            }
+        }
+        send_event(&self.ghci_sender, &self.watch, relevant_events, false).await
     }
 }
 

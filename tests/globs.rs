@@ -1,8 +1,41 @@
+use std::time::Duration;
+
 use test_harness::test;
 use test_harness::BaseMatcher;
 use test_harness::Fs;
 use test_harness::GhciWatchBuilder;
 use test_harness::Matcher;
+
+/// An unrelated watched file does not start a reload attempt or rewrite the error file.
+#[test]
+async fn ignores_unrelated_watched_file() {
+    let mut session = GhciWatchBuilder::new("tests/data/simple")
+        .with_args(["--error-file", "compile.txt"])
+        .start()
+        .await
+        .expect("ghciwatch starts");
+    session
+        .wait_until_ready()
+        .await
+        .expect("ghciwatch loads ghci");
+
+    session
+        .fs()
+        .write(session.path("compile.txt"), "unchanged")
+        .await
+        .unwrap();
+    session.fs().touch(session.path("README.md")).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    assert_eq!(
+        session
+            .fs()
+            .read(session.path("compile.txt"))
+            .await
+            .unwrap(),
+        "unchanged"
+    );
+}
 
 /// Test that `ghciwatch` can reload when a file matching a `--reload-glob` is changed.
 #[test]
@@ -34,7 +67,7 @@ async fn can_reload_glob() {
 #[test]
 async fn can_skip_reload_for_ignore_glob() {
     let mut session = GhciWatchBuilder::new("tests/data/simple")
-        .with_args(["--reload-glob", "!**/*.hs"])
+        .with_args(["--reload-glob", "!**/*.hs", "--error-file", "compile.txt"])
         .start()
         .await
         .expect("ghciwatch starts");
@@ -45,14 +78,24 @@ async fn can_skip_reload_for_ignore_glob() {
 
     session
         .fs()
+        .write(session.path("compile.txt"), "unchanged")
+        .await
+        .unwrap();
+    session
+        .fs()
         .touch(session.path("src/MyModule.hs"))
         .await
         .unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
 
-    session
-        .wait_for_log(BaseMatcher::reload_completes().but_not(BaseMatcher::reload()))
-        .await
-        .expect("ghciwatch reloads when a `.persistentmodels` file is created");
+    assert_eq!(
+        session
+            .fs()
+            .read(session.path("compile.txt"))
+            .await
+            .unwrap(),
+        "unchanged"
+    );
 }
 
 /// Test that `ghciwatch` can restart when a file matching a `--restart-glob` is changed.
@@ -146,7 +189,14 @@ async fn can_ignore_restart_paths() {
         .before_start(
             |project_root| async move { Fs::new().touch(project_root.join(".ghci")).await },
         )
-        .with_args(["--restart-glob", "!.ghci", "--watch", ".ghci"])
+        .with_args([
+            "--restart-glob",
+            "!.ghci",
+            "--watch",
+            ".ghci",
+            "--error-file",
+            "compile.txt",
+        ])
         .start()
         .await
         .expect("ghciwatch starts");
@@ -155,13 +205,23 @@ async fn can_ignore_restart_paths() {
         .wait_until_ready()
         .await
         .expect("ghciwatch loads ghci");
+    session
+        .fs()
+        .write(session.path("compile.txt"), "unchanged")
+        .await
+        .unwrap();
 
     session.fs().touch(session.path(".ghci")).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
 
-    session
-        .wait_for_log(BaseMatcher::reload_completes().but_not(BaseMatcher::restart()))
-        .await
-        .expect("ghciwatch doesn't restart when ignored globs are changed");
+    assert_eq!(
+        session
+            .fs()
+            .read(session.path("compile.txt"))
+            .await
+            .unwrap(),
+        "unchanged"
+    );
 }
 
 /// Ghciwatch can ignore when a file is removed.
@@ -171,7 +231,14 @@ async fn can_ignore_removal() {
         .before_start(|project_root| async move {
             Fs::new().touch(project_root.join("my-model.db")).await
         })
-        .with_args(["--reload-glob", "!**/*.db", "--watch", "."])
+        .with_args([
+            "--reload-glob",
+            "!**/*.db",
+            "--watch",
+            ".",
+            "--error-file",
+            "compile.txt",
+        ])
         .start()
         .await
         .expect("ghciwatch starts");
@@ -180,17 +247,27 @@ async fn can_ignore_removal() {
         .wait_until_ready()
         .await
         .expect("ghciwatch loads ghci");
+    session
+        .fs()
+        .write(session.path("compile.txt"), "unchanged")
+        .await
+        .unwrap();
 
     session
         .fs()
         .remove(session.path("my-model.db"))
         .await
         .unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
 
-    session
-        .wait_for_log(BaseMatcher::reload_completes().but_not(BaseMatcher::ghci_remove()))
-        .await
-        .expect("Ghciwatch ignores removed files");
+    assert_eq!(
+        session
+            .fs()
+            .read(session.path("compile.txt"))
+            .await
+            .unwrap(),
+        "unchanged"
+    );
 }
 
 /// Ghciwatch can whitelist reloads for removed files.
