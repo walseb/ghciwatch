@@ -735,6 +735,45 @@ impl Ghci {
         Ok(actions)
     }
 
+    /// Run an eval-socket `:r`/`:reload` through the normal reload lifecycle and progress monitor.
+    #[instrument(skip_all, level = "debug", name = "reload")]
+    pub(crate) async fn reload_from_eval(&mut self) -> eyre::Result<()> {
+        let start_instant = Instant::now();
+        let mut log = CompilationLog::default();
+        self.opts.clear();
+        let affected_paths = format_bulleted_list(&self.known_haskell_files);
+
+        let reload_result: eyre::Result<()> = async {
+            self.run_hooks(LifecycleEvent::Reload(hooks::When::Before), &mut log)
+                .await?;
+            let status = self.reload_targets(&mut log, &affected_paths).await?;
+            if status != CompilationWaitStatus::Error {
+                self.refresh_eval_commands().await?;
+            }
+            Ok(())
+        }
+        .await;
+
+        let ghci_available = match &reload_result {
+            Ok(()) => true,
+            Err(err) => !error_is_broken_pipe(err) && !self.recovery_restart_required,
+        };
+        let operation_succeeded = reload_result.is_ok();
+        let finish_result = self
+            .finish_compilation(
+                start_instant,
+                &mut log,
+                [LifecycleEvent::Reload(hooks::When::After)],
+                ghci_available,
+                operation_succeeded,
+            )
+            .await;
+        self.prune_command_handles();
+
+        reload_result?;
+        finish_result
+    }
+
     /// Synchronize watched targets and optionally reload this `ghci` session.
     ///
     /// This may fully restart the `ghci` process.
@@ -848,44 +887,11 @@ impl Ghci {
                     "Reloading ghci:\n{}",
                     format_bulleted_list(&actions.needs_reload)
                 );
-                // Like `:unadd`, an ordinary reload can wedge inside GHC. It is not an executable
-                // eval, so monitor the output read itself and interrupt only if compilation goes quiet.
-                let status = self
-                    .stdin
-                    .reload(
-                        &mut self.stdout,
-                        &mut log,
-                        COMPILATION_INACTIVITY_TIMEOUT,
-                        self.opts.interrupt_on_error,
-                    )
-                    .await?;
-                match status {
-                    CompilationWaitStatus::Complete => {
-                        self.refresh_eval_commands_for_paths(&actions.needs_reload).await?;
-                    }
-                    CompilationWaitStatus::Error => {
-                        tracing::info!("Interrupting parallel GHCi reload after first error");
-                        self.send_sigint().await?;
-                        self.stdout.capture_stderr(&mut self.stdin.stdin, &mut log).await?;
-                        log.mark_failed();
-                    }
-                    CompilationWaitStatus::Inactive => {
-                        print_ghciwatch_error(
-                            "GHCi reload stopped reporting compilation progress",
-                            &format!(
-                                "Component: reload (:reload)\nInactivity timeout: {COMPILATION_INACTIVITY_TIMEOUT:?}\nProcess group ID: {}\nWorking directory: {}\nCommand: {}\nChanged paths:\n{}\nRecovery: interrupting GHCi with process-group SIGINT, then retrying :reload with a {RECOVERY_COMPILATION_INACTIVITY_TIMEOUT:?} inactivity timeout",
-                                self.process_group_id, self.search_paths.cwd, self.opts.command,
-                                format_bulleted_list(&actions.needs_reload),
-                            ),
-                        );
-                        tracing::warn!(
-                            "GHCi reported no reload compilation progress for {COMPILATION_INACTIVITY_TIMEOUT:?}; interrupting reload"
-                        );
-                        self.interrupt_and_retry_reload(&mut log, "reload (:reload)")
-                            .await
-                            .wrap_err("Failed to recover from inactive reload")?;
-                        self.refresh_eval_commands_for_paths(&actions.needs_reload).await?;
-                    }
+                let affected_paths = format_bulleted_list(&actions.needs_reload);
+                let status = self.reload_targets(&mut log, &affected_paths).await?;
+                if status != CompilationWaitStatus::Error {
+                    self.refresh_eval_commands_for_paths(&actions.needs_reload)
+                        .await?;
                 }
             }
             Ok(())
@@ -919,6 +925,55 @@ impl Ghci {
         finish_result?;
 
         Ok(())
+    }
+
+    /// Submit `:reload` with the compilation-progress timeout and its SIGINT recovery path.
+    async fn reload_targets(
+        &mut self,
+        log: &mut CompilationLog,
+        affected_paths: &str,
+    ) -> eyre::Result<CompilationWaitStatus> {
+        // Unlike executable evals, compilation has no absolute timeout. Interrupt only after GHCi
+        // stops reporting `Compiling` progress.
+        let status = self
+            .stdin
+            .reload(
+                &mut self.stdout,
+                log,
+                COMPILATION_INACTIVITY_TIMEOUT,
+                self.opts.interrupt_on_error,
+            )
+            .await?;
+        match status {
+            CompilationWaitStatus::Complete => {}
+            CompilationWaitStatus::Error => {
+                tracing::info!("Interrupting parallel GHCi reload after first error");
+                self.send_sigint().await?;
+                self.stdout
+                    .capture_stderr(&mut self.stdin.stdin, log)
+                    .await?;
+                log.mark_failed();
+            }
+            CompilationWaitStatus::Inactive => {
+                print_ghciwatch_error(
+                    "GHCi reload stopped reporting compilation progress",
+                    &format!(
+                        "Component: reload (:reload)\nInactivity timeout: {COMPILATION_INACTIVITY_TIMEOUT:?}\nProcess group ID: {}\nWorking directory: {}\nCommand: {}\nChanged paths:\n{}\nRecovery: interrupting GHCi with process-group SIGINT, then retrying :reload with a {RECOVERY_COMPILATION_INACTIVITY_TIMEOUT:?} inactivity timeout",
+                        self.process_group_id,
+                        self.search_paths.cwd,
+                        self.opts.command,
+                        affected_paths,
+                    ),
+                );
+                tracing::warn!(
+                    "GHCi reported no reload compilation progress for {COMPILATION_INACTIVITY_TIMEOUT:?}; interrupting reload"
+                );
+                self.interrupt_and_retry_reload(log, "reload (:reload)")
+                    .await
+                    .wrap_err("Failed to recover from inactive reload")?;
+            }
+        }
+        Ok(status)
     }
 
     /// Balance a reload attempt cancelled by a newer filesystem event.
