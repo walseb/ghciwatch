@@ -10,6 +10,7 @@ use crate::incremental_reader::FindAt;
 
 use super::loaded_module::LoadedModule;
 use super::parse::ShowPaths;
+use super::stdout::CompilationWaitStatus;
 use super::CompilationLog;
 use super::GhciCommand;
 use super::ModuleSet;
@@ -53,19 +54,25 @@ impl GhciStdin {
             .await
     }
 
-    /// Write a line and wait until either the prompt arrives or compilation progress stops for the
-    /// supplied timeout. Returns `false` when no `Compiling` line appears before the deadline.
+    /// Write a line and wait for the prompt, an error diagnostic, or compilation inactivity.
     async fn write_line_with_progress_timeout(
         &mut self,
         stdout: &mut GhciStdout,
         line: &str,
         log: &mut CompilationLog,
         progress_timeout: Duration,
-    ) -> eyre::Result<bool> {
+        interrupt_on_error: bool,
+    ) -> eyre::Result<CompilationWaitStatus> {
         stdout.clear_stderr_buffer().await?;
         self.stdin.write_all(line.as_bytes()).await?;
         stdout
-            .prompt_with_progress_timeout(&mut self.stdin, FindAt::LineStart, log, progress_timeout)
+            .prompt_with_progress_timeout(
+                &mut self.stdin,
+                FindAt::LineStart,
+                log,
+                progress_timeout,
+                interrupt_on_error,
+            )
             .await
     }
 
@@ -136,9 +143,16 @@ impl GhciStdin {
         stdout: &mut GhciStdout,
         log: &mut CompilationLog,
         inactivity_timeout: Duration,
-    ) -> eyre::Result<bool> {
-        self.write_line_with_progress_timeout(stdout, ":reload\n", log, inactivity_timeout)
-            .await
+        interrupt_on_error: bool,
+    ) -> eyre::Result<CompilationWaitStatus> {
+        self.write_line_with_progress_timeout(
+            stdout,
+            ":reload\n",
+            log,
+            inactivity_timeout,
+            interrupt_on_error,
+        )
+        .await
     }
 
     #[instrument(skip_all, level = "debug")]
@@ -148,20 +162,16 @@ impl GhciStdin {
         modules: impl IntoIterator<Item = &LoadedModule>,
         log: &mut CompilationLog,
         inactivity_timeout: Duration,
-    ) -> eyre::Result<bool> {
+        interrupt_on_error: bool,
+    ) -> eyre::Result<CompilationWaitStatus> {
         let modules = modules.into_iter().format(" ");
-        // We use `:add` because `:load` unloads all previously loaded modules:
-        //
-        // > All previously loaded modules, except package modules, are forgotten. The new set of
-        // > modules is known as the target set. Note that :load can be used without any arguments
-        // > to unload all the currently loaded modules and bindings.
-        //
-        // https://downloads.haskell.org/ghc/latest/docs/users_guide/ghci.html#ghci-cmd-:load
+        // We use `:add` because `:load` unloads all previously loaded modules.
         self.write_line_with_progress_timeout(
             stdout,
             &format!(":add {modules}\n"),
             log,
             inactivity_timeout,
+            interrupt_on_error,
         )
         .await
     }
@@ -173,13 +183,15 @@ impl GhciStdin {
         modules: impl IntoIterator<Item = &LoadedModule>,
         log: &mut CompilationLog,
         inactivity_timeout: Duration,
-    ) -> eyre::Result<bool> {
+        interrupt_on_error: bool,
+    ) -> eyre::Result<CompilationWaitStatus> {
         let modules = modules.into_iter().format(" ");
         self.write_line_with_progress_timeout(
             stdout,
             &format!(":unadd {modules}\n"),
             log,
             inactivity_timeout,
+            interrupt_on_error,
         )
         .await
     }

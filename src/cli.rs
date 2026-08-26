@@ -118,6 +118,13 @@ pub struct Opts {
     #[arg(long)]
     pub restart_on_exit: bool,
 
+    /// Interrupt `:reload`, `:add`, or `:unadd` after the first GHC error diagnostic.
+    ///
+    /// This can reduce feedback time when GHCi uses parallel compilation (`-j`) and would otherwise
+    /// continue compiling independent modules after an error.
+    #[arg(long)]
+    pub interrupt_on_error: bool,
+
     /// A shell command to run synchronously immediately before GHCi is sent `SIGINT`.
     ///
     /// The command receives the configured command PID and process-group ID in the

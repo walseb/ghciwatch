@@ -27,6 +27,12 @@ pub enum StderrEvent {
         sender: oneshot::Sender<()>,
     },
 
+    /// Arm one compilation operation to be notified when GHC emits an error diagnostic.
+    InterruptOnError { sender: oneshot::Sender<()> },
+
+    /// Stop notifying the preceding compilation operation.
+    DisarmInterruptOnError,
+
     /// Read through an exact marker line and return the preceding buffered output.
     /// Once the marker written by GHCi has been consumed, all earlier stderr is in the buffer.
     GetBufferThrough {
@@ -51,6 +57,8 @@ pub struct GhciStderr {
     pub forwarding: bool,
     /// Lines captured while forwarding is disabled, retained across per-command buffer clears.
     pub suppressed_buffer: String,
+    /// Notification for the currently active interrupt-on-error compilation operation.
+    pub interrupt_on_error: Option<oneshot::Sender<()>>,
 }
 
 impl GhciStderr {
@@ -122,6 +130,12 @@ impl GhciStderr {
                 self.forwarding = enabled;
                 let _ = sender.send(());
             }
+            StderrEvent::InterruptOnError { sender } => {
+                self.interrupt_on_error = Some(sender);
+            }
+            StderrEvent::DisarmInterruptOnError => {
+                self.interrupt_on_error = None;
+            }
             StderrEvent::GetBufferThrough {
                 marker,
                 ready,
@@ -146,6 +160,11 @@ impl GhciStderr {
             tracing::debug!(line, "Read suppressed stderr line");
         }
         line.push('\n');
+        if line_has_error_diagnostic(&line) {
+            if let Some(sender) = self.interrupt_on_error.take() {
+                let _ = sender.send(());
+            }
+        }
         self.buffer.push_str(&line);
         if !self.forwarding {
             self.suppressed_buffer.push_str(&line);
@@ -203,5 +222,36 @@ impl GhciStderr {
         }
         let _ = sender.send(self.buffer.clone());
         Ok(())
+    }
+}
+
+fn line_has_error_diagnostic(line: &str) -> bool {
+    use crate::ghci::parse::GhcMessage;
+    use crate::ghci::parse::Severity;
+
+    crate::ghci::parse::parse_ghc_messages(line).is_ok_and(|messages| {
+        messages.into_iter().any(|message| {
+            matches!(
+                message,
+                GhcMessage::Diagnostic(diagnostic) if diagnostic.severity == Severity::Error
+            )
+        })
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::line_has_error_diagnostic;
+
+    #[test]
+    fn recognizes_only_ghc_error_headers() {
+        assert!(line_has_error_diagnostic(
+            "src/Foo.hs:4:11: error: [GHC-12345]\n"
+        ));
+        assert!(line_has_error_diagnostic("<no location info>: error:\n"));
+        assert!(!line_has_error_diagnostic("src/Foo.hs:4:11: warning:\n"));
+        assert!(!line_has_error_diagnostic(
+            "application said error: but this is not a diagnostic\n"
+        ));
     }
 }

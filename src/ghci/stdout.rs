@@ -39,6 +39,13 @@ pub struct GhciStdout {
     pub stderr_sync_nonce: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompilationWaitStatus {
+    Complete,
+    Inactive,
+    Error,
+}
+
 impl GhciStdout {
     #[instrument(skip_all, level = "debug")]
     async fn parse_into_log(
@@ -168,6 +175,15 @@ impl GhciStdout {
         Ok(())
     }
 
+    /// Capture stderr emitted before an interrupted command and parse it into the compilation log.
+    pub async fn capture_stderr(
+        &mut self,
+        stdin: &mut ChildStdin,
+        log: &mut CompilationLog,
+    ) -> eyre::Result<()> {
+        self.parse_into_log(stdin, "", log).await
+    }
+
     #[instrument(skip_all, level = "debug")]
     pub async fn prompt(
         &mut self,
@@ -190,8 +206,7 @@ impl GhciStdout {
         Ok(())
     }
 
-    /// Wait for the GHCi prompt, but stop if no `Compiling` progress is seen for the timeout.
-    /// Unrelated output is still forwarded but does not keep a wedged compilation alive.
+    /// Wait for the GHCi prompt, an error diagnostic, or compilation inactivity.
     #[instrument(skip_all, level = "debug")]
     pub async fn prompt_with_progress_timeout(
         &mut self,
@@ -199,27 +214,52 @@ impl GhciStdout {
         find: FindAt,
         log: &mut CompilationLog,
         progress_timeout: Duration,
-    ) -> eyre::Result<bool> {
-        let result = self
-            .reader
-            .read_until_with_progress_timeout(
-                &mut ReadOpts {
-                    end_marker: &self.prompt_patterns,
-                    find,
-                    writing: WriteBehavior::NoFinalLine,
-                    buffer: &mut self.buffer,
-                },
+        interrupt_on_error: bool,
+    ) -> eyre::Result<CompilationWaitStatus> {
+        let (error_sender, mut error_receiver) = oneshot::channel();
+        if interrupt_on_error {
+            self.stderr_sender
+                .send(StderrEvent::InterruptOnError {
+                    sender: error_sender,
+                })
+                .await?;
+        }
+
+        let result = {
+            let mut opts = ReadOpts {
+                end_marker: &self.prompt_patterns,
+                find,
+                writing: WriteBehavior::NoFinalLine,
+                buffer: &mut self.buffer,
+            };
+            let read = self.reader.read_until_with_progress_timeout(
+                &mut opts,
                 progress_timeout,
                 "Compiling",
-            )
+            );
+            tokio::pin!(read);
+            if interrupt_on_error {
+                tokio::select! {
+                    biased;
+                    result = &mut read => Some(result?),
+                    _ = &mut error_receiver => None,
+                }
+            } else {
+                Some(read.await?)
+            }
+        };
+
+        self.stderr_sender
+            .send(StderrEvent::DisarmInterruptOnError)
             .await?;
         match result {
-            ReadUntilStatus::Complete(data) => {
+            Some(ReadUntilStatus::Complete(data)) => {
                 tracing::debug!(bytes = data.len(), "Got data from ghci");
                 self.parse_into_log(stdin, &data, log).await?;
-                Ok(true)
+                Ok(CompilationWaitStatus::Complete)
             }
-            ReadUntilStatus::Inactive => Ok(false),
+            Some(ReadUntilStatus::Inactive) => Ok(CompilationWaitStatus::Inactive),
+            None => Ok(CompilationWaitStatus::Error),
         }
     }
 
