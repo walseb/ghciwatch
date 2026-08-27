@@ -505,19 +505,23 @@ async fn exits_when_parent_process_exits() {
     std::fs::create_dir_all(&test_dir).expect("can create parent-exit test directory");
     let ready_path = test_dir.join("ready");
     let pid_path = test_dir.join("pid");
+    let command_pid_path = test_dir.join("command-pid");
+    let escaped_pid_path = test_dir.join("escaped-pid");
     let output_path = test_dir.join("output");
 
-    // Keep the short-lived shell alive until ghciwatch has entered startup. Its exit then reparents
-    // ghciwatch and should trigger the normal shutdown manager.
+    // Keep the short-lived shell alive until ghciwatch has entered startup and its managed command
+    // is running. Its exit then reparents ghciwatch and should trigger the normal shutdown manager,
+    // including termination of the managed command tree.
     let script = r#"
         "$GHCIWATCH" \
           --before-startup-shell "touch $READY" \
-          --command "sleep 300" \
+          --command "$GHCI_COMMAND" \
+          --before-kill "sleep 2" \
           >"$OUTPUT" 2>&1 &
         child=$!
         printf '%s\n' "$child" >"$PID_FILE"
         i=0
-        while [ ! -e "$READY" ]; do
+        while [ ! -e "$READY" ] || [ ! -e "$COMMAND_PID_FILE" ] || [ ! -e "$ESCAPED_PID_FILE" ]; do
           if ! kill -0 "$child" 2>/dev/null; then exit 2; fi
           i=$((i + 1))
           if [ "$i" -gt 200 ]; then exit 3; fi
@@ -528,8 +532,14 @@ async fn exits_when_parent_process_exits() {
         .arg("-c")
         .arg(script)
         .env("GHCIWATCH", env!("CARGO_BIN_EXE_ghciwatch"))
+        .env(
+            "GHCI_COMMAND",
+            r#"sh -c 'printf "%s\n" "$$" > "$COMMAND_PID_FILE"; setsid sh -c "printf \"%s\n\" \"\$\$\" > \"$ESCAPED_PID_FILE\"; exec sleep 300" & exec sleep 300'"#,
+        )
         .env("READY", &ready_path)
         .env("PID_FILE", &pid_path)
+        .env("COMMAND_PID_FILE", &command_pid_path)
+        .env("ESCAPED_PID_FILE", &escaped_pid_path)
         .env("OUTPUT", &output_path)
         .status()
         .await
@@ -541,14 +551,26 @@ async fn exits_when_parent_process_exits() {
         .trim()
         .parse::<i32>()
         .expect("ghciwatch PID is numeric");
+    let command_pid = std::fs::read_to_string(&command_pid_path)
+        .expect("managed command records its PID")
+        .trim()
+        .parse::<i32>()
+        .expect("managed command PID is numeric");
+    let escaped_pid = std::fs::read_to_string(&escaped_pid_path)
+        .expect("escaped descendant records its PID")
+        .trim()
+        .parse::<i32>()
+        .expect("escaped descendant PID is numeric");
+    let process_is_alive = |pid| {
+        std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|stat| stat.rsplit_once(") ").map(|(_, fields)| fields.to_owned()))
+            .and_then(|fields| fields.chars().next())
+            .is_some_and(|state| state != 'Z' && state != 'X')
+    };
     let exited = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"));
-            let alive = stat
-                .ok()
-                .and_then(|stat| stat.rsplit_once(") ").map(|(_, fields)| fields.to_owned()))
-                .and_then(|fields| fields.chars().next())
-                .is_some_and(|state| state != 'Z' && state != 'X');
+            let alive = process_is_alive(pid);
             if !alive {
                 break;
             }
@@ -559,9 +581,30 @@ async fn exits_when_parent_process_exits() {
     if exited.is_err() {
         let _ = signal::kill(Pid::from_raw(pid), Signal::SIGKILL);
     }
+    let command_survived = process_is_alive(command_pid);
+    let escaped_survived = process_is_alive(escaped_pid);
+    for survivor in [
+        command_survived.then_some(command_pid),
+        escaped_survived.then_some(escaped_pid),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let _ = signal::kill(Pid::from_raw(survivor), Signal::SIGKILL);
+    }
     assert!(
         exited.is_ok(),
         "ghciwatch remained alive after its parent exited; output:\n{}",
+        std::fs::read_to_string(&output_path).unwrap_or_default()
+    );
+    assert!(
+        !command_survived,
+        "managed command {command_pid} remained alive after ghciwatch exited; output:\n{}",
+        std::fs::read_to_string(&output_path).unwrap_or_default()
+    );
+    assert!(
+        !escaped_survived,
+        "escaped descendant {escaped_pid} remained alive after ghciwatch exited; output:\n{}",
         std::fs::read_to_string(&output_path).unwrap_or_default()
     );
 

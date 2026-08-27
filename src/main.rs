@@ -75,7 +75,8 @@ async fn main() -> eyre::Result<()> {
     let (ghci_opts, maybe_ghci_reader) = GhciOpts::from_cli(&opts)?;
     let watcher_opts = WatcherOpts::from_cli(&opts)?;
 
-    let mut manager = ShutdownManager::with_timeout(Duration::from_secs(1));
+    let mut manager =
+        ShutdownManager::with_timeout(ghci_opts.shutdown_timeout(Duration::from_secs(1)));
 
     if opts.has_experimental_feature(ExperimentalFeature::Tui) {
         let tracing_reader =

@@ -185,6 +185,16 @@ pub struct GhciOpts {
 }
 
 impl GhciOpts {
+    /// Allow every synchronous before-kill command to reach its own timeout before the shutdown
+    /// manager starts cancelling tasks. Cancelling [`GhciProcess`] earlier would bypass its
+    /// complete-tree kill and leave only the child handle's drop behavior.
+    pub fn shutdown_timeout(&self, base_timeout: Duration) -> Duration {
+        base_timeout.saturating_add(
+            process::BEFORE_SIGNAL_COMMAND_TIMEOUT
+                .saturating_mul(self.before_kill.len().try_into().unwrap_or(u32::MAX)),
+        )
+    }
+
     /// Construct options for [`Ghci`] from parsed command-line interface arguments as [`Opts`].
     ///
     /// This extracts the bits of an [`Opts`] struct relevant to the [`Ghci`] session without
@@ -336,8 +346,9 @@ pub struct Ghci {
     targets: ModuleSet,
     /// Last filesystem snapshot successfully applied to GHCi's target set.
     known_haskell_files: BTreeSet<NormalPath>,
-    /// A replacement may return to its prompt after failing to compile. Retain that failure so
-    /// the next relevant edit restarts the incomplete session even with `--no-auto-reload`.
+    /// A replacement may return to its prompt after failing to compile. Retain that failure so a
+    /// `--no-auto-reload` session can restart on the next relevant edit; normal sessions recover by
+    /// reloading the still-usable GHCi process.
     initialization_failure: Option<CompilationLog>,
     /// Eval commands, if `opts.enable_eval` is set.
     eval_commands: BTreeMap<NormalPath, Vec<EvalCommand>>,
@@ -678,7 +689,11 @@ impl Ghci {
                 })
             })
             .collect::<eyre::Result<BTreeSet<_>>>()?;
-        let recovery_paths = if self.initialization_failure.is_some() {
+        // A live GHCi which reached its prompt after startup compilation errors can recover with an
+        // ordinary `:reload`; restarting Cabal for every fixing edit is both unnecessary and slow.
+        // `--no-auto-reload` still needs an explicit recovery action because ordinary reload actions
+        // are suppressed below, so retain the fresh-session fallback for that mode.
+        let recovery_paths = if self.initialization_failure.is_some() && !self.opts.auto_reload {
             events
                 .iter()
                 .filter(|event| is_haskell_source_file(event.as_path()))

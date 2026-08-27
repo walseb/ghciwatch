@@ -142,3 +142,48 @@ async fn can_reload_after_error() {
         .await
         .unwrap();
 }
+
+/// Startup source errors leave a usable GHCi prompt, so fixing them should reload the existing
+/// package session rather than paying for a complete Cabal restart after every edit.
+#[test]
+async fn startup_compilation_errors_recover_by_reload() {
+    let mut session = GhciWatchBuilder::new("tests/data/simple")
+        .before_start(|project| async move {
+            test_harness::Fs::new()
+                .replace(
+                    project.join("src/MyLib.hs"),
+                    "example = \"example\"",
+                    "example = missingAtStartup",
+                )
+                .await
+        })
+        .with_startup_timeout(std::time::Duration::from_secs(20))
+        .start()
+        .await
+        .expect("ghciwatch starts");
+
+    session
+        .wait_for_startup_log("Starting up failed")
+        .await
+        .expect("startup reaches a GHCi prompt with compilation errors");
+    session.clear_events();
+    session
+        .fs()
+        .replace(
+            session.path("src/MyLib.hs"),
+            "example = missingAtStartup",
+            "example = \"example\"",
+        )
+        .await
+        .expect("can fix the startup error");
+    session
+        .wait_for_log("All good! Finished reloading")
+        .await
+        .expect("fixing edit reloads successfully");
+    assert!(
+        session
+            .assert_logged(BaseMatcher::message("Restarting ghci:\\n"))
+            .is_err(),
+        "a usable startup session must not restart for an ordinary fixing edit"
+    );
+}
