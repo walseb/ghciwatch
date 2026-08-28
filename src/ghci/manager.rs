@@ -16,6 +16,7 @@ use tracing::instrument;
 
 use crate::event_filter::FileEvent;
 use crate::event_filter::FileState;
+use crate::event_filter::SourceSnapshot;
 use crate::ghci::CompilationLog;
 use crate::hooks;
 use crate::hooks::LifecycleEvent;
@@ -47,6 +48,8 @@ pub enum WatcherEvent {
         states: BTreeMap<Utf8PathBuf, FileState>,
         /// A stable snapshot of Haskell files under all watch roots.
         haskell_files: BTreeSet<Utf8PathBuf>,
+        /// Content snapshot against which this compilation result must be validated.
+        source_snapshot: SourceSnapshot,
         /// Whether a temporary startup-retry watch produced this event.
         startup_retry: bool,
     },
@@ -62,12 +65,14 @@ impl WatcherEvent {
                     events,
                     states,
                     haskell_files,
+                    source_snapshot,
                     startup_retry,
                 },
                 WatcherEvent::Reload {
                     events: other_events,
                     states: other_states,
                     haskell_files: other_haskell_files,
+                    source_snapshot: other_source_snapshot,
                     startup_retry: other_startup_retry,
                 },
             ) => {
@@ -79,6 +84,7 @@ impl WatcherEvent {
                 states.extend(other_states);
                 // The later filesystem snapshot supersedes the earlier one.
                 *haskell_files = other_haskell_files;
+                *source_snapshot = other_source_snapshot;
                 *startup_retry |= other_startup_retry;
             }
         }
@@ -234,7 +240,7 @@ pub async fn run_ghci(
         handle,
         watcher_receiver,
         exited_receiver,
-        _watcher_command_sender: watcher_command_sender,
+        watcher_command_sender,
         interrupt_reloads,
         restart_on_exit,
         hooks,
@@ -252,21 +258,32 @@ pub async fn run_ghci(
     manager.run().await
 }
 
-#[instrument(level = "debug", skip(ghci, reload_state_sender))]
+#[instrument(
+    level = "debug",
+    skip(ghci, reload_state_sender, watcher_command_sender)
+)]
 async fn dispatch(
     ghci: Arc<Mutex<Ghci>>,
     event: WatcherEvent,
     reload_state_sender: watch::Sender<GhciReloadKind>,
+    watcher_command_sender: mpsc::Sender<WatcherCommand>,
 ) -> eyre::Result<()> {
     match event {
         WatcherEvent::Reload {
             events,
             haskell_files,
+            source_snapshot,
             ..
         } => {
             ghci.lock()
                 .await
-                .reload(events, haskell_files, reload_state_sender)
+                .reload(
+                    events,
+                    haskell_files,
+                    source_snapshot,
+                    reload_state_sender,
+                    watcher_command_sender,
+                )
                 .await?;
         }
     }
@@ -306,8 +323,8 @@ struct GhciManager {
     handle: ShutdownHandle,
     watcher_receiver: mpsc::Receiver<WatcherEvent>,
     exited_receiver: mpsc::Receiver<ExitStatus>,
-    // Keep the watcher command channel alive; configured watches now own startup recovery.
-    _watcher_command_sender: mpsc::Sender<WatcherCommand>,
+    /// Requests publication-time source rescans from the watcher.
+    watcher_command_sender: mpsc::Sender<WatcherCommand>,
     interrupt_reloads: bool,
     restart_on_exit: bool,
     /// Hook configuration copied out of GHCi so before-reload shell hooks do not wait on it.
@@ -492,6 +509,7 @@ impl GhciManager {
             self.ghci.clone(),
             event.clone(),
             reload_state_sender,
+            self.watcher_command_sender.clone(),
         )));
 
         // We only need one interrupt decision. The watch receiver also lets GHCi mark the
@@ -1135,6 +1153,7 @@ mod tests {
             events,
             states,
             haskell_files: BTreeSet::from([path.to_owned()]),
+            source_snapshot: BTreeMap::from([(path.to_owned(), FileState::capture(path).unwrap())]),
             startup_retry: false,
         }
     }

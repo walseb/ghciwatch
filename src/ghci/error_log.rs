@@ -15,12 +15,16 @@ use super::CompilationLog;
 /// editor of choice.
 pub struct ErrorLog {
     path: Option<NormalPath>,
+    temp_nonce: u64,
 }
 
 impl ErrorLog {
     /// Construct a new error log writer for the given path.
     pub fn new(path: Option<NormalPath>) -> Self {
-        Self { path }
+        Self {
+            path,
+            temp_nonce: 0,
+        }
     }
 
     /// Get the path this error log is written to.
@@ -41,7 +45,14 @@ impl ErrorLog {
             }
         };
 
-        let file = File::create(path).await?;
+        self.temp_nonce = self.temp_nonce.wrapping_add(1);
+        let file_name = path.absolute().file_name().unwrap_or("compile");
+        let temporary = path.absolute().with_file_name(format!(
+            ".{file_name}.ghciwatch-{}-{}.tmp",
+            std::process::id(),
+            self.temp_nonce,
+        ));
+        let file = File::create(&temporary).await?;
         let mut writer = BufWriter::new(file);
 
         if let Some(summary) = log.summary {
@@ -67,6 +78,7 @@ impl ErrorLog {
         // This is load-bearing! If we don't properly flush/shutdown the handle, nothing gets
         // written!
         writer.shutdown().await?;
+        tokio::fs::rename(&temporary, path.absolute()).await?;
 
         Ok(())
     }

@@ -89,6 +89,7 @@ use crate::cli::ExperimentalFeature;
 use crate::cli::Opts;
 use crate::clonable_command::ClonableCommand;
 use crate::event_filter::FileEvent;
+use crate::event_filter::SourceSnapshot;
 use crate::format_bulleted_list;
 use crate::hooks;
 use crate::hooks::HookOpts;
@@ -97,6 +98,7 @@ use crate::ignore::GlobMatcher;
 use crate::incremental_reader::IncrementalReader;
 use crate::normal_path::NormalPath;
 use crate::shutdown::ShutdownHandle;
+use crate::watcher::WatcherCommand;
 use crate::CommandExt;
 use crate::StringCase;
 
@@ -346,6 +348,8 @@ pub struct Ghci {
     targets: ModuleSet,
     /// Last filesystem snapshot successfully applied to GHCi's target set.
     known_haskell_files: BTreeSet<NormalPath>,
+    /// Snapshot and watcher channel used to validate a watcher-triggered compilation at publication.
+    publication_snapshot: Option<(SourceSnapshot, mpsc::Sender<WatcherCommand>)>,
     /// A replacement may return to its prompt after failing to compile. Retain that failure so a
     /// `--no-auto-reload` session can restart on the next relevant edit; normal sessions recover by
     /// reloading the still-usable GHCi process.
@@ -572,6 +576,7 @@ impl Ghci {
             classifier,
             targets: Default::default(),
             known_haskell_files: Default::default(),
+            publication_snapshot: None,
             initialization_failure: None,
             eval_commands: Default::default(),
             search_paths: ShowPaths {
@@ -800,8 +805,11 @@ impl Ghci {
         &mut self,
         events: BTreeSet<FileEvent>,
         haskell_files: BTreeSet<Utf8PathBuf>,
+        source_snapshot: SourceSnapshot,
         kind_sender: watch::Sender<GhciReloadKind>,
+        watcher_command_sender: mpsc::Sender<WatcherCommand>,
     ) -> eyre::Result<()> {
+        self.publication_snapshot = Some((source_snapshot, watcher_command_sender));
         let start_instant = Instant::now();
         let haskell_files = haskell_files
             .into_iter()
@@ -998,6 +1006,7 @@ impl Ghci {
     ) -> eyre::Result<()> {
         let event = LifecycleEvent::Reload(hooks::When::After);
         let mut log = CompilationLog::default();
+        self.publication_snapshot = None;
         let result = if ghci_available {
             self.run_hooks(event, &mut log).await
         } else {
@@ -1070,7 +1079,9 @@ impl Ghci {
                 return Err(err);
             }
         };
+        let publication_snapshot = self.publication_snapshot.take();
         let _ = std::mem::replace(self, new);
+        self.publication_snapshot = publication_snapshot;
         self.initialize(
             log,
             [
@@ -1165,7 +1176,9 @@ impl Ghci {
                 return Err(err);
             }
         };
+        let publication_snapshot = self.publication_snapshot.take();
         let _ = std::mem::replace(self, new);
+        self.publication_snapshot = publication_snapshot;
         // `initialize` itself balances all events on both compilation and protocol failures.
         self.initialize(log, events, haskell_files).await?;
 
@@ -1918,9 +1931,18 @@ impl Ghci {
         // Target synchronization followed by `:reload` may compile the same failure twice. Publish
         // each distinct diagnostic once while retaining errors unique to either operation.
         log.deduplicate_diagnostics();
+        // Validate at the publication boundary, rather than trusting notification ordering. If the
+        // source changed, the watcher also enqueues a fresh event so this attempt cannot be the final
+        // result even when its original notification is still being debounced.
+        let snapshot_result = self.compilation_snapshot_is_current().await;
+        let snapshot_current = snapshot_result.as_ref().copied().unwrap_or(false);
         // Allow hooks to consume the error log by updating it before running the hooks. A failure
-        // to publish the log must not suppress lifecycle completion notifications.
-        let error_log_result = self.write_error_log(log).await;
+        // to publish or validate the log must not suppress lifecycle completion notifications.
+        let error_log_result = match snapshot_result {
+            Ok(true) => self.write_error_log(log).await,
+            Ok(false) => Ok(()),
+            Err(error) => Err(error),
+        };
 
         let mut hooks_have_ghci = ghci_available;
         let mut hook_result = Ok(());
@@ -1949,11 +1971,16 @@ impl Ghci {
         }
 
         let event = events[N - 1];
-        let compilation_succeeded = operation_succeeded
+        let compilation_succeeded = snapshot_current
+            && operation_succeeded
             && ghci_available
             && !matches!(log.result(), Some(CompilationResult::Err));
 
-        if !compilation_succeeded {
+        if !snapshot_current {
+            tracing::info!(
+                "Compilation finished for a superseded source snapshot; waiting for follow-up"
+            );
+        } else if !compilation_succeeded {
             tracing::error!(
                 "{} failed in {:.2?}",
                 event.event_noun().first_char_to_ascii_uppercase(),
@@ -2063,6 +2090,21 @@ impl Ghci {
             }
         }
         Ok(())
+    }
+
+    async fn compilation_snapshot_is_current(&mut self) -> eyre::Result<bool> {
+        let Some((expected, sender)) = self.publication_snapshot.take() else {
+            return Ok(true);
+        };
+        let (ack, reply) = oneshot::channel();
+        sender
+            .send(WatcherCommand::ValidateSourceSnapshot { expected, ack })
+            .await
+            .wrap_err("Failed to request source snapshot validation")?;
+        reply
+            .await
+            .wrap_err("Source snapshot validator stopped")?
+            .map_err(eyre::Report::msg)
     }
 
     #[instrument(skip(self), level = "trace")]

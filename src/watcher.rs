@@ -24,6 +24,7 @@ use crate::event_filter::file_events_from_action;
 use crate::event_filter::file_states;
 use crate::event_filter::FileEvent;
 use crate::event_filter::FileState;
+use crate::event_filter::SourceSnapshot;
 use crate::ghci::manager::WatcherEvent;
 use crate::ghci::FileClassifier;
 use crate::haskell_source_file::is_haskell_source_file;
@@ -47,6 +48,14 @@ pub enum WatcherCommand {
     ClearStartupRetryFiles {
         /// Acknowledges that the temporary watcher has stopped.
         ack: oneshot::Sender<()>,
+    },
+    /// Check that a completed compilation still belongs to the current watched-source snapshot.
+    /// If it does not, enqueue a synthetic event carrying the fresh snapshot before replying.
+    ValidateSourceSnapshot {
+        /// Snapshot captured for the compilation attempt.
+        expected: SourceSnapshot,
+        /// Reports whether the snapshot is still current after queuing any required follow-up.
+        ack: oneshot::Sender<Result<bool, String>>,
     },
 }
 
@@ -190,6 +199,17 @@ async fn run_debouncer<T: notify::Watcher>(
                     WatcherCommand::ClearStartupRetryFiles { ack } => {
                         stop_debouncer(&mut retry_debouncer);
                         let _ = ack.send(());
+                    }
+                    WatcherCommand::ValidateSourceSnapshot { expected, ack } => {
+                        let result = validate_source_snapshot(
+                            &ghci_sender,
+                            &opts.watch,
+                            &opts.file_classifier,
+                            expected,
+                        )
+                        .await
+                        .map_err(|error| format!("{error:?}"));
+                        let _ = ack.send(result);
                     }
                 }
             }
@@ -350,16 +370,18 @@ async fn send_event(
     startup_retry: bool,
 ) -> eyre::Result<()> {
     let states = file_states(&events)?;
-    let haskell_files = scan_haskell_files(watch)?;
+    let source_snapshot = scan_haskell_files(watch)?;
+    let haskell_files = source_snapshot.keys().cloned().collect();
     if events.is_empty() {
         tracing::debug!("No relevant file events");
     } else {
-        tracing::debug!(?events, files = haskell_files.len(), "Processed events");
+        tracing::debug!(?events, files = source_snapshot.len(), "Processed events");
         ghci_sender
             .send(WatcherEvent::Reload {
                 events,
                 states,
                 haskell_files,
+                source_snapshot,
                 startup_retry,
             })
             .await?;
@@ -367,10 +389,47 @@ async fn send_event(
     Ok(())
 }
 
-/// Take a fresh snapshot instead of relying on notification ordering. Files can
+/// Re-scan at the publication boundary. A mismatch both suppresses the stale result and creates
+/// follow-up work, independently of whether the debounced notification has arrived yet.
+async fn validate_source_snapshot(
+    ghci_sender: &mpsc::Sender<WatcherEvent>,
+    watch: &[NormalPath],
+    file_classifier: &FileClassifier,
+    expected: SourceSnapshot,
+) -> eyre::Result<bool> {
+    let current = scan_haskell_files(watch)?;
+    let changed_paths = expected
+        .keys()
+        .chain(current.keys())
+        .filter(|path| expected.get(*path) != current.get(*path))
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let mut events = BTreeSet::new();
+    for path in changed_paths {
+        let event = if current.contains_key(&path) {
+            FileEvent::Modify(path)
+        } else {
+            FileEvent::Remove(path)
+        };
+        if file_classifier.is_potentially_relevant(&event)? {
+            events.insert(event);
+        }
+    }
+    if events.is_empty() {
+        return Ok(true);
+    }
+    tracing::info!(
+        files = events.len(),
+        "Compilation source snapshot changed; suppressing its error log and scheduling a follow-up"
+    );
+    send_event(ghci_sender, watch, events, false).await?;
+    Ok(false)
+}
+
+/// Take a fresh content snapshot instead of relying on notification ordering. Files can
 /// appear without an individual event (notably when a whole directory is created).
-fn scan_haskell_files(roots: &[NormalPath]) -> eyre::Result<BTreeSet<Utf8PathBuf>> {
-    fn visit(path: &std::path::Path, files: &mut BTreeSet<Utf8PathBuf>) -> eyre::Result<()> {
+fn scan_haskell_files(roots: &[NormalPath]) -> eyre::Result<SourceSnapshot> {
+    fn visit(path: &std::path::Path, files: &mut SourceSnapshot) -> eyre::Result<()> {
         let metadata = match std::fs::metadata(path) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
@@ -383,13 +442,14 @@ fn scan_haskell_files(roots: &[NormalPath]) -> eyre::Result<BTreeSet<Utf8PathBuf
         } else {
             let path = Utf8PathBuf::try_from(path.to_path_buf())?;
             if is_haskell_source_file(&path) {
-                files.insert(path);
+                let state = FileState::capture(&path)?;
+                files.insert(path, state);
             }
         }
         Ok(())
     }
 
-    let mut files = BTreeSet::new();
+    let mut files = SourceSnapshot::new();
     for root in roots {
         visit(root.as_std_path(), &mut files)?;
     }
