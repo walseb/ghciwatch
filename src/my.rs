@@ -1,12 +1,12 @@
-use std::fs::{File, OpenOptions};
 use std::os::fd::AsRawFd;
-use std::path::{Path, PathBuf};
+use std::os::unix::fs::MetadataExt;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use eyre::Context;
-use nix::fcntl::{flock, FlockArg};
+use nix::sys::stat::fstat;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::io::BufReader;
@@ -44,18 +44,28 @@ impl EvalBarrier {
     }
 }
 
-/// Owns both the advisory lock and the socket pathname. The lock is still held
-/// while `drop` removes the socket, so a successor cannot remove a new socket.
+/// Owns one bound pathname generation. A newer ghciwatch may replace the pathname;
+/// inode checks prevent an older generation from deleting its successor's socket.
 struct SocketLease {
     path: PathBuf,
-    _lock: File,
+    device: u64,
+    inode: u64,
 }
 
 impl Drop for SocketLease {
     fn drop(&mut self) {
-        if let Err(error) = std::fs::remove_file(&self.path) {
-            if error.kind() != std::io::ErrorKind::NotFound {
-                tracing::warn!(path = %self.path.display(), %error, "Failed to remove eval socket");
+        match std::fs::metadata(&self.path) {
+            Ok(metadata) if metadata.dev() == self.device && metadata.ino() == self.inode => {
+                if let Err(error) = std::fs::remove_file(&self.path) {
+                    if error.kind() != std::io::ErrorKind::NotFound {
+                        tracing::warn!(path = %self.path.display(), %error, "Failed to remove eval socket");
+                    }
+                }
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                tracing::warn!(path = %self.path.display(), %error, "Failed to inspect eval socket")
             }
         }
     }
@@ -66,49 +76,25 @@ pub(crate) async fn spawn(
     barrier: Arc<EvalBarrier>,
     path: PathBuf,
 ) -> eyre::Result<()> {
-    let lock_path = path.with_extension("lock");
-
-    // The eval endpoint is optional when another ghciwatch session already owns it.
-    // Never wait for that session: doing so would leave this session's initialized GHCi
-    // manager unable to consume the file events produced by its watcher.
-    let Some(lock) = tokio::task::spawn_blocking(move || try_acquire_lock(&lock_path))
-        .await
-        .wrap_err("Eval socket lock task failed")??
-    else {
-        tracing::info!(
-            path = %path.display(),
-            "Another ghciwatch session owns the eval socket; continuing without executable eval"
-        );
-        return Ok(());
-    };
-
-    // Only the lock owner may remove this path. It may remain after an
-    // unclean shutdown, but cannot belong to a live cooperating process.
+    // The newest session must own the public endpoint, just as it owns the other
+    // process-global service sockets. Existing connections to an older unlinked
+    // listener remain valid, while new clients reach this session.
     match std::fs::remove_file(&path) {
-        Ok(()) => tracing::debug!(path = %path.display(), "Removed stale eval socket"),
+        Ok(()) => tracing::debug!(path = %path.display(), "Replaced existing eval socket"),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error).wrap_err("Failed to remove stale eval socket"),
+        Err(error) => return Err(error).wrap_err("Failed to replace eval socket"),
     }
 
     let listener = UnixListener::bind(&path)
         .wrap_err_with(|| format!("Failed to bind eval socket {}", path.display()))?;
-    let lease = SocketLease { path, _lock: lock };
+    let stat = fstat(listener.as_raw_fd()).wrap_err("Failed to identify bound eval socket")?;
+    let lease = SocketLease {
+        path,
+        device: stat.st_dev,
+        inode: stat.st_ino,
+    };
     tokio::spawn(run(listener, lease, ghci, barrier));
     Ok(())
-}
-
-fn try_acquire_lock(path: &Path) -> eyre::Result<Option<File>> {
-    let lock = OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .open(path)
-        .wrap_err_with(|| format!("Failed to open {}", path.display()))?;
-    match flock(lock.as_raw_fd(), FlockArg::LockExclusiveNonblock) {
-        Ok(()) => Ok(Some(lock)),
-        Err(nix::errno::Errno::EWOULDBLOCK) => Ok(None),
-        Err(error) => Err(error).wrap_err_with(|| format!("Failed to lock {}", path.display())),
-    }
 }
 
 async fn run(
