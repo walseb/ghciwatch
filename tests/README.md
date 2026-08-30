@@ -24,6 +24,10 @@ So a test like `can_detect_compilation_failure` will expand into tests
 `can_detect_compilation_failure_967`, `can_detect_compilation_failure_984`,
 `can_detect_compilation_failure_9102`, and so on.
 
+Tests that only need the compiler already selected in the runtime environment can use
+`#[test_harness::test(current)]`. This generates one test and obtains its version from
+`ghc --numeric-version` instead of expanding over `$GHC_VERSIONS`.
+
 
 ## Feedback speed / reliability tradeoff
 

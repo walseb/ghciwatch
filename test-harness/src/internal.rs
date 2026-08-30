@@ -38,12 +38,12 @@ thread_local! {
 /// temporary directory `GhciWatch` created.
 pub async fn wrap_test(
     test: impl Future<Output = ()> + Send + 'static,
-    ghc_version: &'static str,
+    ghc_version: impl Into<String>,
     test_name: &'static str,
     cargo_target_tmpdir: &'static str,
 ) {
     GHC_VERSION.with(|tmpdir| {
-        *tmpdir.borrow_mut() = ghc_version.to_owned();
+        *tmpdir.borrow_mut() = ghc_version.into();
     });
 
     match tokio::task::spawn(test).await {
@@ -65,6 +65,29 @@ pub async fn wrap_test(
             cleanup().await;
         }
     };
+}
+
+/// Runs a test using the unversioned `ghc` executable available in the runtime environment.
+pub async fn wrap_test_with_environment_ghc(
+    test: impl Future<Output = ()> + Send + 'static,
+    test_name: &'static str,
+    cargo_target_tmpdir: &'static str,
+) {
+    let output = tokio::process::Command::new("ghc")
+        .arg("--numeric-version")
+        .output()
+        .await
+        .expect("Failed to run environment GHC");
+    assert!(
+        output.status.success(),
+        "Environment GHC failed to report its version: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let ghc_version = String::from_utf8(output.stdout)
+        .expect("Environment GHC version was not UTF-8")
+        .trim()
+        .to_owned();
+    wrap_test(test, ghc_version, test_name, cargo_target_tmpdir).await;
 }
 
 /// Save the test logs in `TEMPDIR` to `cargo_target_tmpdir`.

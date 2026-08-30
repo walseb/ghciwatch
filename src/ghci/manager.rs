@@ -92,24 +92,24 @@ impl WatcherEvent {
 
     /// Remove event hints whose captured file contents have already been dispatched.
     ///
-    /// Returns `true` if neither file contents nor the complete Haskell-file snapshot changed.
+    /// Returns `true` if neither file contents nor the complete Haskell-source snapshot changed.
     fn discard_applied(
         &mut self,
         applied_states: &BTreeMap<Utf8PathBuf, FileState>,
-        applied_haskell_files: Option<&BTreeSet<Utf8PathBuf>>,
+        applied_source_snapshot: Option<&SourceSnapshot>,
     ) -> bool {
         match self {
             Self::Reload {
                 events,
                 states,
-                haskell_files,
+                source_snapshot,
                 ..
             } => {
                 events.retain(|event| {
                     states.get(event.as_path()) != applied_states.get(event.as_path())
                 });
                 events.is_empty()
-                    && applied_haskell_files.is_some_and(|applied| applied == haskell_files)
+                    && applied_source_snapshot.is_some_and(|applied| applied == source_snapshot)
             }
         }
     }
@@ -117,16 +117,16 @@ impl WatcherEvent {
     fn mark_applied(
         &self,
         applied_states: &mut BTreeMap<Utf8PathBuf, FileState>,
-        applied_haskell_files: &mut Option<BTreeSet<Utf8PathBuf>>,
+        applied_source_snapshot: &mut Option<SourceSnapshot>,
     ) {
         match self {
             Self::Reload {
                 states,
-                haskell_files,
+                source_snapshot,
                 ..
             } => {
                 applied_states.extend(states.clone());
-                *applied_haskell_files = Some(haskell_files.clone());
+                *applied_source_snapshot = Some(source_snapshot.clone());
             }
         }
     }
@@ -247,12 +247,12 @@ pub async fn run_ghci(
         command_handles: Vec::new(),
         memory_watchdog,
         applied_states: BTreeMap::new(),
-        applied_haskell_files: None,
+        applied_source_snapshot: None,
     };
     if let Some(event) = startup_applied_event {
         event.mark_applied(
             &mut manager.applied_states,
-            &mut manager.applied_haskell_files,
+            &mut manager.applied_source_snapshot,
         );
     }
     manager.run().await
@@ -332,10 +332,12 @@ struct GhciManager {
     /// Background `async:` before-reload shell hooks owned by the manager.
     command_handles: Vec<tokio::task::JoinHandle<eyre::Result<ExitStatus>>>,
     memory_watchdog: tokio::time::Interval,
-    /// File states represented by the last successfully completed dispatch.
+    /// Event-path states represented by the last successfully completed dispatch.
     applied_states: BTreeMap<Utf8PathBuf, FileState>,
-    /// Complete watched-source snapshot represented by the last completed dispatch.
-    applied_haskell_files: Option<BTreeSet<Utf8PathBuf>>,
+    /// Complete watched-source contents represented by the last completed dispatch.
+    /// This must retain hashes, not only the path set: publication-suppression follow-ups can have
+    /// duplicate event hints while still carrying a newer authoritative source snapshot.
+    applied_source_snapshot: Option<SourceSnapshot>,
 }
 
 /// Result of [`GhciManager::wait_for_event`].
@@ -396,7 +398,7 @@ impl GhciManager {
                     ref mut exited_receiver,
                     ref mut memory_watchdog,
                     ref applied_states,
-                    ref applied_haskell_files,
+                    ref applied_source_snapshot,
                     ..
                 } = *self;
                 tokio::select! {
@@ -411,7 +413,7 @@ impl GhciManager {
                                 tracing::debug!(?event, "Received ghci event from watcher");
                                 if event.discard_applied(
                                     applied_states,
-                                    applied_haskell_files.as_ref(),
+                                    applied_source_snapshot.as_ref(),
                                 ) {
                                     tracing::debug!("Discarding watcher event already applied to GHCi");
                                     continue;
@@ -471,7 +473,7 @@ impl GhciManager {
                         RetryResult::Restarted(Some(event)) => {
                             event.mark_applied(
                                 &mut self.applied_states,
-                                &mut self.applied_haskell_files,
+                                &mut self.applied_source_snapshot,
                             );
                             Ok(WaitResult::Restarted)
                         }
@@ -534,7 +536,7 @@ impl GhciManager {
                 ref mut memory_watchdog,
                 interrupt_reloads,
                 ref mut applied_states,
-                ref mut applied_haskell_files,
+                ref mut applied_source_snapshot,
                 ..
             } = *self;
             break tokio::select! {
@@ -661,7 +663,7 @@ impl GhciManager {
                     match ret? {
                         Ok(()) => {
                             tracing::debug!("Finished dispatching ghci event");
-                            event.mark_applied(applied_states, applied_haskell_files);
+                            event.mark_applied(applied_states, applied_source_snapshot);
                             None
                         }
                         Err(err) if is_broken_pipe(&err) || is_recovery_failure(&err) => {
@@ -722,7 +724,7 @@ impl GhciManager {
                     RetryResult::Restarted(Some(restart_event)) => {
                         restart_event.mark_applied(
                             &mut self.applied_states,
-                            &mut self.applied_haskell_files,
+                            &mut self.applied_source_snapshot,
                         );
                     }
                     RetryResult::Restarted(None) => {}
@@ -742,7 +744,7 @@ impl GhciManager {
         if let Some(mut pending_event) = pending_event {
             drain_pending(&mut pending_event, &mut self.watcher_receiver);
             if !pending_event
-                .discard_applied(&self.applied_states, self.applied_haskell_files.as_ref())
+                .discard_applied(&self.applied_states, self.applied_source_snapshot.as_ref())
             {
                 return Ok(HandleResult::Interrupted(pending_event));
             }
@@ -951,7 +953,7 @@ async fn wait_and_restart(
 
     let mut pending_event = initial_event;
     let mut attempted_states = BTreeMap::new();
-    let mut attempted_haskell_files = None;
+    let mut attempted_source_snapshot = None;
     let mut first_retry = true;
 
     loop {
@@ -981,7 +983,8 @@ async fn wait_and_restart(
             loop {
                 if let Some(mut event) = pending_event.take() {
                     drain_pending(&mut event, watcher_receiver);
-                    if !event.discard_applied(&attempted_states, attempted_haskell_files.as_ref()) {
+                    if !event.discard_applied(&attempted_states, attempted_source_snapshot.as_ref())
+                    {
                         pending_event = Some(event);
                         break;
                     }
@@ -1039,7 +1042,7 @@ async fn wait_and_restart(
             .unwrap_or_default();
         if let Some(event) = pending_event.take() {
             // This exact watched state already produced a complete replacement attempt.
-            event.mark_applied(&mut attempted_states, &mut attempted_haskell_files);
+            event.mark_applied(&mut attempted_states, &mut attempted_source_snapshot);
         }
 
         // Events can arrive while replacement initialization owns the GHCi protocol. Pull all of
@@ -1051,7 +1054,7 @@ async fn wait_and_restart(
             }
         }
         if pending_event.as_mut().is_some_and(|event| {
-            event.discard_applied(&attempted_states, attempted_haskell_files.as_ref())
+            event.discard_applied(&attempted_states, attempted_source_snapshot.as_ref())
         }) {
             pending_event = None;
         }
@@ -1173,8 +1176,8 @@ mod tests {
 
         let first = event(&path);
         let mut applied_states = BTreeMap::new();
-        let mut applied_haskell_files = None;
-        first.mark_applied(&mut applied_states, &mut applied_haskell_files);
+        let mut applied_source_snapshot = None;
+        first.mark_applied(&mut applied_states, &mut applied_source_snapshot);
 
         // Keep the replacement the same length to ensure the content hash, rather than only file
         // size (or a coarse timestamp), distinguishes the edit.
@@ -1182,12 +1185,56 @@ mod tests {
         let latest = event(&path);
         let mut delayed_duplicate = latest.clone();
         assert!(
-            !delayed_duplicate.discard_applied(&applied_states, applied_haskell_files.as_ref(),)
+            !delayed_duplicate.discard_applied(&applied_states, applied_source_snapshot.as_ref(),)
         );
 
-        latest.mark_applied(&mut applied_states, &mut applied_haskell_files);
-        assert!(delayed_duplicate.discard_applied(&applied_states, applied_haskell_files.as_ref(),));
+        latest.mark_applied(&mut applied_states, &mut applied_source_snapshot);
+        assert!(
+            delayed_duplicate.discard_applied(&applied_states, applied_source_snapshot.as_ref(),)
+        );
 
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn newer_complete_snapshot_is_not_discarded_with_duplicate_event_hints() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "ghciwatch-manager-snapshot-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let event_path = camino::Utf8PathBuf::try_from(directory.join("Event.hs")).unwrap();
+        let other_path = camino::Utf8PathBuf::try_from(directory.join("Other.hs")).unwrap();
+        std::fs::write(&event_path, "module Event where\n").unwrap();
+        std::fs::write(&other_path, "module Other where\nvalue = 1\n").unwrap();
+
+        let mut first = event(&event_path);
+        let WatcherEvent::Reload {
+            haskell_files,
+            source_snapshot,
+            ..
+        } = &mut first;
+        haskell_files.insert(other_path.clone());
+        source_snapshot.insert(other_path.clone(), FileState::capture(&other_path).unwrap());
+
+        let mut applied_states = BTreeMap::new();
+        let mut applied_source_snapshot = None;
+        first.mark_applied(&mut applied_states, &mut applied_source_snapshot);
+
+        // A publication-time synthetic follow-up can repeat an already-applied event hint while a
+        // different watched source is what invalidated the complete compilation snapshot.
+        std::fs::write(&other_path, "module Other where\nvalue = 2\n").unwrap();
+        let mut follow_up = first.clone();
+        let WatcherEvent::Reload {
+            source_snapshot, ..
+        } = &mut follow_up;
+        source_snapshot.insert(other_path.clone(), FileState::capture(&other_path).unwrap());
+        assert!(!follow_up.discard_applied(&applied_states, applied_source_snapshot.as_ref(),));
+
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }

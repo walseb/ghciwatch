@@ -17,10 +17,11 @@ use syn::ItemFn;
 
 /// Runs a test asynchronously in the `tokio` current-thread runtime with `tracing` enabled.
 ///
-/// One test is generated for each GHC version listed in the `$GHC_VERSIONS` environment variable
-/// at compile-time.
+/// By default, one test is generated for each GHC version listed in the `$GHC_VERSIONS`
+/// environment variable at compile-time. Use `#[test(current)]` to generate one test using the
+/// unversioned `ghc` executable present in the runtime environment.
 #[proc_macro_attribute]
-pub fn test(_attr: TokenStream, item: TokenStream) -> TokenStream {
+pub fn test(attr: TokenStream, item: TokenStream) -> TokenStream {
     // Parse annotated function
     let mut function: ItemFn = parse(item).expect("Could not parse item as function");
 
@@ -37,6 +38,14 @@ pub fn test(_attr: TokenStream, item: TokenStream) -> TokenStream {
         .expect("Could not parse quoted attributes")
         .0,
     );
+
+    if !attr.is_empty() {
+        let mode: Ident = parse(attr).expect("Expected `current`");
+        if mode != "current" {
+            panic!("Unknown test mode `{mode}`; expected `current`");
+        }
+        return make_current_test_fn(function).to_token_stream().into();
+    }
 
     let ghc_versions = match option_env!("GHC_VERSIONS") {
         None => {
@@ -93,5 +102,27 @@ fn make_test_fn(mut function: ItemFn, ghc_version: &str) -> ItemFn {
     // Replace function body
     *function.block = new_body;
 
+    function
+}
+
+fn make_current_test_fn(mut function: ItemFn) -> ItemFn {
+    let stmts = function.block.stmts;
+    let test_name = function.sig.ident.to_string();
+    let new_body = parse::<Block>(
+        quote! {
+            {
+                ::test_harness::internal::wrap_test_with_environment_ghc(
+                    async {
+                        #(#stmts);*
+                    },
+                    #test_name,
+                    env!("CARGO_TARGET_TMPDIR"),
+                ).await;
+            }
+        }
+        .into(),
+    )
+    .expect("Could not parse function body");
+    *function.block = new_body;
     function
 }

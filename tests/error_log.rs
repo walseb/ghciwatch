@@ -441,7 +441,7 @@ async fn error_log_startup_failure() {
 
 /// A completed reload is not published when watched source changed after its event snapshot. The
 /// publication-time rescan must also enqueue a follow-up which eventually recreates the error file.
-#[test]
+#[test(current)]
 async fn suppresses_stale_error_log_and_publishes_follow_up() {
     let mut session = GhciWatchBuilder::new("tests/data/simple")
         .with_args([
@@ -494,6 +494,70 @@ async fn suppresses_stale_error_log_and_publishes_follow_up() {
         .wait_for_path(session.startup_timeout, &session.path("published-current"))
         .await
         .expect("mandatory follow-up eventually publishes compile.txt");
+    let contents = session
+        .fs()
+        .read(session.path("compile.txt"))
+        .await
+        .expect("follow-up leaves compile.txt present");
+    assert_eq!(contents, "All good (1 module)\n");
+}
+
+/// Interrupting a parallel reload after its first error must not let the publication-time
+/// follow-up be discarded. Once edits stop, the follow-up must publish before the manager idles.
+#[test(current)]
+async fn interrupt_on_error_still_publishes_quiescent_follow_up() {
+    let mut session = GhciWatchBuilder::new("tests/data/simple")
+        .with_args([
+            "--error-file",
+            "compile.txt",
+            "--interrupt-on-error",
+            "--no-interrupt-reloads",
+            "--before-reload-shell",
+            "rm -f compile.txt",
+            "--before-interrupt",
+            "sh -c 'touch compilation-interrupted; sleep 2'",
+            "--after-reload-shell",
+            "sh -c 'if test -e compile.txt; then touch published-current; else touch suppressed-stale; fi'",
+        ])
+        .with_startup_timeout(std::time::Duration::from_secs(25))
+        .start()
+        .await
+        .expect("ghciwatch starts");
+    session
+        .wait_until_ready()
+        .await
+        .expect("ghciwatch is ready");
+
+    let source = session.path("src/MyLib.hs");
+    session
+        .fs()
+        .replace(&source, "example = \"example\"", "example = staleFailure")
+        .await
+        .expect("can trigger a failing reload");
+    session
+        .fs()
+        .wait_for_path(
+            session.startup_timeout,
+            &session.path("compilation-interrupted"),
+        )
+        .await
+        .expect("the first error starts interrupt recovery");
+    session
+        .fs()
+        .replace(&source, "example = staleFailure", "example = \"example\"")
+        .await
+        .expect("can supersede the interrupted compilation");
+
+    session
+        .fs()
+        .wait_for_path(session.startup_timeout, &session.path("suppressed-stale"))
+        .await
+        .expect("the interrupted stale attempt does not publish compile.txt");
+    session
+        .fs()
+        .wait_for_path(session.startup_timeout, &session.path("published-current"))
+        .await
+        .expect("the mandatory quiescent follow-up publishes compile.txt");
     let contents = session
         .fs()
         .read(session.path("compile.txt"))
