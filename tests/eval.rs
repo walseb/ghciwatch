@@ -1,5 +1,8 @@
 use indoc::indoc;
 
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::UnixStream;
+
 use test_harness::test;
 use test_harness::BaseMatcher;
 use test_harness::Fs;
@@ -7,6 +10,41 @@ use test_harness::FullGhcVersion;
 use test_harness::GhcVersion;
 use test_harness::GhciWatchBuilder;
 use test_harness::Matcher;
+
+#[test]
+async fn eval_socket_reload_uses_reload_lifecycle() {
+    let mut session = GhciWatchBuilder::new("tests/data/simple")
+        .with_arg("--no-auto-reload")
+        .start()
+        .await
+        .expect("ghciwatch starts");
+    session
+        .wait_until_ready()
+        .await
+        .expect("ghciwatch didn't start in time");
+
+    for command in [":r", ":reload"] {
+        session.clear_events();
+        let mut socket = UnixStream::connect(session.path("ghciwatch-eval.sock"))
+            .await
+            .expect("connects to eval socket");
+        socket
+            .write_all(format!("{command}⋳").as_bytes())
+            .await
+            .expect("writes reload command");
+        let mut response = Vec::new();
+        socket
+            .read_to_end(&mut response)
+            .await
+            .expect("reads reload response");
+        assert_eq!(response, "⋳".as_bytes());
+
+        session
+            .wait_for_log(BaseMatcher::reload_completes())
+            .await
+            .expect("eval socket command uses reload lifecycle");
+    }
+}
 
 /// Test that `ghciwatch` can eval commands and invalidate its cache of eval commands.
 #[test]

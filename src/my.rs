@@ -156,10 +156,12 @@ async fn handle_connection(
     // of GHCi's pipes and a reload arriving during an eval waits for it to finish.
     let operation_guard = barrier.begin_operation().await;
     let mut ghci = ghci.lock().await;
-    let output = match eval_socket_command(&mut ghci, command)
-        .await
-        .wrap_err("Failed to evaluate socket command")
-    {
+    let result = if is_reload_command(command) {
+        ghci.reload_from_eval().await.map(|()| String::new())
+    } else {
+        eval_socket_command(&mut ghci, command).await
+    };
+    let output = match result.wrap_err("Failed to evaluate socket command") {
         Ok(output) => output,
         Err(error) => {
             tracing::error!(?error, "Eval socket command failed");
@@ -205,6 +207,10 @@ fn is_disconnected_client(error: &std::io::Error) -> bool {
             | std::io::ErrorKind::ConnectionReset
             | std::io::ErrorKind::NotConnected
     )
+}
+
+fn is_reload_command(command: &str) -> bool {
+    matches!(command.trim(), ":r" | ":reload")
 }
 
 async fn eval_socket_command(ghci: &mut Ghci, command: &str) -> eyre::Result<String> {

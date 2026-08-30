@@ -22,7 +22,7 @@ use crate::clonable_command::ClonableCommand;
 use crate::shutdown::ShutdownHandle;
 use tokio::sync::oneshot;
 
-const BEFORE_SIGNAL_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+pub(super) const BEFORE_SIGNAL_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct GhciProcess {
     pub shutdown: ShutdownHandle,

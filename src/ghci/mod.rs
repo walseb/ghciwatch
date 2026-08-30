@@ -89,6 +89,7 @@ use crate::cli::ExperimentalFeature;
 use crate::cli::Opts;
 use crate::clonable_command::ClonableCommand;
 use crate::event_filter::FileEvent;
+use crate::event_filter::SourceSnapshot;
 use crate::format_bulleted_list;
 use crate::hooks;
 use crate::hooks::HookOpts;
@@ -97,6 +98,7 @@ use crate::ignore::GlobMatcher;
 use crate::incremental_reader::IncrementalReader;
 use crate::normal_path::NormalPath;
 use crate::shutdown::ShutdownHandle;
+use crate::watcher::WatcherCommand;
 use crate::CommandExt;
 use crate::StringCase;
 
@@ -185,6 +187,16 @@ pub struct GhciOpts {
 }
 
 impl GhciOpts {
+    /// Allow every synchronous before-kill command to reach its own timeout before the shutdown
+    /// manager starts cancelling tasks. Cancelling [`GhciProcess`] earlier would bypass its
+    /// complete-tree kill and leave only the child handle's drop behavior.
+    pub fn shutdown_timeout(&self, base_timeout: Duration) -> Duration {
+        base_timeout.saturating_add(
+            process::BEFORE_SIGNAL_COMMAND_TIMEOUT
+                .saturating_mul(self.before_kill.len().try_into().unwrap_or(u32::MAX)),
+        )
+    }
+
     /// Construct options for [`Ghci`] from parsed command-line interface arguments as [`Opts`].
     ///
     /// This extracts the bits of an [`Opts`] struct relevant to the [`Ghci`] session without
@@ -336,8 +348,11 @@ pub struct Ghci {
     targets: ModuleSet,
     /// Last filesystem snapshot successfully applied to GHCi's target set.
     known_haskell_files: BTreeSet<NormalPath>,
-    /// A replacement may return to its prompt after failing to compile. Retain that failure so
-    /// the next relevant edit restarts the incomplete session even with `--no-auto-reload`.
+    /// Snapshot and watcher channel used to validate a watcher-triggered compilation at publication.
+    publication_snapshot: Option<(SourceSnapshot, mpsc::Sender<WatcherCommand>)>,
+    /// A replacement may return to its prompt after failing to compile. Retain that failure so a
+    /// `--no-auto-reload` session can restart on the next relevant edit; normal sessions recover by
+    /// reloading the still-usable GHCi process.
     initialization_failure: Option<CompilationLog>,
     /// Eval commands, if `opts.enable_eval` is set.
     eval_commands: BTreeMap<NormalPath, Vec<EvalCommand>>,
@@ -561,6 +576,7 @@ impl Ghci {
             classifier,
             targets: Default::default(),
             known_haskell_files: Default::default(),
+            publication_snapshot: None,
             initialization_failure: None,
             eval_commands: Default::default(),
             search_paths: ShowPaths {
@@ -678,7 +694,11 @@ impl Ghci {
                 })
             })
             .collect::<eyre::Result<BTreeSet<_>>>()?;
-        let recovery_paths = if self.initialization_failure.is_some() {
+        // A live GHCi which reached its prompt after startup compilation errors can recover with an
+        // ordinary `:reload`; restarting Cabal for every fixing edit is both unnecessary and slow.
+        // `--no-auto-reload` still needs an explicit recovery action because ordinary reload actions
+        // are suppressed below, so retain the fresh-session fallback for that mode.
+        let recovery_paths = if self.initialization_failure.is_some() && !self.opts.auto_reload {
             events
                 .iter()
                 .filter(|event| is_haskell_source_file(event.as_path()))
@@ -735,6 +755,45 @@ impl Ghci {
         Ok(actions)
     }
 
+    /// Run an eval-socket `:r`/`:reload` through the normal reload lifecycle and progress monitor.
+    #[instrument(skip_all, level = "debug", name = "reload")]
+    pub(crate) async fn reload_from_eval(&mut self) -> eyre::Result<()> {
+        let start_instant = Instant::now();
+        let mut log = CompilationLog::default();
+        self.opts.clear();
+        let affected_paths = format_bulleted_list(&self.known_haskell_files);
+
+        let reload_result: eyre::Result<()> = async {
+            self.run_hooks(LifecycleEvent::Reload(hooks::When::Before), &mut log)
+                .await?;
+            let status = self.reload_targets(&mut log, &affected_paths).await?;
+            if status != CompilationWaitStatus::Error {
+                self.refresh_eval_commands().await?;
+            }
+            Ok(())
+        }
+        .await;
+
+        let ghci_available = match &reload_result {
+            Ok(()) => true,
+            Err(err) => !error_is_broken_pipe(err) && !self.recovery_restart_required,
+        };
+        let operation_succeeded = reload_result.is_ok();
+        let finish_result = self
+            .finish_compilation(
+                start_instant,
+                &mut log,
+                [LifecycleEvent::Reload(hooks::When::After)],
+                ghci_available,
+                operation_succeeded,
+            )
+            .await;
+        self.prune_command_handles();
+
+        reload_result?;
+        finish_result
+    }
+
     /// Synchronize watched targets and optionally reload this `ghci` session.
     ///
     /// This may fully restart the `ghci` process.
@@ -746,8 +805,11 @@ impl Ghci {
         &mut self,
         events: BTreeSet<FileEvent>,
         haskell_files: BTreeSet<Utf8PathBuf>,
+        source_snapshot: SourceSnapshot,
         kind_sender: watch::Sender<GhciReloadKind>,
+        watcher_command_sender: mpsc::Sender<WatcherCommand>,
     ) -> eyre::Result<()> {
+        self.publication_snapshot = Some((source_snapshot, watcher_command_sender));
         let start_instant = Instant::now();
         let haskell_files = haskell_files
             .into_iter()
@@ -848,44 +910,11 @@ impl Ghci {
                     "Reloading ghci:\n{}",
                     format_bulleted_list(&actions.needs_reload)
                 );
-                // Like `:unadd`, an ordinary reload can wedge inside GHC. It is not an executable
-                // eval, so monitor the output read itself and interrupt only if compilation goes quiet.
-                let status = self
-                    .stdin
-                    .reload(
-                        &mut self.stdout,
-                        &mut log,
-                        COMPILATION_INACTIVITY_TIMEOUT,
-                        self.opts.interrupt_on_error,
-                    )
-                    .await?;
-                match status {
-                    CompilationWaitStatus::Complete => {
-                        self.refresh_eval_commands_for_paths(&actions.needs_reload).await?;
-                    }
-                    CompilationWaitStatus::Error => {
-                        tracing::info!("Interrupting parallel GHCi reload after first error");
-                        self.send_sigint().await?;
-                        self.stdout.capture_stderr(&mut self.stdin.stdin, &mut log).await?;
-                        log.mark_failed();
-                    }
-                    CompilationWaitStatus::Inactive => {
-                        print_ghciwatch_error(
-                            "GHCi reload stopped reporting compilation progress",
-                            &format!(
-                                "Component: reload (:reload)\nInactivity timeout: {COMPILATION_INACTIVITY_TIMEOUT:?}\nProcess group ID: {}\nWorking directory: {}\nCommand: {}\nChanged paths:\n{}\nRecovery: interrupting GHCi with process-group SIGINT, then retrying :reload with a {RECOVERY_COMPILATION_INACTIVITY_TIMEOUT:?} inactivity timeout",
-                                self.process_group_id, self.search_paths.cwd, self.opts.command,
-                                format_bulleted_list(&actions.needs_reload),
-                            ),
-                        );
-                        tracing::warn!(
-                            "GHCi reported no reload compilation progress for {COMPILATION_INACTIVITY_TIMEOUT:?}; interrupting reload"
-                        );
-                        self.interrupt_and_retry_reload(&mut log, "reload (:reload)")
-                            .await
-                            .wrap_err("Failed to recover from inactive reload")?;
-                        self.refresh_eval_commands_for_paths(&actions.needs_reload).await?;
-                    }
+                let affected_paths = format_bulleted_list(&actions.needs_reload);
+                let status = self.reload_targets(&mut log, &affected_paths).await?;
+                if status != CompilationWaitStatus::Error {
+                    self.refresh_eval_commands_for_paths(&actions.needs_reload)
+                        .await?;
                 }
             }
             Ok(())
@@ -921,6 +950,55 @@ impl Ghci {
         Ok(())
     }
 
+    /// Submit `:reload` with the compilation-progress timeout and its SIGINT recovery path.
+    async fn reload_targets(
+        &mut self,
+        log: &mut CompilationLog,
+        affected_paths: &str,
+    ) -> eyre::Result<CompilationWaitStatus> {
+        // Unlike executable evals, compilation has no absolute timeout. Interrupt only after GHCi
+        // stops reporting `Compiling` progress.
+        let status = self
+            .stdin
+            .reload(
+                &mut self.stdout,
+                log,
+                COMPILATION_INACTIVITY_TIMEOUT,
+                self.opts.interrupt_on_error,
+            )
+            .await?;
+        match status {
+            CompilationWaitStatus::Complete => {}
+            CompilationWaitStatus::Error => {
+                tracing::info!("Interrupting parallel GHCi reload after first error");
+                self.send_sigint().await?;
+                self.stdout
+                    .capture_stderr(&mut self.stdin.stdin, log)
+                    .await?;
+                log.mark_failed();
+            }
+            CompilationWaitStatus::Inactive => {
+                print_ghciwatch_error(
+                    "GHCi reload stopped reporting compilation progress",
+                    &format!(
+                        "Component: reload (:reload)\nInactivity timeout: {COMPILATION_INACTIVITY_TIMEOUT:?}\nProcess group ID: {}\nWorking directory: {}\nCommand: {}\nChanged paths:\n{}\nRecovery: interrupting GHCi with process-group SIGINT, then retrying :reload with a {RECOVERY_COMPILATION_INACTIVITY_TIMEOUT:?} inactivity timeout",
+                        self.process_group_id,
+                        self.search_paths.cwd,
+                        self.opts.command,
+                        affected_paths,
+                    ),
+                );
+                tracing::warn!(
+                    "GHCi reported no reload compilation progress for {COMPILATION_INACTIVITY_TIMEOUT:?}; interrupting reload"
+                );
+                self.interrupt_and_retry_reload(log, "reload (:reload)")
+                    .await
+                    .wrap_err("Failed to recover from inactive reload")?;
+            }
+        }
+        Ok(status)
+    }
+
     /// Balance a reload attempt cancelled by a newer filesystem event.
     pub(crate) async fn finish_interrupted_reload(
         &mut self,
@@ -928,6 +1006,7 @@ impl Ghci {
     ) -> eyre::Result<()> {
         let event = LifecycleEvent::Reload(hooks::When::After);
         let mut log = CompilationLog::default();
+        self.publication_snapshot = None;
         let result = if ghci_available {
             self.run_hooks(event, &mut log).await
         } else {
@@ -1000,7 +1079,9 @@ impl Ghci {
                 return Err(err);
             }
         };
+        let publication_snapshot = self.publication_snapshot.take();
         let _ = std::mem::replace(self, new);
+        self.publication_snapshot = publication_snapshot;
         self.initialize(
             log,
             [
@@ -1095,7 +1176,9 @@ impl Ghci {
                 return Err(err);
             }
         };
+        let publication_snapshot = self.publication_snapshot.take();
         let _ = std::mem::replace(self, new);
+        self.publication_snapshot = publication_snapshot;
         // `initialize` itself balances all events on both compilation and protocol failures.
         self.initialize(log, events, haskell_files).await?;
 
@@ -1848,9 +1931,18 @@ impl Ghci {
         // Target synchronization followed by `:reload` may compile the same failure twice. Publish
         // each distinct diagnostic once while retaining errors unique to either operation.
         log.deduplicate_diagnostics();
+        // Validate at the publication boundary, rather than trusting notification ordering. If the
+        // source changed, the watcher also enqueues a fresh event so this attempt cannot be the final
+        // result even when its original notification is still being debounced.
+        let snapshot_result = self.compilation_snapshot_is_current().await;
+        let snapshot_current = snapshot_result.as_ref().copied().unwrap_or(false);
         // Allow hooks to consume the error log by updating it before running the hooks. A failure
-        // to publish the log must not suppress lifecycle completion notifications.
-        let error_log_result = self.write_error_log(log).await;
+        // to publish or validate the log must not suppress lifecycle completion notifications.
+        let error_log_result = match snapshot_result {
+            Ok(true) => self.write_error_log(log).await,
+            Ok(false) => Ok(()),
+            Err(error) => Err(error),
+        };
 
         let mut hooks_have_ghci = ghci_available;
         let mut hook_result = Ok(());
@@ -1879,11 +1971,16 @@ impl Ghci {
         }
 
         let event = events[N - 1];
-        let compilation_succeeded = operation_succeeded
+        let compilation_succeeded = snapshot_current
+            && operation_succeeded
             && ghci_available
             && !matches!(log.result(), Some(CompilationResult::Err));
 
-        if !compilation_succeeded {
+        if !snapshot_current {
+            tracing::info!(
+                "Compilation finished for a superseded source snapshot; waiting for follow-up"
+            );
+        } else if !compilation_succeeded {
             tracing::error!(
                 "{} failed in {:.2?}",
                 event.event_noun().first_char_to_ascii_uppercase(),
@@ -1993,6 +2090,21 @@ impl Ghci {
             }
         }
         Ok(())
+    }
+
+    async fn compilation_snapshot_is_current(&mut self) -> eyre::Result<bool> {
+        let Some((expected, sender)) = self.publication_snapshot.take() else {
+            return Ok(true);
+        };
+        let (ack, reply) = oneshot::channel();
+        sender
+            .send(WatcherCommand::ValidateSourceSnapshot { expected, ack })
+            .await
+            .wrap_err("Failed to request source snapshot validation")?;
+        reply
+            .await
+            .wrap_err("Source snapshot validator stopped")?
+            .map_err(eyre::Report::msg)
     }
 
     #[instrument(skip(self), level = "trace")]

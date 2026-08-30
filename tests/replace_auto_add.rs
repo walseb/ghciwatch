@@ -68,3 +68,48 @@ async fn replaces_auto_add_and_then_reloads_known_source() {
         "replacement runs only for addition"
     );
 }
+
+/// A replacement generator can modify an already watched aggregate while handling a new module.
+/// The queued aggregate notification starts another lifecycle attempt, whose before-hook removes the
+/// error file; the follow-up attempt must publish the file again even when its work is redundant.
+#[test]
+async fn replacement_generated_follow_up_republishes_error_file() {
+    let mut session = GhciWatchBuilder::new("tests/data/simple")
+        .with_args([
+            "--error-file",
+            "compile.txt",
+            "--before-reload-shell",
+            "rm -f compile.txt",
+            "--replace-auto-add-shell",
+            r#"sh -c 'printf "\n-- generated aggregate update\n" >> src/MyLib.hs'"#,
+            "--after-reload-shell",
+            r#"sh -c 'echo after >> after-reload.log; if test "$(wc -l < after-reload.log)" -ge 2 && test -e compile.txt; then touch follow-up-complete; fi'"#,
+        ])
+        .with_startup_timeout(Duration::from_secs(25))
+        .start()
+        .await
+        .expect("ghciwatch starts");
+
+    session.wait_until_ready().await.unwrap();
+    session
+        .fs()
+        .write(
+            session.path("src/MyGeneratedModule.hs"),
+            "module MyGeneratedModule where\ngeneratedValue = ()\n",
+        )
+        .await
+        .expect("can create a module");
+
+    session
+        .fs()
+        .wait_for_path(
+            session.startup_timeout,
+            &session.path("follow-up-complete"),
+        )
+        .await
+        .expect("replacement-generated follow-up republishes compile.txt");
+    assert!(
+        session.path("compile.txt").exists(),
+        "compile.txt remains present after the follow-up lifecycle completes"
+    );
+}

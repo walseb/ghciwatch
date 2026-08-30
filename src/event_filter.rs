@@ -40,7 +40,7 @@ impl FileEvent {
     }
 }
 
-/// State of an event path when a debounced watcher batch was delivered.
+/// State of a path when a filesystem snapshot was captured.
 ///
 /// Haskell files include a content hash so delayed notifications for an already-compiled edit can
 /// be discarded without relying on filesystem timestamp granularity.
@@ -61,7 +61,7 @@ enum FileStateKind {
 }
 
 impl FileState {
-    fn capture(path: &Utf8Path) -> eyre::Result<Self> {
+    pub(crate) fn capture(path: &Utf8Path) -> eyre::Result<Self> {
         let metadata = match std::fs::metadata(path) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == ErrorKind::NotFound => {
@@ -128,6 +128,9 @@ pub fn file_states(events: &BTreeSet<FileEvent>) -> eyre::Result<BTreeMap<Utf8Pa
         })
         .collect()
 }
+
+/// Immutable contents-and-existence snapshot of every watched Haskell source file.
+pub type SourceSnapshot = BTreeMap<Utf8PathBuf, FileState>;
 
 /// Process a set of events into a set of [`FileEvent`]s.
 pub fn file_events_from_action(events: Vec<DebouncedEvent>) -> eyre::Result<BTreeSet<FileEvent>> {
