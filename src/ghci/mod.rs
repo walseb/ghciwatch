@@ -657,8 +657,15 @@ impl Ghci {
         log.fill_empty_summary();
         self.initialization_failure =
             matches!(log.result(), Some(CompilationResult::Err)).then(|| log.clone());
-        self.finish_compilation(start_instant, log, events, result.is_ok(), result.is_ok())
-            .await?;
+        self.finish_compilation(
+            start_instant,
+            log,
+            events,
+            result.is_ok(),
+            result.is_ok(),
+            true,
+        )
+        .await?;
 
         result
     }
@@ -793,6 +800,7 @@ impl Ghci {
                 [LifecycleEvent::Reload(hooks::When::After)],
                 ghci_available,
                 operation_succeeded,
+                true,
             )
             .await;
         self.prune_command_handles();
@@ -843,7 +851,8 @@ impl Ghci {
             let mut log = CompilationLog::default();
             // The manager has already run before-reload shell hooks for this accepted event. Even
             // when classification finds no GHCi work, publish a fresh result and complete the
-            // reload lifecycle so external consumers cannot remain in a pending state.
+            // reload lifecycle so external consumers cannot remain in a pending state. Eval and
+            // test actions belong to actual compilations, not suppressed `--no-auto-reload` edits.
             let result = self
                 .finish_compilation(
                     start_instant,
@@ -851,6 +860,7 @@ impl Ghci {
                     [LifecycleEvent::Reload(hooks::When::After)],
                     true,
                     true,
+                    false,
                 )
                 .await;
             self.prune_command_handles();
@@ -944,6 +954,7 @@ impl Ghci {
                 [LifecycleEvent::Reload(hooks::When::After)],
                 ghci_available,
                 operation_succeeded,
+                true,
             )
             .await;
 
@@ -1079,6 +1090,7 @@ impl Ghci {
                     ],
                     false,
                     false,
+                    true,
                 )
                 .await?;
                 return Err(err);
@@ -1176,7 +1188,7 @@ impl Ghci {
                 log.mark_failed_with_diagnostic(format!(
                     "Failed to start configured GHCi command: {err:#}"
                 ));
-                self.finish_compilation(Instant::now(), log, events, false, false)
+                self.finish_compilation(Instant::now(), log, events, false, false, true)
                     .await?;
                 return Err(err);
             }
@@ -1931,8 +1943,9 @@ impl Ghci {
 
     /// Finish a compilation process.
     ///
-    /// This outputs how long the compilation took (since `compilation_start`), runs eval and test
-    /// commands (if compilation succeeded), and writes the error log.
+    /// This outputs how long the compilation took (since `compilation_start`) and writes the error
+    /// log. Successful compilation attempts also run eval and test commands when
+    /// `run_post_actions` is true.
     #[instrument(skip_all, level = "trace")]
     async fn finish_compilation<const N: usize>(
         &mut self,
@@ -1941,6 +1954,7 @@ impl Ghci {
         events: [LifecycleEvent; N],
         ghci_available: bool,
         operation_succeeded: bool,
+        run_post_actions: bool,
     ) -> eyre::Result<()> {
         // Target synchronization followed by `:reload` may compile the same failure twice. Publish
         // each distinct diagnostic once while retaining errors unique to either operation.
@@ -2011,7 +2025,7 @@ impl Ghci {
 
         error_log_result?;
         hook_result?;
-        if compilation_succeeded {
+        if compilation_succeeded && run_post_actions {
             // Run the eval commands, if any.
             self.eval(log).await?;
             // Run the user-provided test command, if any.

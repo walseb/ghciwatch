@@ -43,7 +43,11 @@ async fn can_reload() {
 #[test]
 async fn can_synchronize_targets_without_auto_reload() {
     let mut session = GhciWatchBuilder::new("tests/data/simple")
-        .with_arg("--no-auto-reload")
+        .with_args([
+            "--no-auto-reload",
+            "--test-ghci",
+            "putStrLn \"test action ran\"",
+        ])
         .start()
         .await
         .expect("ghciwatch starts");
@@ -65,6 +69,12 @@ async fn can_synchronize_targets_without_auto_reload() {
     assert!(
         session.assert_logged(BaseMatcher::ghci_reload()).is_err(),
         "ghciwatch must not issue :reload for an ordinary edit"
+    );
+    assert!(
+        session
+            .assert_logged(BaseMatcher::message("test action ran"))
+            .is_err(),
+        "ghciwatch must not run test actions for a suppressed edit"
     );
 
     let new_module = session.path("src/NewModule.hs");
