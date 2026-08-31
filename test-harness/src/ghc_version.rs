@@ -28,9 +28,7 @@ impl Display for FullGhcVersion {
     }
 }
 
-/// A major version of GHC.
-///
-/// Variants of this enum will correspond to `ghcVersions` in `../../flake.nix`.
+/// A supported major version of GHC.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum GhcVersion {
     /// GHC 9.6
@@ -41,6 +39,8 @@ pub enum GhcVersion {
     Ghc910,
     /// GHC 9.12
     Ghc912,
+    /// GHC 9.14
+    Ghc914,
 }
 
 fn ghc_version_re() -> &'static Regex {
@@ -63,12 +63,14 @@ impl FromStr for GhcVersion {
             ("9", "8") => Ok(Self::Ghc98),
             ("9", "10") => Ok(Self::Ghc910),
             ("9", "12") => Ok(Self::Ghc912),
+            ("9", "14") => Ok(Self::Ghc914),
             (_, _) => Err(eyre!(
                 "Only the following GHC versions are supported:\n\
                 - 9.6\n\
                 - 9.8\n\
                 - 9.10\n\
-                - 9.12"
+                - 9.12\n\
+                - 9.14"
             )),
         }
     }
@@ -82,7 +84,8 @@ mod tests {
     fn test_parse_ghc_version() {
         assert_eq!("9.6.1".parse::<GhcVersion>().unwrap(), GhcVersion::Ghc96);
         assert_eq!("9.10.1".parse::<GhcVersion>().unwrap(), GhcVersion::Ghc910);
-        assert_eq!("9.12.1".parse::<GhcVersion>().unwrap(), GhcVersion::Ghc910);
+        assert_eq!("9.12.1".parse::<GhcVersion>().unwrap(), GhcVersion::Ghc912);
+        assert_eq!("9.14.1".parse::<GhcVersion>().unwrap(), GhcVersion::Ghc914);
 
         let _ = "9.6.1rc1"
             .parse::<GhcVersion>()

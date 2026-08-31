@@ -17,6 +17,24 @@ async fn can_load() {
         .expect("ghciwatch loads ghci");
 }
 
+/// A missing configured watch path is reported without preventing GHCi startup.
+#[test]
+async fn missing_watch_starts() {
+    let mut session = GhciWatchBuilder::new("tests/data/simple")
+        .with_args(["--watch", "does-not-exist"])
+        .start()
+        .await
+        .expect("ghciwatch starts despite the missing watch path");
+    session
+        .wait_for_log("No such file or directory")
+        .await
+        .expect("ghciwatch reports the missing watch path");
+    session
+        .wait_until_ready()
+        .await
+        .expect("ghciwatch loads GHCi despite the missing watch path");
+}
+
 /// Test that `ghciwatch` can load new modules.
 #[test]
 async fn can_load_new_module() {

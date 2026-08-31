@@ -140,24 +140,26 @@ async fn run_debouncer<T: notify::Watcher>(
 
     {
         let watcher = debouncer.watcher();
+        let mut watched = Vec::new();
         for path in &opts.watch {
-            watcher
-                .watch(path.as_std_path(), RecursiveMode::Recursive)
-                .map_err(|err| match err {
-                    notify::Error {
-                        kind: notify::ErrorKind::Io(e),
-                        ..
-                    } if e.kind() == std::io::ErrorKind::NotFound => {
-                        eyre!(
-                            "Cannot watch path that doesn't exist: {:?}",
-                            path.absolute()
-                        )
-                    }
-                    err => eyre!("{err}"),
-                })?;
+            match watcher.watch(path.as_std_path(), RecursiveMode::Recursive) {
+                Ok(()) => watched.push(path),
+                Err(notify::Error {
+                    kind: notify::ErrorKind::Io(e),
+                    ..
+                }) if e.kind() == std::io::ErrorKind::NotFound => {
+                    tracing::error!(
+                        path = ?path.absolute(),
+                        "cannot watch path because it does not exist"
+                    );
+                }
+                Err(error) => {
+                    tracing::error!(?error, path = ?path.absolute(), "cannot watch path");
+                }
+            }
         }
         let mut cache = debouncer.cache();
-        for path in &opts.watch {
+        for path in watched {
             cache.add_root(path.as_std_path(), RecursiveMode::Recursive);
         }
     }
@@ -349,7 +351,9 @@ fn process_debounced_events(event: DebounceEventResult) -> eyre::Result<BTreeSet
                     fatal_error = true;
                     tracing::error!("{err}");
                 } else {
-                    tracing::debug!("{err}");
+                    // Some backends accept a missing root and report it asynchronously. It is
+                    // nonfatal, but must remain visible at the default log level.
+                    tracing::error!("{err}");
                 }
             }
             return if fatal_error {

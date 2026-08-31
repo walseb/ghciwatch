@@ -249,7 +249,7 @@ async fn preserves_error_log_paths() {
             4 | depFunc = putStrLn "depFunc
               |                            ^
         "#]],
-        GhcVersion::Ghc912 => expect![[r#"
+        GhcVersion::Ghc912 | GhcVersion::Ghc914 => expect![[r#"
             src/SimpleDep.hs:4:20: error: [GHC-21231]
                 lexical error at character '\n'
               |
@@ -427,7 +427,7 @@ async fn error_log_startup_failure() {
             4 | depFunc = putStrLn "depFunc
               |                            ^
         "#]],
-        GhcVersion::Ghc912 => expect![[r#"
+        GhcVersion::Ghc912 | GhcVersion::Ghc914 => expect![[r#"
             src/SimpleDep.hs:4:20: error: [GHC-21231]
                 lexical error at character '\n'
               |

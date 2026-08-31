@@ -110,6 +110,13 @@ const COMPILATION_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(90);
 /// untrustworthy session is replaced.
 const RECOVERY_COMPILATION_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(40);
 
+/// Capturing diagnostics after SIGINT is part of prompt recovery and must not block indefinitely.
+const INTERRUPT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// GHCi hooks should normally return immediately. A bounded wait prevents an interrupted parallel
+/// compilation from leaving the manager permanently blocked on a superficially recovered prompt.
+const GHCI_HOOK_TIMEOUT: Duration = Duration::from_secs(40);
+
 /// Print a conspicuous diagnostic which remains visible even when tracing is filtered out.
 pub(crate) fn print_ghciwatch_error(summary: &str, details: &str) {
     let timestamp = std::time::SystemTime::now()
@@ -972,9 +979,7 @@ impl Ghci {
             CompilationWaitStatus::Error => {
                 tracing::info!("Interrupting parallel GHCi reload after first error");
                 self.send_sigint().await?;
-                self.stdout
-                    .capture_stderr(&mut self.stdin.stdin, log)
-                    .await?;
+                self.capture_interrupted_stderr(log).await?;
                 log.mark_failed();
             }
             CompilationWaitStatus::Inactive => {
@@ -1545,9 +1550,7 @@ impl Ghci {
             CompilationWaitStatus::Error => {
                 tracing::info!("Interrupting parallel GHCi :add after first error");
                 self.send_sigint().await?;
-                self.stdout
-                    .capture_stderr(&mut self.stdin.stdin, log)
-                    .await?;
+                self.capture_interrupted_stderr(log).await?;
                 log.mark_failed();
             }
             CompilationWaitStatus::Inactive => {
@@ -1628,9 +1631,7 @@ impl Ghci {
             CompilationWaitStatus::Error => {
                 tracing::info!("Interrupting parallel GHCi :unadd after first error");
                 self.send_sigint().await?;
-                self.stdout
-                    .capture_stderr(&mut self.stdin.stdin, log)
-                    .await?;
+                self.capture_interrupted_stderr(log).await?;
                 log.mark_failed();
             }
             CompilationWaitStatus::Inactive => {
@@ -1820,11 +1821,10 @@ impl Ghci {
             }
         }
 
-        // If we only sent 1 SIGINT, then there cannot be extra prompts waiting to be read from the
-        // buffer; only do the sync barrier process if we sent multiple SIGINTs.
-        if sigint_count > 1 {
-            self.sync_barrier().await?;
-        }
+        // A prompt proves that the command loop responded, but an interrupted parallel pipeline can
+        // leave stale output or internal activity behind it. Always execute an in-band command
+        // barrier before allowing hooks or evals to use the recovered session.
+        self.sync_barrier().await?;
 
         tracing::info!("Interrupted ghci in {:.2?}", start_instant.elapsed());
         Ok(())
@@ -2038,7 +2038,8 @@ impl Ghci {
                 .await?;
         }
 
-        for hook in self.opts.hooks.select(event) {
+        let hooks = self.opts.hooks.select(event).cloned().collect::<Vec<_>>();
+        for hook in hooks {
             if shell_first && matches!(&hook.command, hooks::Command::Shell(_)) {
                 continue;
             }
@@ -2055,9 +2056,7 @@ impl Ghci {
                         // Hook diagnostics are advisory and must not turn the surrounding reload
                         // into a failed compilation or suppress its after-hooks.
                         let mut hook_log = CompilationLog::default();
-                        self.stdin
-                            .run_command(&mut self.stdout, command, &mut hook_log)
-                            .await?;
+                        self.run_hook_command(command, &mut hook_log).await?;
                         if matches!(hook_log.result(), Some(CompilationResult::Err)) {
                             tracing::error!(%command, "Ignoring {hook} command error");
                         }
@@ -2076,20 +2075,67 @@ impl Ghci {
 
     /// Run only the GHCi commands for an event whose shell hooks were run by the manager.
     async fn run_ghci_hooks(&mut self, event: LifecycleEvent) -> eyre::Result<()> {
-        for hook in self.opts.hooks.select(event) {
+        let hooks = self.opts.hooks.select(event).cloned().collect::<Vec<_>>();
+        for hook in hooks {
             let hooks::Command::Ghci(command) = &hook.command else {
                 continue;
             };
             tracing::info!(%command, "Running {hook} command");
             let mut hook_log = CompilationLog::default();
-            self.stdin
-                .run_command(&mut self.stdout, command, &mut hook_log)
-                .await?;
+            self.run_hook_command(command, &mut hook_log).await?;
             if matches!(hook_log.result(), Some(CompilationResult::Err)) {
                 tracing::error!(%command, "Ignoring {hook} command error");
             }
         }
         Ok(())
+    }
+
+    async fn capture_interrupted_stderr(&mut self, log: &mut CompilationLog) -> eyre::Result<()> {
+        match tokio::time::timeout(
+            INTERRUPT_CLEANUP_TIMEOUT,
+            self.stdout.capture_stderr(&mut self.stdin.stdin, log),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                self.force_kill_for_recovery(eyre!(
+                    "Timed out capturing diagnostics after interrupting GHCi compilation after {INTERRUPT_CLEANUP_TIMEOUT:?}"
+                ))
+                .await
+            }
+        }
+    }
+
+    /// Run a lifecycle hook without trusting a recovered prompt indefinitely. On timeout the pipe
+    /// protocol and GHC's post-interrupt state are both uncertain, so replacement is the only safe
+    /// continuation.
+    async fn run_hook_command(
+        &mut self,
+        command: &GhciCommand,
+        log: &mut CompilationLog,
+    ) -> eyre::Result<()> {
+        match tokio::time::timeout(
+            GHCI_HOOK_TIMEOUT,
+            self.stdin.run_command(&mut self.stdout, command, log),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                print_ghciwatch_error(
+                    "GHCi lifecycle hook timed out",
+                    &format!(
+                        "Command: {command}\nTimeout: {GHCI_HOOK_TIMEOUT:?}\nProcess group ID: {}\nWorking directory: {}\nRecovery: force-killing the unresponsive GHCi process tree; the manager will immediately initialize a fresh session",
+                        self.process_group_id, self.search_paths.cwd,
+                    ),
+                );
+                self.force_kill_for_recovery(eyre!(
+                    "GHCi lifecycle hook timed out after {GHCI_HOOK_TIMEOUT:?}: {command}"
+                ))
+                .await
+            }
+        }
     }
 
     async fn compilation_snapshot_is_current(&mut self) -> eyre::Result<bool> {
