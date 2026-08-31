@@ -200,7 +200,12 @@ impl GhciStderr {
             .ok_or_else(|| {
                 eyre::eyre!("GHCi stderr closed while waiting for synchronization marker")
             })?;
-            if line == marker {
+            if let Some(diagnostic_line) = line_without_marker(&line, marker) {
+                // GHC's orphaned parallel logger can write concurrently with the marker shell
+                // command, splicing the marker into a diagnostic line. Retain its surrounding text.
+                if !diagnostic_line.is_empty() {
+                    self.ingest_line(diagnostic_line).await?;
+                }
                 break;
             }
             self.ingest_line(line).await?;
@@ -225,6 +230,10 @@ impl GhciStderr {
     }
 }
 
+fn line_without_marker(line: &str, marker: &str) -> Option<String> {
+    line.contains(marker).then(|| line.replacen(marker, "", 1))
+}
+
 fn line_has_error_diagnostic(line: &str) -> bool {
     use crate::ghci::parse::GhcMessage;
     use crate::ghci::parse::Severity;
@@ -242,6 +251,7 @@ fn line_has_error_diagnostic(line: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::line_has_error_diagnostic;
+    use super::line_without_marker;
 
     #[test]
     fn recognizes_only_ghc_error_headers() {
@@ -253,5 +263,27 @@ mod tests {
         assert!(!line_has_error_diagnostic(
             "application said error: but this is not a diagnostic\n"
         ));
+    }
+
+    #[test]
+    fn recognizes_marker_spliced_into_diagnostic() {
+        let marker = "__GHCIWATCH_STDERR_END_872490_463__";
+        assert_eq!(
+            line_without_marker(
+                &format!("558 | value = Zspirv.Signed   Zspirv.W32{marker}^^^^^^^"),
+                marker,
+            ),
+            Some("558 | value = Zspirv.Signed   Zspirv.W32^^^^^^^".to_owned())
+        );
+        assert_eq!(
+            line_without_marker(&format!("{marker}diagnostic"), marker),
+            Some("diagnostic".to_owned())
+        );
+        assert_eq!(
+            line_without_marker(&format!("diagnostic{marker}"), marker),
+            Some("diagnostic".to_owned())
+        );
+        assert_eq!(line_without_marker(marker, marker), Some(String::new()));
+        assert_eq!(line_without_marker("diagnostic", marker), None);
     }
 }

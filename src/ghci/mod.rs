@@ -1738,7 +1738,8 @@ impl Ghci {
     /// the kill succeeds, rather than propagating the recovery error as fatal.
     #[instrument(skip_all, level = "debug")]
     pub(crate) async fn send_sigint(&mut self) -> eyre::Result<()> {
-        self.send_sigint_capturing(&mut CompilationLog::default()).await
+        self.send_sigint_capturing(&mut CompilationLog::default())
+            .await
     }
 
     async fn send_sigint_capturing(&mut self, log: &mut CompilationLog) -> eyre::Result<()> {
@@ -1871,20 +1872,27 @@ impl Ghci {
         let read =
             tokio::time::timeout(sync_timeout, self.stdout.read_until_marker(&sync_marker)).await;
         let result = match read {
-            Ok(Ok(_ghci_output)) => async {
-                // Do not use `set_prompt`: it clears stderr before writing. The buffer still belongs
-                // to the interrupted compilation and must be parsed through the restoration marker.
-                self.stdin.write_set_prompt(PROMPT).await?;
-                self.stdout
-                    .prompt(
-                        &mut self.stdin.stdin,
-                        crate::incremental_reader::FindAt::LineStart,
-                        log,
-                    )
-                    .await
+            Ok(Ok(_ghci_output)) => {
+                let restore = async {
+                    // Do not use `set_prompt`: it clears stderr before writing. The buffer still
+                    // belongs to the interrupted compilation and must be parsed through the
+                    // restoration marker.
+                    self.stdin.write_set_prompt(PROMPT).await?;
+                    self.stdout
+                        .prompt(
+                            &mut self.stdin.stdin,
+                            crate::incremental_reader::FindAt::LineStart,
+                            log,
+                        )
+                        .await
+                };
+                match tokio::time::timeout(sync_timeout, restore).await {
+                    Ok(result) => result.wrap_err("Failed to restore prompt after sync barrier"),
+                    Err(_elapsed) => Err(eyre!(
+                        "Timed out restoring the GHCi prompt after {sync_timeout:?}"
+                    )),
+                }
             }
-            .await
-            .wrap_err("Failed to restore prompt after sync barrier"),
             Ok(Err(e)) => Err(e).wrap_err("Failed to read until sync marker"),
             Err(_elapsed) => Err(eyre!(
                 "Timed out waiting for GHCi sync marker after {sync_timeout:?}"

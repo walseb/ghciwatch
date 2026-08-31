@@ -83,6 +83,7 @@ async fn can_write_error_log_recursive_module_errors() {
 #[test(current)]
 async fn interrupted_reload_writes_diagnostics() {
     let mut session = GhciWatchBuilder::new("tests/data/simple")
+        .with_startup_timeout(std::time::Duration::from_secs(25))
         .with_args([
             "--error-file",
             "compile.txt",
