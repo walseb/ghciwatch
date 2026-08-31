@@ -104,22 +104,6 @@ impl GhciStdin {
         Ok(())
     }
 
-    /// Set the GHCi prompt to the given string.
-    ///
-    /// This writes `:set prompt` and waits for GHCi to show the new prompt.
-    #[instrument(skip(self, stdout), level = "debug")]
-    pub async fn set_prompt(
-        &mut self,
-        stdout: &mut GhciStdout,
-        prompt: &str,
-        find: FindAt,
-        log: &mut CompilationLog,
-    ) -> eyre::Result<()> {
-        stdout.clear_stderr_buffer().await?;
-        self.write_set_prompt(prompt).await?;
-        stdout.prompt(&mut self.stdin, find, log).await
-    }
-
     #[instrument(skip(self, stdout), name = "stdin_initialize", level = "debug")]
     pub async fn initialize(
         &mut self,

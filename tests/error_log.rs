@@ -78,6 +78,64 @@ async fn can_write_error_log_recursive_module_errors() {
     );
 }
 
+/// Diagnostics remain available when `--interrupt-on-error` cancels compilation before GHCi's
+/// ordinary reload prompt is consumed.
+#[test(current)]
+async fn interrupted_reload_writes_diagnostics() {
+    let mut session = GhciWatchBuilder::new("tests/data/simple")
+        .with_args([
+            "--error-file",
+            "compile.txt",
+            "--interrupt-on-error",
+            "--before-interrupt",
+            "touch compilation-interrupted",
+            "--after-reload-shell",
+            "sh -c 'grep -q staleFailure compile.txt && touch interrupted-error-published'",
+        ])
+        .start()
+        .await
+        .expect("ghciwatch starts");
+    session
+        .wait_until_ready()
+        .await
+        .expect("ghciwatch is ready");
+
+    session
+        .fs()
+        .replace(
+            session.path("src/MyLib.hs"),
+            "example = \"example\"",
+            "example = staleFailure",
+        )
+        .await
+        .expect("can trigger a failing reload");
+    session
+        .fs()
+        .wait_for_path(
+            session.startup_timeout,
+            &session.path("compilation-interrupted"),
+        )
+        .await
+        .expect("the failing reload is interrupted");
+    session
+        .fs()
+        .wait_for_path(
+            session.startup_timeout,
+            &session.path("interrupted-error-published"),
+        )
+        .await
+        .expect("after-reload hook observes the interrupted diagnostic");
+
+    let contents = session
+        .fs()
+        .read(session.path("compile.txt"))
+        .await
+        .expect("interrupted reload writes compile.txt");
+    assert!(
+        contents.contains("staleFailure"),
+        "interrupted diagnostic missing from error log: {contents:?}"
+    );
+}
 /// Test that `ghciwatch --errors ...` can write the error log with `--repl-no-load`.
 #[test]
 async fn can_write_error_log_repl_no_load() {

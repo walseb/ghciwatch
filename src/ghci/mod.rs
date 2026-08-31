@@ -978,7 +978,7 @@ impl Ghci {
             CompilationWaitStatus::Complete => {}
             CompilationWaitStatus::Error => {
                 tracing::info!("Interrupting parallel GHCi reload after first error");
-                self.send_sigint().await?;
+                self.send_sigint_capturing(log).await?;
                 self.capture_interrupted_stderr(log).await?;
                 log.mark_failed();
             }
@@ -1549,7 +1549,7 @@ impl Ghci {
             CompilationWaitStatus::Complete => {}
             CompilationWaitStatus::Error => {
                 tracing::info!("Interrupting parallel GHCi :add after first error");
-                self.send_sigint().await?;
+                self.send_sigint_capturing(log).await?;
                 self.capture_interrupted_stderr(log).await?;
                 log.mark_failed();
             }
@@ -1630,7 +1630,7 @@ impl Ghci {
             CompilationWaitStatus::Complete => {}
             CompilationWaitStatus::Error => {
                 tracing::info!("Interrupting parallel GHCi :unadd after first error");
-                self.send_sigint().await?;
+                self.send_sigint_capturing(log).await?;
                 self.capture_interrupted_stderr(log).await?;
                 log.mark_failed();
             }
@@ -1667,7 +1667,7 @@ impl Ghci {
         log: &mut CompilationLog,
         inactive_component: &str,
     ) -> eyre::Result<()> {
-        self.send_sigint().await?;
+        self.send_sigint_capturing(log).await?;
 
         tracing::warn!(
             component = inactive_component,
@@ -1738,7 +1738,11 @@ impl Ghci {
     /// the kill succeeds, rather than propagating the recovery error as fatal.
     #[instrument(skip_all, level = "debug")]
     pub(crate) async fn send_sigint(&mut self) -> eyre::Result<()> {
-        match self.send_sigint_inner().await {
+        self.send_sigint_capturing(&mut CompilationLog::default()).await
+    }
+
+    async fn send_sigint_capturing(&mut self, log: &mut CompilationLog) -> eyre::Result<()> {
+        match self.send_sigint_inner(log).await {
             Ok(()) => Ok(()),
             Err(error) => self.force_kill_for_recovery(error).await,
         }
@@ -1769,7 +1773,7 @@ impl Ghci {
         Err(error).wrap_err(GhciRecoveryFailed)
     }
 
-    async fn send_sigint_inner(&mut self) -> eyre::Result<()> {
+    async fn send_sigint_inner(&mut self, log: &mut CompilationLog) -> eyre::Result<()> {
         // A cancelled speculative named `:add` may have disabled stderr forwarding. SIGINT is the
         // cancellation recovery boundary, so restore normal forwarding before doing anything else.
         self.stdout.set_stderr_forwarding(true, false).await?;
@@ -1824,7 +1828,7 @@ impl Ghci {
         // A prompt proves that the command loop responded, but an interrupted parallel pipeline can
         // leave stale output or internal activity behind it. Always execute an in-band command
         // barrier before allowing hooks or evals to use the recovered session.
-        self.sync_barrier().await?;
+        self.sync_barrier(log).await?;
 
         tracing::info!("Interrupted ghci in {:.2?}", start_instant.elapsed());
         Ok(())
@@ -1848,7 +1852,7 @@ impl Ghci {
     /// method. This ensures we consume all remaining stale output, without having to wait until we
     /// "think it's safe" and wasting the user's time after GHCi is done writing.
     #[instrument(skip_all, level = "debug")]
-    async fn sync_barrier(&mut self) -> eyre::Result<()> {
+    async fn sync_barrier(&mut self, log: &mut CompilationLog) -> eyre::Result<()> {
         self.sync_nonce += 1;
         let nonce = self.sync_nonce;
         let sync_marker = format!("~~~GHCIWATCH-SYNC-{nonce}~~~");
@@ -1867,18 +1871,20 @@ impl Ghci {
         let read =
             tokio::time::timeout(sync_timeout, self.stdout.read_until_marker(&sync_marker)).await;
         let result = match read {
-            Ok(Ok(_ghci_output)) => self
-                .stdin
-                .set_prompt(
-                    &mut self.stdout,
-                    PROMPT,
-                    crate::incremental_reader::FindAt::LineStart,
-                    // We don't expect to see any compilation here, so we pass a stub
-                    // `CompilationLog` and discard it.
-                    &mut Default::default(),
-                )
-                .await
-                .wrap_err("Failed to restore prompt after sync barrier"),
+            Ok(Ok(_ghci_output)) => async {
+                // Do not use `set_prompt`: it clears stderr before writing. The buffer still belongs
+                // to the interrupted compilation and must be parsed through the restoration marker.
+                self.stdin.write_set_prompt(PROMPT).await?;
+                self.stdout
+                    .prompt(
+                        &mut self.stdin.stdin,
+                        crate::incremental_reader::FindAt::LineStart,
+                        log,
+                    )
+                    .await
+            }
+            .await
+            .wrap_err("Failed to restore prompt after sync barrier"),
             Ok(Err(e)) => Err(e).wrap_err("Failed to read until sync marker"),
             Err(_elapsed) => Err(eyre!(
                 "Timed out waiting for GHCi sync marker after {sync_timeout:?}"
