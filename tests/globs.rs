@@ -115,7 +115,7 @@ async fn can_restart_on_custom_file_change() {
 
     session
         .fs()
-        .touch(session.path("package.yaml"))
+        .append(session.path("package.yaml"), "\n")
         .await
         .unwrap();
 
@@ -146,7 +146,7 @@ async fn can_restart_on_cabal_file_change() {
 
     session
         .fs()
-        .touch(session.path("my-simple-package.cabal"))
+        .append(session.path("my-simple-package.cabal"), "\n")
         .await
         .unwrap();
 
@@ -173,7 +173,11 @@ async fn can_restart_on_ghci_file_change() {
         .await
         .expect("ghciwatch loads ghci");
 
-    session.fs().touch(session.path(".ghci")).await.unwrap();
+    session
+        .fs()
+        .append(session.path(".ghci"), "\n")
+        .await
+        .unwrap();
 
     session
         .wait_until_restart()
@@ -211,7 +215,11 @@ async fn can_ignore_restart_paths() {
         .await
         .unwrap();
 
-    session.fs().touch(session.path(".ghci")).await.unwrap();
+    session
+        .fs()
+        .append(session.path(".ghci"), "\n")
+        .await
+        .unwrap();
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     assert_eq!(

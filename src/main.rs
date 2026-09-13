@@ -72,8 +72,13 @@ async fn main() -> eyre::Result<()> {
     let (ghci_sender, ghci_receiver) = mpsc::channel(32);
     let (watcher_command_sender, watcher_command_receiver) = mpsc::channel::<WatcherCommand>(8);
 
-    let (ghci_opts, maybe_ghci_reader) = GhciOpts::from_cli(&opts)?;
-    let watcher_opts = WatcherOpts::from_cli(&opts)?;
+    let (mut ghci_opts, maybe_ghci_reader) = GhciOpts::from_cli(&opts)?;
+    let mut watcher_opts = WatcherOpts::from_cli(&opts)?;
+    let (setup_sender, setup_receiver) = tokio::sync::watch::channel(());
+    ghci_opts.setup_updates = setup_receiver;
+    watcher_opts.setup_updates = Some(setup_sender);
+    let (watcher_ready_sender, watcher_ready) = tokio::sync::oneshot::channel();
+    watcher_opts.ready = Some(watcher_ready_sender);
 
     let mut manager =
         ShutdownManager::with_timeout(ghci_opts.shutdown_timeout(Duration::from_secs(1)));
@@ -91,13 +96,15 @@ async fn main() -> eyre::Result<()> {
     }
 
     manager
-        .spawn("run_ghci", |handle| {
-            run_ghci(handle, ghci_opts, ghci_receiver, watcher_command_sender)
-        })
-        .await;
-    manager
         .spawn("run_watcher", move |handle| {
             run_watcher(handle, ghci_sender, watcher_command_receiver, watcher_opts)
+        })
+        .await;
+    // Install watches and their content baseline before setup or GHCi can change any files.
+    watcher_ready.await?;
+    manager
+        .spawn("run_ghci", |handle| {
+            run_ghci(handle, ghci_opts, ghci_receiver, watcher_command_sender)
         })
         .await;
     // Subscribe this last so every long-running task is already able to receive its shutdown

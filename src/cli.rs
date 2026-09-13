@@ -125,6 +125,15 @@ pub struct Opts {
     #[arg(long)]
     pub interrupt_on_error: bool,
 
+    /// Run a synchronous setup command before every GHCi launch, before before-startup hooks.
+    ///
+    /// On failure, write its output to --error-file and wait for a watched file's contents
+    /// or existence to change before retrying. Touches and identical rewrites are ignored.
+    /// Commands run in order and stop at the first failure. Repeatable.
+    /// Unlike lifecycle hooks, this does not support the async: prefix.
+    #[arg(long, value_name = "SHELL_COMMAND")]
+    pub setup_shell: Vec<ClonableCommand>,
+
     /// A shell command to run synchronously immediately before GHCi is sent `SIGINT`.
     ///
     /// The command receives the configured command PID and process-group ID in the

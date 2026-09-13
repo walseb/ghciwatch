@@ -82,7 +82,7 @@ async fn can_run_hooks() {
 
     session
         .fs()
-        .touch(session.path("src/MyLib.hs"))
+        .append(session.path("src/MyLib.hs"), "\n")
         .await
         .unwrap();
 

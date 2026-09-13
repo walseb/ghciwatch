@@ -143,6 +143,19 @@ Generate shell completions for the given shell
 ## Lifecycle hooks
 <dl>
 
+<dt><a id="--setup-shell" href="#--setup-shell"><code>--setup-shell &lt;SHELL_COMMAND&gt;</code></a></dt><dd>
+
+Run a synchronous command before every GHCi launch, before before-startup hooks.
+Failure prevents launching `--command`, writes the command's stdout/stderr and failure
+status to `--error-file`, and waits for any watched file to change before retrying.
+Only content changes, additions, and removals count; touches and identical rewrites are ignored.
+The previous error file remains available during retries until a completed result replaces it.
+Without watched paths, a failed setup waits until ghciwatch is stopped.
+
+Repeatable: commands run in order, stopping at the first failure. All commands run
+again on retry. The `async:` prefix is not supported.
+
+</dd>
 <dt><a id="--test-ghci" href="#--test-ghci"><code>--test-ghci &lt;GHCI_CMD&gt;</code></a></dt><dd>
 
 `ghci` commands to run tests

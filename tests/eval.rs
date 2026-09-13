@@ -198,8 +198,8 @@ async fn can_eval_commands_in_non_interpreted_modules() {
         .await
         .expect("ghciwatch didn't start in time");
 
-    // Touch the module so `ghci` compiles it.
-    session.fs().touch(&module_path).await.unwrap();
+    // Change the module so `ghci` compiles it.
+    session.fs().append(&module_path, "\n").await.unwrap();
     session
         .wait_for_log(BaseMatcher::reload_completes())
         .await
@@ -208,8 +208,8 @@ async fn can_eval_commands_in_non_interpreted_modules() {
     // Restart so it loads the compiled, non-interpreted module.
     session.restart_ghciwatch().await.unwrap();
 
-    // Touch the module so `ghciwatch` loads it.
-    session.fs().touch(&module_path).await.unwrap();
+    // Change the module so `ghciwatch` loads it.
+    session.fs().append(&module_path, "\n").await.unwrap();
 
     session
         .assert_logged_or_wait(
@@ -277,14 +277,14 @@ async fn can_eval_commands_twice() {
         .expect("ghciwatch didn't start in time");
 
     session.clear_events();
-    session.fs().touch(&module_path).await.unwrap();
+    session.fs().append(&module_path, "\n").await.unwrap();
     session
         .assert_logged_or_wait(ok_reload.clone())
         .await
         .expect("ghciwatch evals commands");
 
     session.clear_events();
-    session.fs().touch(&module_path).await.unwrap();
+    session.fs().append(&module_path, "\n").await.unwrap();
     session
         .assert_logged_or_wait(ok_reload)
         .await
@@ -338,7 +338,7 @@ async fn eval_can_handle_non_haskell_files() {
 
     // Make sure we can reload.
     session.clear_events();
-    session.fs().touch(&model_path).await.unwrap();
+    session.fs().append(&model_path, "\n").await.unwrap();
     session
         .assert_logged_or_wait(reload_no_eval_matcher.clone())
         .await
@@ -346,7 +346,7 @@ async fn eval_can_handle_non_haskell_files() {
 
     // Make sure we can reload _again_ (i.e. ghciwatch didn't crash).
     session.clear_events();
-    session.fs().touch(&model_path).await.unwrap();
+    session.fs().append(&model_path, "\n").await.unwrap();
     session
         .assert_logged_or_wait(reload_no_eval_matcher)
         .await

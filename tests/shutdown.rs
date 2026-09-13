@@ -55,7 +55,7 @@ async fn replacement_keeps_old_output_pipe_alive() {
     session.clear_events();
     session
         .fs()
-        .touch(session.path("src/MyLib.hs"))
+        .append(session.path("src/MyLib.hs"), "\n")
         .await
         .expect("can trigger an intentional replacement");
     session
@@ -217,12 +217,12 @@ async fn handles_upstream_startup_repair_from_configured_watch() {
     // Clear events so we don't match the first "ghci exited during startup" again.
     session.clear_events();
 
-    // Touching a source file triggers the first restart attempt, which also fails.
+    // Changing a source file triggers the first restart attempt, which also fails.
     session
         .fs()
-        .touch(session.path("src/MyLib.hs"))
+        .append(session.path("src/MyLib.hs"), "\n")
         .await
-        .expect("can touch source file");
+        .expect("can change source file");
 
     // The second failure confirms the retry loop re-enters rather than crashing.
     session
@@ -322,12 +322,12 @@ async fn handles_repeated_startup_failures_before_restart_ghci_hook() {
     // Clear events so we don't match the first "ghci exited during startup" again.
     session.clear_events();
 
-    // Touching a source file triggers the first restart attempt, which also fails.
+    // Changing a source file triggers the first restart attempt, which also fails.
     session
         .fs()
-        .touch(session.path("src/MyLib.hs"))
+        .append(session.path("src/MyLib.hs"), "\n")
         .await
-        .expect("can touch source file");
+        .expect("can change source file");
 
     // The shell reload hooks bracket the failed replacement even though no GHCi prompt exists.
     session

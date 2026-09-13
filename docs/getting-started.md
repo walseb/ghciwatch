@@ -7,6 +7,12 @@ For example:
     ghciwatch --command "cabal repl lib:test-dev" \
               --watch src --watch test
 
+Reloads and restarts respond to changed file contents, additions, and removals—not
+timestamps. Saving identical bytes, atomically replacing a file with identical
+contents, or running `touch` does not trigger work. This also applies to
+non-Haskell reload/restart inputs and retries of a failed `--setup-shell` command.
+An initial content baseline is captured before launch.
+
 Check out the [examples](cli.md#examples) and [command-line
 arguments](cli.md#options) for more information.
 

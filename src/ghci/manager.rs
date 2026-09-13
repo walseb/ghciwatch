@@ -166,6 +166,33 @@ pub async fn run_ghci(
     // This function is pretty tricky! We need to handle shutdowns at each stage, and the process
     // is a little different each time, so the `select!`s can't be consolidated.
 
+    // Keep receiving events while setup blocks a launch (including inside a restart).
+    // Coalesce queued dispatches rather than allowing backpressure to hide setup retries.
+    let (dispatch_sender, dispatch_receiver) = mpsc::channel(1);
+    handle
+        .spawn("setup_watcher", |mut handle| async move {
+            let mut pending: Option<WatcherEvent> = None;
+            loop {
+                tokio::select! {
+                    _ = handle.on_shutdown_requested() => return Ok(()),
+                    event = watcher_receiver.recv() => {
+                        let Some(event) = event else { return Ok(()) };
+                        if let Some(pending) = &mut pending {
+                            pending.merge(event);
+                        } else {
+                            pending = Some(event);
+                        }
+                    }
+                    permit = dispatch_sender.reserve(), if pending.is_some() => {
+                        let Ok(permit) = permit else { return Ok(()) };
+                        permit.send(pending.take().unwrap());
+                    }
+                }
+            }
+        })
+        .await;
+    let mut watcher_receiver = dispatch_receiver;
+
     let eval_socket = opts.eval_socket.clone().into_std_path_buf();
     let interrupt_reloads = opts.interrupt_reloads;
     let restart_on_exit = opts.restart_on_exit;
@@ -173,9 +200,13 @@ pub async fn run_ghci(
     // active eval or for access to the GHCi session.
     let hooks = opts.hooks.clone();
     let (exited_sender, mut exited_receiver) = mpsc::channel::<ExitStatus>(1);
-    let mut ghci = Ghci::new(handle.clone(), opts, exited_sender)
-        .await
-        .wrap_err("Failed to start `ghci`")?;
+    let shutdown = handle.clone();
+    let mut ghci = tokio::select! {
+        biased;
+        _ = handle.on_shutdown_requested() => return Ok(()),
+        result = Ghci::new(shutdown, opts, exited_sender) =>
+            result.wrap_err("Failed to start `ghci`")?,
+    };
 
     // Wait for ghci to finish loading.
     //

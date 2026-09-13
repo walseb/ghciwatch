@@ -6,14 +6,11 @@ use std::collections::BTreeSet;
 use std::hash::Hasher;
 use std::io::ErrorKind;
 use std::io::Read;
-use std::time::SystemTime;
 
 use camino::Utf8Path;
 use camino::Utf8PathBuf;
 use notify_debouncer_full::notify::EventKind;
 use notify_debouncer_full::DebouncedEvent;
-
-use crate::haskell_source_file::is_haskell_source_file;
 
 /// A set of filesystem events that `ghci` will need to respond to. Due to the way that `ghci` is,
 /// we need to divide these into a few different classes so that we can respond appropriately.
@@ -42,13 +39,10 @@ impl FileEvent {
 
 /// State of a path when a filesystem snapshot was captured.
 ///
-/// Haskell files include a content hash so delayed notifications for an already-compiled edit can
-/// be discarded without relying on filesystem timestamp granularity.
+/// Compare contents and file kind only. Timestamps and identical rewrites are not changes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileState {
     kind: FileStateKind,
-    len: u64,
-    modified: Option<SystemTime>,
     content_hash: Option<u64>,
 }
 
@@ -67,8 +61,6 @@ impl FileState {
             Err(error) if error.kind() == ErrorKind::NotFound => {
                 return Ok(Self {
                     kind: FileStateKind::Missing,
-                    len: 0,
-                    modified: None,
                     content_hash: None,
                 });
             }
@@ -81,7 +73,7 @@ impl FileState {
         } else {
             FileStateKind::Other
         };
-        let content_hash = if metadata.is_file() && is_haskell_source_file(path) {
+        let content_hash = if metadata.is_file() {
             let mut file = match std::fs::File::open(path) {
                 Ok(file) => file,
                 // Atomic saves can replace a path between metadata and open. Treat that transient
@@ -89,8 +81,6 @@ impl FileState {
                 Err(error) if error.kind() == ErrorKind::NotFound => {
                     return Ok(Self {
                         kind: FileStateKind::Missing,
-                        len: 0,
-                        modified: None,
                         content_hash: None,
                     });
                 }
@@ -109,12 +99,7 @@ impl FileState {
         } else {
             None
         };
-        Ok(Self {
-            kind,
-            len: metadata.len(),
-            modified: metadata.modified().ok(),
-            content_hash,
-        })
+        Ok(Self { kind, content_hash })
     }
 }
 

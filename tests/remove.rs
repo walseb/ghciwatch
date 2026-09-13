@@ -137,7 +137,7 @@ async fn removes_module_deleted_during_after_reload_hook() {
     session.wait_until_ready().await.unwrap();
     session
         .fs()
-        .touch(session.path("src/MyLib.hs"))
+        .append(session.path("src/MyLib.hs"), "\n")
         .await
         .unwrap();
     session

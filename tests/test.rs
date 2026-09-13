@@ -21,9 +21,9 @@ async fn can_run_test_suite_on_reload() {
 
     session
         .fs()
-        .touch(session.path("src/MyLib.hs"))
+        .append(session.path("src/MyLib.hs"), "\n")
         .await
-        .expect("Can touch file");
+        .expect("Can change file");
 
     session
         .wait_for_log(BaseMatcher::span_close().in_leaf_spans(["error_log_write"]))

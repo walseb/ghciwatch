@@ -69,6 +69,23 @@ This is particularly useful for code which may be compiled, run in a plain
 
 ## List of lifecycle hooks
 
+### Setup
+
+Hook: [`--setup-shell`](cli.md#--setup-shell).
+
+Runs before every launch, including restarts, before the advisory before-startup
+hooks. Unlike those hooks, a setup failure **prevents launching** the configured
+command. Its stdout/stderr and failure status are written to `--error-file`, and
+ghciwatch waits for any watched file (including non-Haskell files) to change before
+retrying. Only content changes, additions, and removals count; `touch` and identical
+rewrites do not retry setup. Error-file publication itself does not trigger a retry.
+
+For example: `ghciwatch --watch src --setup-shell 'cabal build prerequisites'`.
+
+Repeatable, synchronous only: commands run in order and stop at the first failure;
+a retry starts the entire setup sequence again. Without watched paths, setup
+failure waits indefinitely until shutdown. Ordinary reloads do not rerun setup.
+
 ### Before startup
 
 Hook: [`--before-startup-shell`](cli.md#--before-startup-shell).

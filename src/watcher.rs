@@ -1,3 +1,7 @@
+mod content;
+
+use content::ContentChanges;
+
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::io::ErrorKind;
@@ -70,6 +74,14 @@ pub struct WatcherOpts {
     pub poll: Option<Duration>,
     /// Classifies paths before they are sent to the GHCi manager.
     pub file_classifier: FileClassifier,
+    /// Wake setup on any watched update, independently of reload classification.
+    pub setup_updates: Option<tokio::sync::watch::Sender<()>>,
+    /// Signals that initial watches are installed and launch hooks may start.
+    pub ready: Option<oneshot::Sender<()>>,
+    /// Exclude our own error publication from setup retries.
+    pub error_path: Option<NormalPath>,
+    /// Initial content baseline, captured before any launch hooks run.
+    content: ContentChanges,
 }
 
 impl WatcherOpts {
@@ -82,6 +94,14 @@ impl WatcherOpts {
             watch: opts.watch.paths.clone(),
             debounce: opts.watch.debounce,
             poll: opts.watch.poll,
+            setup_updates: None,
+            ready: None,
+            content: ContentChanges::new(&opts.watch.paths)?,
+            error_path: opts
+                .error_file
+                .as_ref()
+                .map(NormalPath::from_cwd)
+                .transpose()?,
             file_classifier: FileClassifier::new(
                 opts.watch.restart_globs()?,
                 opts.watch.reload_globs()?,
@@ -114,7 +134,9 @@ async fn run_debouncer<T: notify::Watcher>(
 ) -> eyre::Result<()> {
     let mut config = notify::Config::default();
     if let Some(interval) = opts.poll {
-        config = config.with_poll_interval(interval);
+        config = config
+            .with_poll_interval(interval)
+            .with_compare_contents(true);
     }
 
     let event_handler = EventHandler {
@@ -123,6 +145,9 @@ async fn run_debouncer<T: notify::Watcher>(
         shutdown: handle.clone(),
         watch: opts.watch.clone(),
         file_classifier: opts.file_classifier.clone(),
+        setup_updates: opts.setup_updates.clone(),
+        error_path: opts.error_path.clone(),
+        content: opts.content,
     };
 
     let cache = FileIdMap::new();
@@ -165,6 +190,9 @@ async fn run_debouncer<T: notify::Watcher>(
     }
 
     tracing::debug!("notify watcher started");
+    if let Some(ready) = opts.ready {
+        let _ = ready.send(());
+    }
     let mut retry_debouncer: Option<Debouncer<T, FileIdMap>> = None;
 
     loop {
@@ -279,18 +307,41 @@ struct EventHandler {
     shutdown: ShutdownHandle,
     watch: Vec<NormalPath>,
     file_classifier: FileClassifier,
+    setup_updates: Option<tokio::sync::watch::Sender<()>>,
+    error_path: Option<NormalPath>,
+    content: ContentChanges,
 }
 
 impl EventHandler {
-    async fn handle_event_async(&self, event: DebounceEventResult) {
+    async fn handle_event_async(&mut self, event: DebounceEventResult) {
         if let Err(err) = self.handle_event_inner(event).await {
             tracing::error!("{err:?}");
             let _ = self.shutdown.request_shutdown();
         }
     }
 
-    async fn handle_event_inner(&self, event: DebounceEventResult) -> eyre::Result<()> {
-        let events = process_debounced_events(event)?;
+    async fn handle_event_inner(&mut self, event: DebounceEventResult) -> eyre::Result<()> {
+        let events = self.content.observe(process_debounced_events(event)?)?;
+        // Setup gates launches, not reloads: even a watched README or config can repair it.
+        // Do not let publishing setup errors wake setup again.
+        if events.iter().any(|event| {
+            let path = event.as_path();
+            !self.error_path.as_ref().is_some_and(|error| {
+                path == error.absolute()
+                    || (path.parent() == error.absolute().parent()
+                        && path.file_name().is_some_and(|name| {
+                            name.starts_with(&format!(
+                                ".{}.ghciwatch-{}-",
+                                error.absolute().file_name().unwrap_or("compile"),
+                                std::process::id(),
+                            )) && name.ends_with(".tmp")
+                        }))
+            })
+        }) {
+            if let Some(updates) = &self.setup_updates {
+                updates.send_replace(());
+            }
+        }
         let mut relevant_events = BTreeSet::new();
         for event in events {
             if self.file_classifier.is_potentially_relevant(&event)? {
@@ -303,7 +354,7 @@ impl EventHandler {
 
 impl DebounceEventHandler for EventHandler {
     fn handle_event(&mut self, event: DebounceEventResult) {
-        self.handle.block_on(self.handle_event_async(event))
+        self.handle.clone().block_on(self.handle_event_async(event))
     }
 }
 
@@ -373,23 +424,23 @@ async fn send_event(
     events: BTreeSet<FileEvent>,
     startup_retry: bool,
 ) -> eyre::Result<()> {
+    if events.is_empty() {
+        tracing::debug!("No changed file contents");
+        return Ok(());
+    }
     let states = file_states(&events)?;
     let source_snapshot = scan_haskell_files(watch)?;
     let haskell_files = source_snapshot.keys().cloned().collect();
-    if events.is_empty() {
-        tracing::debug!("No relevant file events");
-    } else {
-        tracing::debug!(?events, files = source_snapshot.len(), "Processed events");
-        ghci_sender
-            .send(WatcherEvent::Reload {
-                events,
-                states,
-                haskell_files,
-                source_snapshot,
-                startup_retry,
-            })
-            .await?;
-    }
+    tracing::debug!(?events, files = source_snapshot.len(), "Processed events");
+    ghci_sender
+        .send(WatcherEvent::Reload {
+            events,
+            states,
+            haskell_files,
+            source_snapshot,
+            startup_retry,
+        })
+        .await?;
     Ok(())
 }
 

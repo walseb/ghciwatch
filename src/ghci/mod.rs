@@ -33,6 +33,7 @@ use tokio::io::BufReader;
 use tokio::sync::mpsc;
 use tracing::instrument;
 
+mod setup;
 mod stdin;
 use stdin::GhciStdin;
 
@@ -165,6 +166,10 @@ pub struct GhciOpts {
     pub extra_search_paths: Vec<Utf8PathBuf>,
     /// Lifecycle hooks, mostly `ghci` commands to run at certain points.
     pub hooks: HookOpts,
+    /// Synchronous, failure-gating commands run before each launch.
+    pub setup_shell: Vec<ClonableCommand>,
+    /// Watcher notifications independent of the manager's dispatch queue.
+    pub setup_updates: tokio::sync::watch::Receiver<()>,
     /// Shell commands to run synchronously before sending SIGINT.
     pub before_interrupt: Vec<ClonableCommand>,
     /// Shell commands to run synchronously before sending SIGKILL.
@@ -281,6 +286,8 @@ impl GhciOpts {
                 hooks: opts.hooks.clone(),
                 before_interrupt: opts.before_interrupt.clone(),
                 before_kill: opts.before_kill.clone(),
+                setup_shell: opts.setup_shell.clone(),
+                setup_updates: tokio::sync::watch::channel(()).1,
                 restart_globs: opts.watch.restart_globs()?,
                 reload_globs: opts.watch.reload_globs()?,
                 interrupt_reloads: opts.interrupt_reloads(),
@@ -469,6 +476,10 @@ impl Ghci {
         opts: GhciOpts,
         exited_sender: mpsc::Sender<ExitStatus>,
     ) -> eyre::Result<Self> {
+        tokio::select! {
+            _ = shutdown.on_shutdown_requested() => eyre::bail!("Shutdown during setup"),
+            result = setup::run(&opts) => result?,
+        }
         let mut command_handles = Vec::new();
         {
             let span = tracing::debug_span!("before_startup_shell");
