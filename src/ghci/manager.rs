@@ -524,8 +524,13 @@ impl GhciManager {
     /// non-interruptible dispatch are accumulated into `pending_event` and returned as
     /// `Interrupted` for retry.
     async fn handle_event(&mut self, mut event: WatcherEvent) -> eyre::Result<HandleResult> {
-        // This event has passed debounce and the applied-state duplicate check. Notify external
-        // consumers now, before a slow eval or occupied GHCi session can delay the reload cycle.
+        // Queue behind any active eval and prevent later evals from entering GHCi
+        // until this complete dispatch (including interruption cleanup) is done.
+        let _eval_reload_guard = self.eval_barrier.begin_operation().await;
+
+        // Only notify external consumers once this event can actually begin its reload cycle. In
+        // particular, a before-reload hook which removes an error file must not run while an eval
+        // can indefinitely delay the operation that will publish its replacement.
         self.command_handles.retain(|handle| !handle.is_finished());
         self.hooks
             .run_shell_hooks(
@@ -533,10 +538,6 @@ impl GhciManager {
                 &mut self.command_handles,
             )
             .await?;
-
-        // Queue behind any active eval and prevent later evals from entering GHCi
-        // until this complete dispatch (including interruption cleanup) is done.
-        let _eval_reload_guard = self.eval_barrier.begin_operation().await;
         let (reload_state_sender, reload_state_receiver) = watch::channel(GhciReloadKind::Pending);
         let mut task = Box::pin(tokio::task::spawn(dispatch(
             self.ghci.clone(),

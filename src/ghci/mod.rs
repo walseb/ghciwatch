@@ -107,9 +107,9 @@ use crate::StringCase;
 /// considered wedged. Other stdout does not reset this timeout.
 const COMPILATION_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(90);
 
-/// A recovery reload gets a shorter opportunity to demonstrate compilation progress before the
-/// untrustworthy session is replaced.
-const RECOVERY_COMPILATION_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(40);
+/// A recovery reload gets a shorter inactivity allowance before the untrustworthy
+/// session is replaced. Compilation progress resets this timeout too.
+const RECOVERY_COMPILATION_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Capturing diagnostics after SIGINT is part of prompt recovery and must not block indefinitely.
 const INTERRUPT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -420,11 +420,30 @@ impl Ghci {
 }
 
 impl Ghci {
-    /// Restart a leaking session through the normal lifecycle-hook and target-sync path.
+    /// Restart a leaking session through lifecycle hooks that remain valid after a failed reload.
     pub(crate) async fn restart_for_memory_watchdog(&mut self) -> eyre::Result<()> {
         let haskell_files = self.known_haskell_files.clone();
+        let mut log = CompilationLog::default();
         self.opts.clear();
-        self.restart(haskell_files, false).await
+        // A watchdog commonly fires after a failed reload has already cleared GHCi's module
+        // scope. Before-reload GHCi hooks can therefore reference modules that are no longer
+        // loaded. The replacement process has fresh plugin state, so only the external shell
+        // notification and restart hooks are meaningful before replacing it.
+        self.run_shell_lifecycle_events([LifecycleEvent::Reload(hooks::When::Before)])
+            .await?;
+        self.run_hooks(LifecycleEvent::Restart(hooks::When::Before), &mut log)
+            .await?;
+        self.restart_inner(
+            &mut log,
+            [
+                LifecycleEvent::Startup(hooks::When::After),
+                LifecycleEvent::Restart(hooks::When::After),
+                LifecycleEvent::Reload(hooks::When::After),
+            ],
+            Some(haskell_files),
+            true,
+        )
+        .await
     }
 
     /// Start a replacement after failed SIGINT recovery. The old session is dead, so
@@ -460,6 +479,7 @@ impl Ghci {
                 LifecycleEvent::Restart(hooks::When::After),
             ],
             Some(haskell_files),
+            false,
         )
         .await
     }
@@ -654,7 +674,8 @@ impl Ghci {
                 format!("GHCi initialization failed: {err:#}")
             };
             // Cabal configure/plugin failures are often plain prose rather than GHC diagnostics.
-            // Preserve that output as a no-location error instead of publishing an empty success log.
+            // Mark the operation failed; raw stderr is published when available, while this synthetic
+            // diagnostic remains the fallback for failures with no captured stderr.
             log.mark_failed_with_diagnostic(failure_message);
             // If writing the compilation log or running hooks fails, we should log this error so
             // it's not lost forever.
@@ -1008,7 +1029,7 @@ impl Ghci {
                 print_ghciwatch_error(
                     "GHCi reload stopped reporting compilation progress",
                     &format!(
-                        "Component: reload (:reload)\nInactivity timeout: {COMPILATION_INACTIVITY_TIMEOUT:?}\nProcess group ID: {}\nWorking directory: {}\nCommand: {}\nChanged paths:\n{}\nRecovery: interrupting GHCi with process-group SIGINT, then retrying :reload with a {RECOVERY_COMPILATION_INACTIVITY_TIMEOUT:?} inactivity timeout",
+                        "Component: reload (:reload)\nProtocol stage: :reload was written to GHCi stdin; ghciwatch was waiting for its stdout prompt\nProgress signal: no stdout containing `Compiling` or GHCi prompt was observed during the final {COMPILATION_INACTIVITY_TIMEOUT:?}\nProcess group ID: {}\nWorking directory: {}\nCommand: {}\nChanged paths:\n{}\nRecovery: interrupting GHCi with process-group SIGINT, then retrying :reload with a {RECOVERY_COMPILATION_INACTIVITY_TIMEOUT:?} inactivity timeout",
                         self.process_group_id,
                         self.search_paths.cwd,
                         self.opts.command,
@@ -1168,6 +1189,7 @@ impl Ghci {
                 LifecycleEvent::Reload(hooks::When::After),
             ],
             Some(haskell_files),
+            true,
         )
         .await?;
 
@@ -1180,10 +1202,16 @@ impl Ghci {
         log: &mut CompilationLog,
         events: [LifecycleEvent; N],
         haskell_files: Option<BTreeSet<NormalPath>>,
+        stop_old_process: bool,
     ) -> eyre::Result<()> {
-        if let Err(err) = self.stop().await {
-            self.run_shell_lifecycle_events(events).await?;
-            return Err(err);
+        // Recovery-kill callers have already consumed the old process's exit notification. Its
+        // process-watcher task and restart channel are gone, so asking `stop` for an acknowledgement
+        // would fail instead of starting the replacement.
+        if stop_old_process {
+            if let Err(err) = self.stop().await {
+                self.run_shell_lifecycle_events(events).await?;
+                return Err(err);
+            }
         }
         let new = match Self::new(
             self.shutdown.clone(),
@@ -1496,6 +1524,9 @@ impl Ghci {
             // The named attempt is the final compilation result, including legitimate source
             // diagnostics from modules which entered the target set but failed to compile.
             log.diagnostics.append(&mut named_log.diagnostics);
+            log.stdout_diagnostics
+                .append(&mut named_log.stdout_diagnostics);
+            log.stderr.push_str(&named_log.stderr);
             if named_log.summary.is_some() {
                 log.summary = named_log.summary;
             }
@@ -1716,7 +1747,7 @@ impl Ghci {
         print_ghciwatch_error(
             "GHCi recovery reload stopped reporting compilation progress",
             &format!(
-                "Component: recovery :reload after {inactive_component}\nInactivity timeout: {RECOVERY_COMPILATION_INACTIVITY_TIMEOUT:?}\nProcess group ID: {}\nWorking directory: {}\nCommand: {}\nRecovery: force-killing the GHCi process tree; the manager will immediately initialize a fresh session",
+                "Component: recovery :reload after {inactive_component}\nProtocol stage: recovery :reload was written to GHCi stdin; ghciwatch was waiting for its stdout prompt\nProgress signal: no stdout containing `Compiling` or GHCi prompt was observed during the final {RECOVERY_COMPILATION_INACTIVITY_TIMEOUT:?}\nProcess group ID: {}\nWorking directory: {}\nCommand: {}\nRecovery: force-killing the GHCi process tree; the manager will immediately initialize a fresh session",
                 self.process_group_id, self.search_paths.cwd, self.opts.command,
             ),
         );
@@ -1766,7 +1797,10 @@ impl Ghci {
     }
 
     async fn send_sigint_capturing(&mut self, log: &mut CompilationLog) -> eyre::Result<()> {
-        match self.send_sigint_inner(log).await {
+        let stderr_start = log.stderr.len();
+        let result = self.send_sigint_inner(log).await;
+        log.discard_interrupt_output_since(stderr_start);
+        match result {
             Ok(()) => Ok(()),
             Err(error) => self.force_kill_for_recovery(error).await,
         }
@@ -2090,7 +2124,6 @@ impl Ghci {
                         self.stdin
                             .run_command(&mut self.stdout, command, log)
                             .await?;
-                        tracing::info!("Finished running tests in {:.2?}", start_time.elapsed());
                     } else {
                         // Hook diagnostics are advisory and must not turn the surrounding reload
                         // into a failed compilation or suppress its after-hooks.
@@ -2100,9 +2133,14 @@ impl Ghci {
                             tracing::error!(%command, "Ignoring {hook} command error");
                         }
                     }
+                    hook.event.log_completion(start_time, command);
                 }
                 hooks::Command::Shell(command) => {
-                    if let Err(err) = command.run_on(&mut self.command_handles).await {
+                    let (description, timing_threshold) = hook.event.completion_timing();
+                    if let Err(err) = command
+                        .run_hook_on(&mut self.command_handles, description, timing_threshold)
+                        .await
+                    {
                         tracing::error!(%command, "Ignoring {hook} command error: {err}");
                     }
                 }
@@ -2120,22 +2158,26 @@ impl Ghci {
                 continue;
             };
             tracing::info!(%command, "Running {hook} command");
+            let start_time = Instant::now();
             let mut hook_log = CompilationLog::default();
             self.run_hook_command(command, &mut hook_log).await?;
             if matches!(hook_log.result(), Some(CompilationResult::Err)) {
                 tracing::error!(%command, "Ignoring {hook} command error");
             }
+            hook.event.log_completion(start_time, command);
         }
         Ok(())
     }
 
     async fn capture_interrupted_stderr(&mut self, log: &mut CompilationLog) -> eyre::Result<()> {
-        match tokio::time::timeout(
+        let stderr_start = log.stderr.len();
+        let result = tokio::time::timeout(
             INTERRUPT_CLEANUP_TIMEOUT,
             self.stdout.capture_stderr(&mut self.stdin.stdin, log),
         )
-        .await
-        {
+        .await;
+        log.discard_interrupt_output_since(stderr_start);
+        match result {
             Ok(result) => result,
             Err(_) => {
                 self.force_kill_for_recovery(eyre!(

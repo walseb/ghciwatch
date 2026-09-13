@@ -102,10 +102,7 @@ async fn replacement_generated_follow_up_republishes_error_file() {
 
     session
         .fs()
-        .wait_for_path(
-            session.startup_timeout,
-            &session.path("follow-up-complete"),
-        )
+        .wait_for_path(session.startup_timeout, &session.path("follow-up-complete"))
         .await
         .expect("replacement-generated follow-up republishes compile.txt");
     assert!(

@@ -70,10 +70,21 @@ impl ErrorLog {
             }
         }
 
-        for diagnostic in &log.diagnostics {
+        let diagnostics = if log.stderr.is_empty() {
+            // With no raw stderr, include synthetic failures and all parsed diagnostics.
+            &log.diagnostics
+        } else {
+            // Cabal can forward dependency-build diagnostics on stdout while writing its own
+            // warnings/failure summary on stderr. Only stderr diagnostics are already represented
+            // by the raw capture; never suppress the independent stdout diagnostics.
+            &log.stdout_diagnostics
+        };
+        for diagnostic in diagnostics {
             tracing::debug!(%diagnostic, "Writing diagnostic");
             writer.write_all(diagnostic.to_string().as_bytes()).await?;
         }
+        tracing::debug!(bytes = log.stderr.len(), "Writing raw GHCi stderr");
+        writer.write_all(log.stderr.as_bytes()).await?;
 
         // This is load-bearing! If we don't properly flush/shutdown the handle, nothing gets
         // written!

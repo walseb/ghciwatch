@@ -103,19 +103,19 @@ mod tests {
                     severity: Severity::Error,
                     path: Some("./C.hs".into()),
                     span: Default::default(),
-                    message: message.to_owned()
+                    message: message.to_owned(),
                 }),
                 GhcMessage::Diagnostic(GhcDiagnostic {
                     severity: Severity::Error,
                     path: Some("A.hs".into()),
                     span: Default::default(),
-                    message: message.to_owned()
+                    message: message.to_owned(),
                 }),
                 GhcMessage::Diagnostic(GhcDiagnostic {
                     severity: Severity::Error,
                     path: Some("./B.hs".into()),
                     span: Default::default(),
-                    message: message.to_owned()
+                    message: message.to_owned(),
                 }),
             ]
         );
@@ -132,19 +132,19 @@ mod tests {
                     severity: Severity::Error,
                     path: Some("./C.hs".into()),
                     span: Default::default(),
-                    message: message.clone()
+                    message: message.clone(),
                 }),
                 GhcMessage::Diagnostic(GhcDiagnostic {
                     severity: Severity::Error,
                     path: Some("A.hs".into()),
                     span: Default::default(),
-                    message: message.clone()
+                    message: message.clone(),
                 }),
                 GhcMessage::Diagnostic(GhcDiagnostic {
                     severity: Severity::Error,
                     path: Some("./B.hs".into()),
                     span: Default::default(),
-                    message: message.clone()
+                    message: message.clone(),
                 }),
             ]
         );

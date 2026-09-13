@@ -58,7 +58,7 @@ mod tests {
                 message: "\n    Could not find module ‘Example’\
                     \n    It is not a module in the current program, or in any known package.\
                     \n"
-                .into()
+                .into(),
             }
         );
 
@@ -83,7 +83,7 @@ mod tests {
                                                                                           src/Foo.hs
                     "
                 )
-                .into()
+                .into(),
             }
         );
 

@@ -84,7 +84,7 @@ mod tests {
                       |            ^^^^^^^
                     "
                 )
-                .into()
+                .into(),
             }
         );
 
@@ -140,7 +140,7 @@ mod tests {
                     "  |           ^^^^^^^^^",
                     "",
                 ]
-                .join("\n")
+                .join("\n"),
             }
             .to_string(),
             indoc!(

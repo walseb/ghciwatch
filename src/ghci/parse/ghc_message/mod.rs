@@ -2,7 +2,6 @@
 
 use std::fmt::Display;
 
-use camino::Utf8Path;
 use camino::Utf8PathBuf;
 use eyre::eyre;
 use winnow::combinator::alt;
@@ -38,7 +37,10 @@ mod cant_find_file_diagnostic;
 use cant_find_file_diagnostic::cant_find_file_diagnostic;
 
 mod generic_diagnostic;
+mod json_diagnostic;
 use generic_diagnostic::generic_diagnostic;
+use json_diagnostic::json_diagnostic;
+pub(crate) use json_diagnostic::parse_json_diagnostic_line;
 
 mod module_import_cycle_diagnostic;
 use module_import_cycle_diagnostic::module_import_cycle_diagnostic;
@@ -170,6 +172,7 @@ fn parse_messages_inner(input: &mut &str) -> PResult<Vec<GhcMessage>> {
         0..,
         alt((
             compiling.map(GhcMessage::Compiling).map(Item::One),
+            json_diagnostic.map(GhcMessage::Diagnostic).map(Item::One),
             generic_diagnostic
                 .map(GhcMessage::Diagnostic)
                 .map(Item::One),

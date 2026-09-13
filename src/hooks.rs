@@ -4,6 +4,8 @@ use std::fmt::Display;
 use std::fmt::Write;
 use std::process::ExitStatus;
 use std::str::FromStr;
+use std::time::Duration;
+use std::time::Instant;
 
 use clap::builder::ValueParserFactory;
 use clap::Arg;
@@ -16,6 +18,8 @@ use tokio::task::JoinHandle;
 
 use crate::ghci::GhciCommand;
 use crate::maybe_async_command::MaybeAsyncCommand;
+
+const HOOK_COMPLETION_TIMING_THRESHOLD: Duration = Duration::from_millis(10);
 
 /// A lifecycle event that triggers hooks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Sequence)]
@@ -47,6 +51,23 @@ impl LifecycleEvent {
             LifecycleEvent::Startup(_) => "startup",
             LifecycleEvent::Reload(_) => "reload",
             LifecycleEvent::Restart(_) => "restart",
+        }
+    }
+
+    /// Description and threshold policy for lifecycle-hook completion timing.
+    pub(crate) fn completion_timing(&self) -> (String, Duration) {
+        match self {
+            LifecycleEvent::Test => ("running tests".to_owned(), Duration::ZERO),
+            event => (format!("{event} command"), HOOK_COMPLETION_TIMING_THRESHOLD),
+        }
+    }
+
+    /// Report a completed GHCi hook. Tests are always reported; other hooks are reported after 10 ms.
+    pub(crate) fn log_completion(&self, start_time: Instant, command: impl Display) {
+        let elapsed = start_time.elapsed();
+        let (description, threshold) = self.completion_timing();
+        if elapsed >= threshold {
+            tracing::info!(%command, "Finished {description} in {elapsed:.2?}");
         }
     }
 
@@ -316,7 +337,11 @@ impl HookOpts {
         for hook in self.select(event) {
             if let Command::Shell(command) = &hook.command {
                 tracing::info!(%command, "Running {hook} command");
-                if let Err(err) = command.run_on(handles).await {
+                let (description, timing_threshold) = hook.event.completion_timing();
+                if let Err(err) = command
+                    .run_hook_on(handles, description, timing_threshold)
+                    .await
+                {
                     // Hook failures are advisory. They must not prevent the lifecycle operation or
                     // suppress later hooks (especially paired after-hooks used for cleanup).
                     tracing::error!(%command, "Ignoring {hook} command error: {err}");
@@ -396,5 +421,29 @@ impl FromArgMatches for HookOpts {
             .sort_by(|a, b| a.command.kind().cmp(&b.command.kind()));
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::LifecycleEvent;
+    use super::When;
+    use super::HOOK_COMPLETION_TIMING_THRESHOLD;
+
+    #[test]
+    fn test_hooks_always_log_completion_timing() {
+        assert_eq!(
+            LifecycleEvent::Test.completion_timing(),
+            ("running tests".to_owned(), Duration::ZERO)
+        );
+        assert_eq!(
+            LifecycleEvent::Reload(When::After).completion_timing(),
+            (
+                "after-reload command".to_owned(),
+                HOOK_COMPLETION_TIMING_THRESHOLD
+            )
+        );
     }
 }

@@ -58,7 +58,8 @@ impl GhciStdout {
         // task has consumed all diagnostics emitted by the command. Submit a subsequent marker
         // command and read stderr through it before parsing the operation's output.
         let stderr_data = self.stderr_buffer_through_marker(stdin).await?;
-        log.extend(parse_ghc_messages(data).wrap_err("Failed to parse compiler output")?);
+        log.append_stderr(&stderr_data);
+        log.extend_stdout(parse_ghc_messages(data).wrap_err("Failed to parse compiler output")?);
         log.extend(parse_ghc_messages(&stderr_data).wrap_err("Failed to parse compiler output")?);
         Ok(())
     }
@@ -124,7 +125,7 @@ impl GhciStdout {
         // Parse startup stdout now, but leave stderr buffered. `GhciStdin::initialize` installs the
         // prompt without clearing stderr and then uses the normal marker boundary to collect every
         // startup diagnostic, including output delayed beyond the version banner.
-        log.extend(parse_ghc_messages(&data).wrap_err("Failed to parse compiler output")?);
+        log.extend_stdout(parse_ghc_messages(&data).wrap_err("Failed to parse compiler output")?);
 
         Ok(())
     }
@@ -136,6 +137,7 @@ impl GhciStdout {
             .send(StderrEvent::DrainBuffer { sender })
             .await?;
         let data = receiver.await?;
+        log.append_stderr(&data);
         log.extend(parse_ghc_messages(&data).wrap_err("Failed to parse compiler output")?);
         Ok(data)
     }
@@ -254,12 +256,25 @@ impl GhciStdout {
             .await?;
         match result {
             Some(ReadUntilStatus::Complete(data)) => {
-                tracing::debug!(bytes = data.len(), "Got data from ghci");
+                tracing::debug!(
+                    bytes = data.len(),
+                    "GHCi stdout prompt reached; synchronizing and parsing stderr"
+                );
                 self.parse_into_log(stdin, &data, log).await?;
+                tracing::debug!("GHCi prompt operation and stderr synchronization completed");
                 Ok(CompilationWaitStatus::Complete)
             }
-            Some(ReadUntilStatus::Inactive) => Ok(CompilationWaitStatus::Inactive),
-            None => Ok(CompilationWaitStatus::Error),
+            Some(ReadUntilStatus::Inactive) => {
+                tracing::debug!(
+                    ?progress_timeout,
+                    "No compilation progress or GHCi prompt before inactivity timeout"
+                );
+                Ok(CompilationWaitStatus::Inactive)
+            }
+            None => {
+                tracing::debug!("GHC error observed before stdout prompt");
+                Ok(CompilationWaitStatus::Error)
+            }
         }
     }
 

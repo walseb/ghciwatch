@@ -3,6 +3,8 @@ use std::fmt::Write;
 use std::process::ExitStatus;
 use std::process::Stdio;
 use std::str::FromStr;
+use std::time::Duration;
+use std::time::Instant;
 
 use eyre::eyre;
 use eyre::Context;
@@ -57,12 +59,20 @@ fn parse_maybe_async_command(input: &mut &str) -> PResult<MaybeAsyncCommand> {
 impl MaybeAsyncCommand {
     #[instrument(skip(self), fields(%self), level = "debug")]
     pub async fn status(&self) -> MaybeAsyncCommandStatus {
+        self.status_with_timing(None).await
+    }
+
+    async fn status_with_timing(
+        &self,
+        timing: Option<(String, Duration)>,
+    ) -> MaybeAsyncCommandStatus {
         let program = self.command.program.to_string_lossy().into_owned();
         let mut command = self.command.as_tokio();
         command.kill_on_drop(true);
         let command_formatted = self.display();
         let join_handle = tokio::task::spawn(
             async move {
+                let start_time = Instant::now();
                 tracing::info!("$ {command_formatted}");
                 // Let hook output stream directly rather than retaining the complete output in
                 // memory until the command exits.
@@ -72,6 +82,16 @@ impl MaybeAsyncCommand {
                     .status()
                     .await
                     .wrap_err_with(|| format!("Failed to execute `{command_formatted}`"))?;
+
+                if let Some((description, threshold)) = timing {
+                    let elapsed = start_time.elapsed();
+                    if elapsed >= threshold {
+                        tracing::info!(
+                            command = command_formatted,
+                            "Finished {description} in {elapsed:.2?}"
+                        );
+                    }
+                }
 
                 let mut message = shell_words::quote(&program).into_owned();
                 message.push(' ');
@@ -121,6 +141,26 @@ impl MaybeAsyncCommand {
             }
         }
         Ok(())
+    }
+
+    /// Run a lifecycle hook, reporting completion when it takes at least 10 ms. Test hooks always
+    /// report their completion time. Async hooks report when their child actually exits.
+    pub(crate) async fn run_hook_on(
+        &self,
+        handles: &mut Vec<JoinHandle<eyre::Result<ExitStatus>>>,
+        description: String,
+        timing_threshold: Duration,
+    ) -> eyre::Result<()> {
+        match self
+            .status_with_timing(Some((description, timing_threshold)))
+            .await
+        {
+            MaybeAsyncCommandStatus::Sync(result) => result.map(|_| ()),
+            MaybeAsyncCommandStatus::Async(join_handle) => {
+                handles.push(join_handle);
+                Ok(())
+            }
+        }
     }
 }
 
