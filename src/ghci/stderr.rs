@@ -210,7 +210,10 @@ impl GhciStderr {
             }
             self.ingest_line(line).await?;
         }
-        let _ = sender.send(self.buffer.clone());
+        // Synchronization is a consumptive boundary. Later markers must return only stderr
+        // emitted since this marker; returning the cumulative buffer duplicates diagnostics when
+        // interrupt recovery performs a sync barrier followed by a final stderr capture.
+        let _ = sender.send(std::mem::take(&mut self.buffer));
         Ok(())
     }
 
@@ -238,6 +241,10 @@ fn line_has_error_diagnostic(line: &str) -> bool {
     use crate::ghci::parse::GhcMessage;
     use crate::ghci::parse::Severity;
 
+    if let Some(diagnostic) = crate::ghci::parse::parse_json_diagnostic_line(line) {
+        return diagnostic.severity == Severity::Error;
+    }
+
     crate::ghci::parse::parse_ghc_messages(line).is_ok_and(|messages| {
         messages.into_iter().any(|message| {
             matches!(
@@ -263,6 +270,17 @@ mod tests {
         assert!(!line_has_error_diagnostic(
             "application said error: but this is not a diagnostic\n"
         ));
+    }
+
+    #[test]
+    fn recognizes_json_error_diagnostics() {
+        assert!(line_has_error_diagnostic(
+            r#"{"version":"1.1","ghcVersion":"9.12.2","span":null,"severity":"Error","code":null,"message":["bad"],"hints":[]}"#
+        ));
+        assert!(!line_has_error_diagnostic(
+            r#"{"version":"1.1","ghcVersion":"9.12.2","span":null,"severity":"Warning","code":null,"message":["careful"],"hints":[]}"#
+        ));
+        assert!(!line_has_error_diagnostic(r#"{"severity":"Error"}"#));
     }
 
     #[test]

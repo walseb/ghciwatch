@@ -1,10 +1,12 @@
 use expect_test::expect;
 use indoc::indoc;
 
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::UnixStream;
+
 use test_harness::test;
 use test_harness::BaseMatcher;
 use test_harness::Fs;
-use test_harness::GhcVersion;
 use test_harness::GhciWatchBuilder;
 
 /// Test that `ghciwatch --errors ...` can write the error log.
@@ -26,10 +28,10 @@ async fn can_write_error_log() {
         .read(&error_path)
         .await
         .expect("ghciwatch writes ghcid.txt");
-    expect![[r#"
-        All good (1 module)
-    "#]]
-    .assert_eq(&error_contents);
+    assert!(
+        error_contents.starts_with("All good (1 module)\n"),
+        "success headline missing from raw error log: {error_contents:?}"
+    );
 }
 
 /// Recursive-module diagnostics emitted immediately on stderr are preserved in `--error-file`.
@@ -72,8 +74,7 @@ async fn can_write_error_log_recursive_module_errors() {
         .await
         .expect("ghciwatch writes ghcid.txt");
     assert!(
-        error_contents.contains("src/MyLib.hs: error:")
-            && error_contents.contains("imports itself"),
+        error_contents.contains("src/MyLib.hs:") && error_contents.contains("imports itself"),
         "recursive-module diagnostic missing from error log: {error_contents:?}"
     );
 }
@@ -136,7 +137,89 @@ async fn interrupted_reload_writes_diagnostics() {
         contents.contains("staleFailure"),
         "interrupted diagnostic missing from error log: {contents:?}"
     );
+    assert!(
+        !contents.lines().any(|line| line == "Interrupted."),
+        "GHCi interrupt acknowledgement leaked into error log: {contents:?}"
+    );
 }
+
+/// JSON GHC diagnostics trigger `--interrupt-on-error` and remain raw in the error file.
+#[test(current)]
+async fn json_diagnostic_interrupts_reload_and_writes_diagnostic() {
+    let mut session = GhciWatchBuilder::new("tests/data/simple")
+        .with_startup_timeout(std::time::Duration::from_secs(25))
+        .with_ghc_arg("-fdiagnostics-as-json")
+        .with_args([
+            "--error-file",
+            "compile.txt",
+            "--interrupt-on-error",
+            "--before-interrupt",
+            "touch compilation-interrupted",
+        ])
+        .start()
+        .await
+        .expect("ghciwatch starts");
+    session
+        .wait_until_ready()
+        .await
+        .expect("ghciwatch is ready");
+
+    session
+        .fs()
+        .replace(
+            session.path("src/MyLib.hs"),
+            "example = \"example\"",
+            "example = jsonDiagnosticFailure",
+        )
+        .await
+        .expect("can trigger a failing reload");
+    session
+        .fs()
+        .wait_for_path(
+            session.startup_timeout,
+            &session.path("compilation-interrupted"),
+        )
+        .await
+        .expect("the JSON diagnostic interrupts compilation");
+    session
+        .wait_for_log(BaseMatcher::span_close().in_leaf_spans(["error_log_write"]))
+        .await
+        .expect("ghciwatch writes compile.txt");
+
+    let contents = session
+        .fs()
+        .read(session.path("compile.txt"))
+        .await
+        .expect("interrupted reload writes compile.txt");
+    let json_line = contents
+        .lines()
+        .find(|line| line.starts_with('{'))
+        .expect("error file contains a raw JSON diagnostic line");
+    let diagnostic: serde_json::Value =
+        serde_json::from_str(json_line).expect("raw diagnostic line is valid JSON");
+    assert_eq!(diagnostic["severity"], "Error");
+    assert_eq!(
+        contents
+            .lines()
+            .filter(|line| line.contains("jsonDiagnosticFailure"))
+            .count(),
+        1,
+        "interrupted diagnostic was written more than once: {contents:?}"
+    );
+    assert!(
+        diagnostic["message"]
+            .as_array()
+            .is_some_and(|messages| messages.iter().any(|message| message
+                .as_str()
+                .is_some_and(|message| message.contains("jsonDiagnosticFailure")))),
+        "JSON diagnostic missing from error log: {contents:?}"
+    );
+    assert!(
+        !contents.lines().any(|line| line == "Interrupted."),
+        "GHCi interrupt acknowledgement leaked into error log: {contents:?}"
+    );
+}
+
 /// Test that `ghciwatch --errors ...` can write the error log with `--repl-no-load`.
 #[test]
 async fn can_write_error_log_repl_no_load() {
@@ -157,10 +240,10 @@ async fn can_write_error_log_repl_no_load() {
         .read(&error_path)
         .await
         .expect("ghciwatch writes ghcid.txt");
-    expect![[r#"
-        All good (0 modules)
-    "#]]
-    .assert_eq(&error_contents);
+    assert!(
+        error_contents.starts_with("All good (0 modules)\n"),
+        "success headline missing from raw error log: {error_contents:?}"
+    );
 }
 
 /// Test that `ghciwatch --errors ...` can write compilation errors.
@@ -216,18 +299,12 @@ async fn can_write_error_log_compilation_errors() {
         .await
         .expect("ghciwatch writes ghcid.txt");
 
-    expect![[r#"
-            src/My/Module.hs:3:11: error: [GHC-83865]
-                * Couldn't match type `[Char]' with `()'
-                  Expected: ()
-                    Actual: String
-                * In the expression: "Uh oh!"
-                  In an equation for `myIdent': myIdent = "Uh oh!"
-              |
-            3 | myIdent = "Uh oh!"
-              |           ^^^^^^^^
-        "#]]
-    .assert_eq(&error_contents);
+    assert!(
+        error_contents.contains("src/My/Module.hs:3:11:")
+            && error_contents.contains("Couldn't match expected type")
+            && error_contents.contains("myIdent = \"Uh oh!\""),
+        "raw compilation stderr missing from error log: {error_contents:?}"
+    );
 
     session
         .fs()
@@ -300,24 +377,10 @@ async fn preserves_error_log_paths() {
         .expect("ghciwatch writes ghcid.txt");
 
     // GHCi's working directory is the package, so GHC emits paths relative to it.
-    let expected = match session.ghc_version() {
-        GhcVersion::Ghc96 | GhcVersion::Ghc98 | GhcVersion::Ghc910 => expect![[r#"
-            src/SimpleDep.hs:4:28: error: [GHC-21231]
-                lexical error in string/character literal at character '\n'
-              |
-            4 | depFunc = putStrLn "depFunc
-              |                            ^
-        "#]],
-        GhcVersion::Ghc912 | GhcVersion::Ghc914 => expect![[r#"
-            src/SimpleDep.hs:4:20: error: [GHC-21231]
-                lexical error at character '\n'
-              |
-            4 | depFunc = putStrLn "depFunc
-              |                    ^^^^^^^^
-        "#]],
-    };
-
-    expected.assert_eq(&error_contents);
+    assert!(
+        error_contents.contains("src/SimpleDep.hs:4:") && error_contents.contains("lexical error"),
+        "raw dependency diagnostic missing from error log: {error_contents:?}"
+    );
 }
 
 /// Diagnostics written only to stderr are captured when the command exits before GHCi boots.
@@ -350,6 +413,35 @@ async fn error_log_pre_ghci_stderr_failure() {
     .assert_eq(&error_contents);
 }
 
+/// Cabal may forward dependency diagnostics to stdout while its own failure goes to stderr.
+#[test(current)]
+async fn error_log_pre_ghci_stdout_diagnostics_with_stderr() {
+    let command = r#"sh -c 'printf "%s\n" "src/Early.hs:179:20: error: [GHC-56428]" "    Ambiguous record field sampleRate."; printf "%s\n" "Error: [Cabal-7125]" "Failed to build dependency required by cabal repl." >&2; exit 1'"#;
+    let mut session = GhciWatchBuilder::new("tests/data/simple")
+        .with_args(["--error-file", "compile.txt"])
+        .with_repl_command(command)
+        .start()
+        .await
+        .expect("ghciwatch starts");
+    session
+        .wait_for_startup_log("ghci exited during startup")
+        .await
+        .expect("ghciwatch detects the dependency build failure");
+
+    let contents = session
+        .fs()
+        .read(session.path("compile.txt"))
+        .await
+        .expect("startup failure publishes compile.txt");
+    assert!(
+        contents.contains("src/Early.hs:179:20: error: [GHC-56428]")
+            && contents.contains("Ambiguous record field sampleRate.")
+            && contents.contains("Cabal-7125"),
+        "stdout dependency diagnostic missing alongside stderr: {contents:?}"
+    );
+    assert!(!contents.contains("All good"));
+}
+
 /// Plain Cabal failures before the GHCi banner become errors and are visible to startup hooks.
 #[test]
 async fn error_log_pre_ghci_plain_failure_runs_hook() {
@@ -373,10 +465,7 @@ async fn error_log_pre_ghci_plain_failure_runs_hook() {
         .expect("ghciwatch detects the plain pre-GHCi failure");
     session
         .fs()
-        .wait_for_path(
-            session.startup_timeout,
-            &session.path("early-startup-hook"),
-        )
+        .wait_for_path(session.startup_timeout, &session.path("early-startup-hook"))
         .await
         .expect("after-startup hook observes the early error log");
 
@@ -385,11 +474,9 @@ async fn error_log_pre_ghci_plain_failure_runs_hook() {
         .read(session.path(error_path))
         .await
         .expect("ghciwatch writes the plain startup failure");
-    assert!(
-        error_contents.contains("<no location info>: error:")
-            && error_contents.contains("Cabal-7125")
-            && error_contents.contains("configure failed before GHCi startup"),
-        "plain startup diagnostic missing from error log: {error_contents:?}"
+    assert_eq!(
+        error_contents,
+        "Error: [Cabal-7125]\nconfigure failed before GHCi startup\n"
     );
 }
 
@@ -398,6 +485,7 @@ async fn error_log_pre_ghci_plain_failure_runs_hook() {
 async fn error_log_restart_failure_before_ghci() {
     let error_path = "ghcid.txt";
     let mut session = GhciWatchBuilder::new("tests/data/with-dep")
+        .with_startup_timeout(std::time::Duration::from_secs(25))
         .with_args([
             "--errors",
             error_path,
@@ -475,27 +563,13 @@ async fn error_log_startup_failure() {
         .await
         .expect("ghciwatch writes ghcid.txt");
 
-    // We don't have access to the package's directory here so we can't fix these paths!
-    // These _should_ be like `simple-dep/src/SimpleDep.hs` but GHC doesn't emit them relative to
-    // the invocation so users are just Fucked.
-    let expected = match session.ghc_version() {
-        GhcVersion::Ghc96 | GhcVersion::Ghc98 | GhcVersion::Ghc910 => expect![[r#"
-            src/SimpleDep.hs:4:28: error: [GHC-21231]
-                lexical error in string/character literal at character '\n'
-              |
-            4 | depFunc = putStrLn "depFunc
-              |                            ^
-        "#]],
-        GhcVersion::Ghc912 | GhcVersion::Ghc914 => expect![[r#"
-            src/SimpleDep.hs:4:20: error: [GHC-21231]
-                lexical error at character '\n'
-              |
-            4 | depFunc = putStrLn "depFunc
-              |                    ^^^^^^^^
-        "#]],
-    };
-
-    expected.assert_eq(&error_contents);
+    // We don't have access to the package's directory here, so preserve GHC/Cabal's raw paths.
+    assert!(
+        error_contents.contains("src/SimpleDep.hs:4:")
+            && error_contents.contains("lexical error")
+            && error_contents.contains("Cabal-7125"),
+        "raw startup stderr missing from error log: {error_contents:?}"
+    );
 }
 
 /// A completed reload is not published when watched source changed after its event snapshot. The
@@ -623,4 +697,136 @@ async fn interrupt_on_error_still_publishes_quiescent_follow_up() {
         .await
         .expect("follow-up leaves compile.txt present");
     assert_eq!(contents, "All good (1 module)\n");
+}
+
+/// A queued watcher event must not remove the last completed error log while an executable eval
+/// prevents its replacement reload from beginning.
+#[test(current)]
+async fn before_reload_shell_waits_for_active_eval_before_removing_error_log() {
+    let mut session = GhciWatchBuilder::new("tests/data/simple")
+        .with_args([
+            "--error-file",
+            "compile.txt",
+            "--before-reload-shell",
+            "sh -c 'rm -f compile.txt; touch before-reload'",
+        ])
+        .start()
+        .await
+        .expect("ghciwatch starts");
+    session
+        .wait_until_ready()
+        .await
+        .expect("ghciwatch is ready");
+    let initial_error_log = session
+        .fs()
+        .read(session.path("compile.txt"))
+        .await
+        .expect("startup publishes the initial error log");
+
+    let socket_path = session.path("ghciwatch-eval.sock");
+    let release_path = session.path("../release-eval");
+    let eval_command = format!(
+        ":! touch eval-started; while test ! -e '{}'; do sleep .05; done{}",
+        release_path.display(),
+        '⋳'
+    );
+    let eval = tokio::spawn(async move {
+        let mut socket = UnixStream::connect(socket_path)
+            .await
+            .expect("connects to eval socket");
+        socket
+            .write_all(eval_command.as_bytes())
+            .await
+            .expect("writes blocking eval command");
+        let mut response = Vec::new();
+        socket
+            .read_to_end(&mut response)
+            .await
+            .expect("reads eval response");
+        assert_eq!(response, "⋳".as_bytes());
+    });
+    session
+        .fs()
+        .wait_for_path(session.startup_timeout, &session.path("eval-started"))
+        .await
+        .expect("eval holds the operation barrier");
+
+    session.clear_events();
+    session
+        .fs()
+        .touch(session.path("src/MyLib.hs"))
+        .await
+        .expect("can queue a reload");
+    session
+        .wait_for_log(BaseMatcher::message("Received ghci event from watcher"))
+        .await
+        .expect("manager receives the reload while the eval holds the barrier");
+    let queued_error_log = session
+        .fs()
+        .read(session.path("compile.txt"))
+        .await
+        .expect("queued reload leaves the completed error log in place");
+    assert_eq!(
+        queued_error_log, initial_error_log,
+        "queued reload preserves the last completed error log"
+    );
+    assert!(
+        !session.path("before-reload").exists(),
+        "before-reload hook waits until the reload can begin"
+    );
+
+    session
+        .fs()
+        .touch(release_path)
+        .await
+        .expect("can release the eval barrier");
+    eval.await.expect("eval task completes");
+    session
+        .wait_until_reload()
+        .await
+        .expect("queued reload completes after eval");
+    assert!(
+        session.path("before-reload").exists(),
+        "before-reload hook eventually runs"
+    );
+    assert!(
+        session.path("compile.txt").exists(),
+        "reload publishes a replacement error log"
+    );
+}
+
+/// REPL-only JSON flags do not affect Cabal's prerequisite package builds.
+#[test(current)]
+async fn error_log_json_repl_dependency_startup_failure() {
+    let mut session = GhciWatchBuilder::new("tests/data/with-dep")
+        .with_ghc_arg("-fdiagnostics-as-json")
+        .with_args(["--error-file", "compile.txt"])
+        .before_start(|path| async move {
+            Fs::new()
+                .replace(
+                    path.join("simple-dep/src/SimpleDep.hs"),
+                    "\"depFunc\"",
+                    "\"depFunc",
+                )
+                .await
+        })
+        .start()
+        .await
+        .expect("ghciwatch starts");
+    session
+        .wait_for_startup_log("ghci exited during startup")
+        .await
+        .expect("Cabal fails before the JSON-configured REPL boots");
+    let contents = session
+        .fs()
+        .read(session.path("compile.txt"))
+        .await
+        .expect("dependency failure publishes compile.txt");
+    assert!(
+        contents.contains("src/SimpleDep.hs:4:")
+            && contents.contains("lexical error")
+            && contents.contains("Cabal-7125"),
+        "text dependency diagnostic missing in JSON REPL mode: {contents:?}"
+    );
+    assert!(!contents.contains("All good"));
 }

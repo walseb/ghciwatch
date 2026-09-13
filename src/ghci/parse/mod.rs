@@ -16,6 +16,7 @@ pub use eval::parse_eval_commands;
 pub use eval::EvalCommand;
 pub use ghc_message::compiling;
 pub use ghc_message::parse_ghc_messages;
+pub(crate) use ghc_message::parse_json_diagnostic_line;
 pub use ghc_message::CompilationResult;
 pub use ghc_message::CompilationSummary;
 pub use ghc_message::CompilingProgress;

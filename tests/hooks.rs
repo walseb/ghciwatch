@@ -20,11 +20,17 @@ async fn can_run_hooks() {
             "async:touch before-startup-1",
             "--before-startup-shell",
             "touch before-startup-2",
+            "--before-startup-shell",
+            "sleep 0.02",
+            "--before-startup-shell",
+            "async:sleep 0.03",
             // ---
             "--after-startup-ghci",
             "putStrLn \"after-startup-1\"",
             "--after-startup-ghci",
             "putStrLn \"after-startup-2\"",
+            "--after-startup-ghci",
+            ":! sleep 0.02",
             // ---
             "--before-reload-ghci",
             "Definitely.Not.In.Scope.beforeReload",
@@ -77,6 +83,19 @@ async fn can_run_hooks() {
 
     ghci_hook(&mut session, "after-startup", "1").await;
     ghci_hook(&mut session, "after-startup", "2").await;
+
+    for (message, command) in [
+        ("Finished before-startup command in", "sleep 0.02"),
+        ("Finished before-startup command in", "sleep 0.03"),
+        ("Finished after-startup command in", ":! sleep 0.02"),
+    ] {
+        session
+            .wait_for_startup_log(
+                BaseMatcher::message(message).with_field("command", &regex::escape(command)),
+            )
+            .await
+            .unwrap_or_else(|err| panic!("completion timing missing for {command}: {err}"));
+    }
 
     session.wait_until_ready().await.unwrap();
 
@@ -257,9 +276,10 @@ async fn shell_hook(session: &mut GhciWatch, hook: &str, index: &str) {
 #[test]
 async fn hooks_can_observe_error_log() {
     let module_path = "src/MyLib.hs";
-    let after_startup = shell_requote("grep -q '^src/MyLib.hs:4:11' ghcid.txt");
-    let after_reload = shell_requote("grep -q '^src/MyLib.hs:5:11' ghcid.txt");
-    let after_restart = shell_requote("grep -q '^src/MyCoolModule.hs:1:8' ghcid.txt");
+    // Raw GHC stderr may begin with ANSI styling, so do not require the path at byte zero.
+    let after_startup = shell_requote("grep -q 'src/MyLib.hs:4:11' ghcid.txt");
+    let after_reload = shell_requote("grep -q 'src/MyLib.hs:5:11' ghcid.txt");
+    let after_restart = shell_requote("grep -q 'src/MyCoolModule.hs:1:8' ghcid.txt");
 
     let mut session = GhciWatchBuilder::new("tests/data/simple")
         .before_start(move |path| async move {

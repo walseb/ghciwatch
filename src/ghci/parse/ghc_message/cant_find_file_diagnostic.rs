@@ -49,7 +49,7 @@ mod tests {
                 severity: Severity::Error,
                 path: Some("Why.hs".into()),
                 span: Default::default(),
-                message: "can't find file".to_owned()
+                message: "can't find file".to_owned(),
             }
         );
 

@@ -18,8 +18,7 @@ pub struct Position {
 
 impl Position {
     /// Construct a new [`Position`] from a line and column number.
-    #[cfg(test)]
-    pub fn new(line: usize, column: usize) -> Self {
+    pub(crate) fn new(line: usize, column: usize) -> Self {
         Self { line, column }
     }
 
@@ -46,8 +45,12 @@ pub struct PositionRange {
 
 impl PositionRange {
     /// Construct a new span from the given lines and columns.
-    #[cfg(test)]
-    pub fn new(start_line: usize, start_column: usize, end_line: usize, end_column: usize) -> Self {
+    pub(crate) fn new(
+        start_line: usize,
+        start_column: usize,
+        end_line: usize,
+        end_column: usize,
+    ) -> Self {
         Self {
             start: Position::new(start_line, start_column),
             end: Position::new(end_line, end_column),

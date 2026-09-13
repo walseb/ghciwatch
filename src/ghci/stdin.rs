@@ -63,8 +63,16 @@ impl GhciStdin {
         progress_timeout: Duration,
         interrupt_on_error: bool,
     ) -> eyre::Result<CompilationWaitStatus> {
+        tracing::debug!(
+            command = line.trim_end(),
+            "Clearing stderr before GHCi command"
+        );
         stdout.clear_stderr_buffer().await?;
         self.stdin.write_all(line.as_bytes()).await?;
+        tracing::debug!(
+            command = line.trim_end(),
+            "GHCi command written; waiting for compilation progress, an error, or the prompt"
+        );
         stdout
             .prompt_with_progress_timeout(
                 &mut self.stdin,
@@ -78,7 +86,9 @@ impl GhciStdin {
 
     /// Run a [`GhciCommand`].
     ///
-    /// The command may be multiple lines.
+    /// Independent commands are submitted one line at a time. An explicit `:{` / `:}` block must
+    /// instead be submitted as one operation: synchronizing stderr after an intermediate
+    /// continuation prompt would inject the marker command into the Haskell block.
     #[instrument(skip(self, stdout), level = "debug")]
     pub async fn run_command(
         &mut self,
@@ -86,8 +96,18 @@ impl GhciStdin {
         command: &GhciCommand,
         log: &mut CompilationLog,
     ) -> eyre::Result<()> {
-        for line in command.lines() {
-            self.write_line(stdout, &format!("{line}\n"), log).await?;
+        let command = command.as_ref();
+        let mut lines = command.lines();
+        let is_explicit_multiline = lines.next().is_some_and(|line| line.trim() == ":{")
+            && lines.last().is_some_and(|line| line.trim() == ":}");
+
+        if is_explicit_multiline {
+            self.write_line(stdout, &format!("{command}\n"), log)
+                .await?;
+        } else {
+            for line in command.lines() {
+                self.write_line(stdout, &format!("{line}\n"), log).await?;
+            }
         }
 
         Ok(())
