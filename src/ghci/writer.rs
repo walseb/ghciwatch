@@ -61,6 +61,14 @@ impl GhciWriter {
             render_progress,
         ))))
     }
+
+    /// Clone the output destination without GHCi-specific progress buffering.
+    pub(super) fn without_progress(&self) -> Self {
+        match &self.0 {
+            Kind::Progress(writer) => writer.inner_without_progress(),
+            _ => self.clone(),
+        }
+    }
 }
 
 impl AsyncWrite for GhciWriter {

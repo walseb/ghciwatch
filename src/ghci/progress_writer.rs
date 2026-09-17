@@ -70,6 +70,10 @@ impl ProgressWriter {
         Self::new(self.inner.clone(), self.render_progress)
     }
 
+    pub(super) fn inner_without_progress(&self) -> GhciWriter {
+        self.inner.without_progress()
+    }
+
     /// Process complete lines in the line buffer. Progress lines are replaced with
     /// condensed ANSI progress indicators; all output is routed through `pending_output`.
     fn process_complete_lines(&mut self) {

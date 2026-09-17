@@ -67,8 +67,8 @@ async fn execute(command: &ClonableCommand, opts: &GhciOpts) -> eyre::Result<Opt
     let stderr = child.stderr.take().unwrap();
     let (status, stdout, stderr) = tokio::try_join!(
         child.wait(),
-        capture(stdout, opts.stdout_writer.clone()),
-        capture(stderr, opts.stderr_writer.clone()),
+        capture(stdout, opts.stdout_writer.without_progress()),
+        capture(stderr, opts.stderr_writer.without_progress()),
     )?;
     Ok((!status.success()).then(|| {
         format!(
@@ -94,5 +94,33 @@ async fn capture(
         output.extend_from_slice(&buffer[..count]);
         writer.write_all(&buffer[..count]).await?;
         writer.flush().await?;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn forwards_partial_output_before_eof_and_retains_diagnostics() {
+        let (mut source, reader) = tokio::io::duplex(1024);
+        let (writer, mut terminal) = tokio::io::duplex(1024);
+        let writer = GhciWriter::duplex_stream(writer).with_progress(true);
+        let task = tokio::spawn(capture(reader, writer.without_progress()));
+        // Neither a newline nor process exit should be needed for forwarding.
+        let bytes = b"setup working...";
+        source.write_all(bytes).await.unwrap();
+        let mut visible = vec![0; bytes.len()];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            terminal.read_exact(&mut visible),
+        )
+        .await
+        .expect("setup output was buffered")
+        .unwrap();
+        assert_eq!(visible, bytes);
+        assert!(!task.is_finished());
+        drop(source);
+        assert_eq!(task.await.unwrap().unwrap(), bytes);
     }
 }
