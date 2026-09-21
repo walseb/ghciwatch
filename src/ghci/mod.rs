@@ -116,7 +116,7 @@ const INTERRUPT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// GHCi hooks should normally return immediately. A bounded wait prevents an interrupted parallel
 /// compilation from leaving the manager permanently blocked on a superficially recovered prompt.
-const GHCI_HOOK_TIMEOUT: Duration = Duration::from_secs(40);
+const GHCI_HOOK_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// Print a conspicuous diagnostic which remains visible even when tracing is filtered out.
 pub(crate) fn print_ghciwatch_error(summary: &str, details: &str) {
