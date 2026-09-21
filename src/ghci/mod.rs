@@ -190,6 +190,8 @@ pub struct GhciOpts {
     pub replace_auto_add_shell: Option<ClonableCommand>,
     /// Whether unexpected exits keep starting delayed replacements despite an unchanged crash loop.
     pub restart_on_exit: bool,
+    /// Number of forced reloads to measure before exiting in memory diagnostic mode.
+    pub debug_mem: Option<u32>,
     /// Where to write what `ghci` emits to `stdout`. Inherits parent's `stdout` by default.
     pub stdout_writer: GhciWriter,
     /// Where to write what `ghci` emits to `stderr`. Inherits parent's `stderr` by default.
@@ -296,6 +298,7 @@ impl GhciOpts {
                 restart_on_add: opts.restart_on_add,
                 replace_auto_add_shell: opts.replace_auto_add_shell.clone(),
                 restart_on_exit: opts.restart_on_exit,
+                debug_mem: opts.debug_mem,
                 stdout_writer,
                 stderr_writer,
                 clear: opts.clear,
@@ -799,6 +802,18 @@ impl Ghci {
             actions.needs_restart.append(&mut actions.needs_add);
         }
         Ok(actions)
+    }
+
+    /// Recompile unchanged modules too; retain the same GHCi process for leak diagnosis.
+    async fn debug_memory_reload(&mut self) -> eyre::Result<()> {
+        let mut log = CompilationLog::default();
+        self.run_hook_command(&GhciCommand(":set -fforce-recomp".into()), &mut log)
+            .await?;
+        eyre::ensure!(
+            !log.failed_for_memory_diagnostic(),
+            "Cannot enable full recompilation for memory diagnostic"
+        );
+        self.reload_from_eval().await
     }
 
     /// Run an eval-socket `:r`/`:reload` through the normal reload lifecycle and progress monitor.
@@ -2070,11 +2085,21 @@ impl Ghci {
 
         error_log_result?;
         hook_result?;
+        if self.opts.debug_mem.is_some() {
+            eyre::ensure!(
+                compilation_succeeded && !log.failed_for_memory_diagnostic(),
+                "Memory diagnostic aborted: compilation failed; no memory sample recorded"
+            );
+        }
         if compilation_succeeded && run_post_actions {
             // Run the eval commands, if any.
             self.eval(log).await?;
             // Run the user-provided test command, if any.
             self.test(log).await?;
+            if self.opts.debug_mem.is_some() {
+                eyre::ensure!(!log.failed_for_memory_diagnostic(),
+                    "Memory diagnostic aborted: eval/test command failed; no memory sample recorded");
+            }
         }
 
         Ok(())
@@ -2129,7 +2154,14 @@ impl Ghci {
                         // into a failed compilation or suppress its after-hooks.
                         let mut hook_log = CompilationLog::default();
                         self.run_hook_command(command, &mut hook_log).await?;
-                        if matches!(hook_log.result(), Some(CompilationResult::Err)) {
+                        if matches!(hook_log.result(), Some(CompilationResult::Err))
+                            || (self.opts.debug_mem.is_some()
+                                && hook_log.failed_for_memory_diagnostic())
+                        {
+                            eyre::ensure!(
+                                self.opts.debug_mem.is_none(),
+                                "Memory diagnostic aborted: {hook} command failed: {command}"
+                            );
                             tracing::error!(%command, "Ignoring {hook} command error");
                         }
                     }
@@ -2138,9 +2170,17 @@ impl Ghci {
                 hooks::Command::Shell(command) => {
                     let (description, timing_threshold) = hook.event.completion_timing();
                     if let Err(err) = command
-                        .run_hook_on(&mut self.command_handles, description, timing_threshold)
+                        .run_hook_on(
+                            &mut self.command_handles,
+                            description,
+                            timing_threshold,
+                            self.opts.debug_mem.is_some(),
+                        )
                         .await
                     {
+                        if self.opts.debug_mem.is_some() {
+                            return Err(err);
+                        }
                         tracing::error!(%command, "Ignoring {hook} command error: {err}");
                     }
                 }

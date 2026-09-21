@@ -48,6 +48,10 @@ pub(super) async fn run(opts: &GhciOpts) -> eyre::Result<()> {
         let mut log = CompilationLog::default();
         log.mark_failed_with_diagnostic(&message);
         error_log.write(&log).await?;
+        eyre::ensure!(
+            opts.debug_mem.is_none(),
+            "Memory diagnostic setup failed: {message}"
+        );
         tracing::error!(
             "{message}Waiting for a watched file to change before retrying setup-shell"
         );

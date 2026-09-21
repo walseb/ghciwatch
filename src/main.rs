@@ -21,6 +21,8 @@ use ghciwatch::WatcherCommand;
 use ghciwatch::WatcherOpts;
 use tokio::sync::mpsc;
 
+mod debug_mem_log;
+
 const PARENT_CHECK_INTERVAL: Duration = Duration::from_millis(250);
 
 #[tokio::main]
@@ -30,6 +32,12 @@ async fn main() -> eyre::Result<()> {
     let original_parent = nix::unistd::getppid();
     color_eyre::install()?;
     let mut opts = cli::Opts::parse();
+    if let Some(path) = &opts.debug_mem_log {
+        debug_mem_log::install(path)?;
+    }
+    if opts.debug_mem.is_some() {
+        opts.hooks.enable_strict()?;
+    }
     opts.init()?;
 
     if opts.tui {

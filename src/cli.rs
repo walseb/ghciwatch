@@ -118,6 +118,18 @@ pub struct Opts {
     #[arg(long)]
     pub restart_on_exit: bool,
 
+    /// Force N full-graph reloads after startup, report total process-tree RSS, then exit.
+    ///
+    /// Linux only. Includes ghciwatch and all descendants; shared pages may be counted twice.
+    #[arg(long, value_name = "N")]
+    pub debug_mem: Option<u32>,
+
+    /// Save all diagnostic-run stdout/stderr (including hooks and memory samples) to this file.
+    ///
+    /// The file is truncated. Without this option, output uses the normal stdout/stderr.
+    #[arg(long, value_name = "PATH", requires = "debug_mem")]
+    pub debug_mem_log: Option<std::path::PathBuf>,
+
     /// Interrupt `:reload`, `:add`, or `:unadd` after the first GHC error diagnostic.
     ///
     /// This can reduce feedback time when GHCi uses parallel compilation (`-j`) and would otherwise

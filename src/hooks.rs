@@ -322,9 +322,21 @@ struct Help {
 #[derive(Debug, Clone, Default)]
 pub struct HookOpts {
     hooks: Vec<Hook<Command>>,
+    strict: bool,
 }
 
 impl HookOpts {
+    /// Make diagnostic runs fail on shell-hook errors rather than treating them as advisory.
+    /// Background hooks cannot provide a reliable completion/failure boundary.
+    pub fn enable_strict(&mut self) -> eyre::Result<()> {
+        eyre::ensure!(
+            !self.hooks.iter().any(|hook| matches!(&hook.command, Command::Shell(command) if command.is_async)),
+            "--debug-mem does not support async: hooks; use synchronous hooks for representative samples"
+        );
+        self.strict = true;
+        Ok(())
+    }
+
     pub fn select(&self, event: LifecycleEvent) -> impl Iterator<Item = &Hook<Command>> {
         self.hooks.iter().filter(move |hook| hook.event == event)
     }
@@ -339,9 +351,12 @@ impl HookOpts {
                 tracing::info!(%command, "Running {hook} command");
                 let (description, timing_threshold) = hook.event.completion_timing();
                 if let Err(err) = command
-                    .run_hook_on(handles, description, timing_threshold)
+                    .run_hook_on(handles, description, timing_threshold, self.strict)
                     .await
                 {
+                    if self.strict {
+                        return Err(err);
+                    }
                     // Hook failures are advisory. They must not prevent the lifecycle operation or
                     // suppress later hooks (especially paired after-hooks used for cleanup).
                     tracing::error!(%command, "Ignoring {hook} command error: {err}");

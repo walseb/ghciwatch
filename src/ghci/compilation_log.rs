@@ -19,6 +19,19 @@ pub struct CompilationLog {
 }
 
 impl CompilationLog {
+    /// Diagnostic mode also rejects errors without a compilation summary (e.g. hook expressions).
+    pub(crate) fn failed_for_memory_diagnostic(&self) -> bool {
+        matches!(self.result(), Some(CompilationResult::Err))
+            || self
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.severity == Severity::Error)
+            || self
+                .stderr
+                .lines()
+                .any(|line| line.starts_with("*** Exception:"))
+    }
+
     /// Track stdout diagnostics separately so raw stderr does not suppress them at publication.
     pub fn extend_stdout(&mut self, messages: impl IntoIterator<Item = GhcMessage>) {
         for message in messages {

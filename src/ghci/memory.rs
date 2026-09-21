@@ -71,6 +71,26 @@ impl MemoryUsage {
     }
 }
 
+/// Sum RSS across ghciwatch and every descendant, independent of process groups.
+/// This is a best-effort /proc snapshot, not unique physical memory (shared pages overlap).
+pub(super) fn tree_resident_memory() -> io::Result<u64> {
+    let processes = process_snapshot()?;
+    let root = std::process::id() as i32;
+    if !processes.contains_key(&root) {
+        return Err(io::Error::other("Cannot read ghciwatch RSS from /proc"));
+    }
+    Ok(tree_bytes(root, &processes))
+}
+
+fn tree_bytes(root: i32, processes: &BTreeMap<i32, Process>) -> u64 {
+    processes
+        .values()
+        .filter(|process| descendant_depth(process.pid, root, processes).is_some())
+        .fold(0_u64, |total, process| {
+            total.saturating_add(process.resident_bytes)
+        })
+}
+
 /// Read RSS for the interactive GHC and its immediate Cabal parent.
 pub(super) fn repl_resident_memory(
     command_pid: i32,
@@ -370,5 +390,34 @@ mod tests {
             parse_process_status(status),
             Some((17, 71, 20_971_521 * 1024))
         );
+    }
+}
+
+#[cfg(test)]
+mod tree_tests {
+    use super::*;
+
+    #[test]
+    fn includes_root_and_all_descendants_but_not_siblings_or_ancestors() {
+        let processes = [(1, 1, 10), (2, 1, 20), (3, 2, 30), (4, 3, 40), (5, 1, 50)]
+            .into_iter()
+            .map(|(pid, parent_pid, resident_bytes)| {
+                (
+                    pid,
+                    Process {
+                        pid,
+                        parent_pid,
+                        resident_bytes,
+                        process_group_id: pid, // Each descendant escaped its parent's group.
+                        interactive: false,
+                        ghc_executable: false,
+                        cabal_executable: false,
+                    },
+                )
+            })
+            .collect();
+        assert_eq!(tree_bytes(2, &processes), 90);
+        assert_eq!(tree_bytes(4, &processes), 40);
+        assert_eq!(tree_bytes(99, &processes), 0);
     }
 }

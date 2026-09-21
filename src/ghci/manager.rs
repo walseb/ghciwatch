@@ -193,6 +193,13 @@ pub async fn run_ghci(
         .await;
     let mut watcher_receiver = dispatch_receiver;
 
+    let debug_mem = opts.debug_mem;
+    if debug_mem.is_some() {
+        eyre::ensure!(
+            cfg!(target_os = "linux"),
+            "--debug-mem requires Linux /proc"
+        );
+    }
     let eval_socket = opts.eval_socket.clone().into_std_path_buf();
     let interrupt_reloads = opts.interrupt_reloads;
     let restart_on_exit = opts.restart_on_exit;
@@ -225,6 +232,12 @@ pub async fn run_ghci(
             None,
         ) => startup_result,
     };
+    // Diagnostic runs must never repair/restart a failed build and then sample it.
+    if debug_mem.is_some() {
+        if let Err(error) = startup_result {
+            return Err(error);
+        }
+    }
     let startup_exit: Option<ExitStatus> = match startup_result {
         // Even on success, ghci may have exited right after starting up; check for a
         // pending exit status so we don't hand the manager a dead session.
@@ -243,6 +256,10 @@ pub async fn run_ghci(
     };
     let mut startup_applied_event = None;
     if let Some(status) = startup_exit {
+        eyre::ensure!(
+            debug_mem.is_none(),
+            "Memory diagnostic command exited during startup: {status}"
+        );
         match wait_and_restart(
             &mut handle,
             &mut watcher_receiver,
@@ -258,6 +275,35 @@ pub async fn run_ghci(
             RetryResult::Restarted(event) => startup_applied_event = event,
             RetryResult::Shutdown => return Ok(()),
         }
+    }
+
+    if let Some(reloads) = debug_mem {
+        // Own the session exclusively: watcher traffic and evals must not add reloads,
+        // and the normal watchdog must not replace the process under measurement.
+        for iteration in 0..=reloads {
+            if iteration > 0 {
+                tokio::select! {
+                    _ = handle.on_shutdown_requested() => return Ok(()),
+                    result = ghci.debug_memory_reload() => result?,
+                }
+            }
+            if let Ok(status) = exited_receiver.try_recv() {
+                eyre::bail!(
+                    "Memory diagnostic command exited: {status}; no memory sample recorded"
+                );
+            }
+            let bytes = tokio::task::spawn_blocking(super::memory::tree_resident_memory).await??;
+            use std::io::Write;
+            let mut stdout = std::io::stdout().lock();
+            writeln!(
+                stdout,
+                "DEBUG-MEM {iteration}/{reloads}: process-tree RSS {} ({bytes} bytes)",
+                format_bytes(bytes)
+            )?;
+            stdout.flush()?;
+        }
+        handle.request_shutdown()?;
+        return Ok(());
     }
 
     let ghci = Arc::new(Mutex::new(ghci));

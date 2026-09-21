@@ -150,12 +150,20 @@ impl MaybeAsyncCommand {
         handles: &mut Vec<JoinHandle<eyre::Result<ExitStatus>>>,
         description: String,
         timing_threshold: Duration,
+        strict: bool,
     ) -> eyre::Result<()> {
         match self
             .status_with_timing(Some((description, timing_threshold)))
             .await
         {
-            MaybeAsyncCommandStatus::Sync(result) => result.map(|_| ()),
+            MaybeAsyncCommandStatus::Sync(result) => {
+                let status = result?;
+                eyre::ensure!(
+                    !strict || status.success(),
+                    "Hook command failed ({status}): {self}"
+                );
+                Ok(())
+            }
             MaybeAsyncCommandStatus::Async(join_handle) => {
                 handles.push(join_handle);
                 Ok(())
