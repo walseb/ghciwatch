@@ -587,6 +587,8 @@ async fn suppresses_stale_error_log_and_publishes_follow_up() {
             ":! touch compilation-started; sleep 2",
             "--after-reload-shell",
             "sh -c 'if test -e compile.txt; then touch published-current; else touch suppressed-stale; fi'",
+            "--after-reload-ghci",
+            ":! echo refreshed >> ghci-refreshes",
         ])
         .with_startup_timeout(std::time::Duration::from_secs(25))
         .start()
@@ -633,6 +635,21 @@ async fn suppresses_stale_error_log_and_publishes_follow_up() {
         .await
         .expect("follow-up leaves compile.txt present");
     assert_eq!(contents, "All good (1 module)\n");
+    session
+        .wait_for_log(BaseMatcher::reload_completes())
+        .await
+        .expect("current follow-up finishes its hooks");
+    session
+        .fs()
+        .wait_for_path(session.startup_timeout, &session.path("ghci-refreshes"))
+        .await
+        .expect("current follow-up runs its GHCi hook");
+    let refreshes = session
+        .fs()
+        .read(session.path("ghci-refreshes"))
+        .await
+        .expect("successful current compilation refreshes GHCi state");
+    assert_eq!(refreshes, "refreshed\n", "superseded attempt must skip GHCi hooks");
 }
 
 /// Interrupting a parallel reload after its first error must not let the publication-time

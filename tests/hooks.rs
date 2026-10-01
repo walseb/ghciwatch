@@ -185,9 +185,9 @@ async fn failed_restart_runs_reload_hooks_once() {
         "each reload hook must run exactly once for the failed restart attempt"
     );
 }
-/// Reload hooks describe every reload attempt, including one that fails compilation.
+/// Failed attempts complete shell hooks, but GHCi after-hooks require a clean compilation.
 #[test]
-async fn failed_reload_runs_before_and_after_hooks() {
+async fn failed_reload_skips_ghci_after_hooks_until_recovery() {
     let mut session = GhciWatchBuilder::new("tests/data/simple")
         .with_args([
             "--before-reload-shell",
@@ -197,9 +197,9 @@ async fn failed_reload_runs_before_and_after_hooks() {
             "--after-reload-shell",
             "touch after-reload-shell",
             "--after-reload-ghci",
-            "Definitely.Not.In.Scope.afterFailedReload",
-            "--after-reload-ghci",
             "putStrLn \"after-reload-ghci\"",
+            "--after-reload-ghci",
+            ":! touch after-reload-ghci-ran",
         ])
         .start()
         .await
@@ -219,11 +219,30 @@ async fn failed_reload_runs_before_and_after_hooks() {
     shell_hook(&mut session, "before-reload", "shell").await;
     ghci_hook(&mut session, "before-reload", "ghci").await;
     shell_hook(&mut session, "after-reload", "shell").await;
-    ghci_hook(&mut session, "after-reload", "ghci").await;
     session
         .wait_for_log(BaseMatcher::reload_completes())
         .await
-        .expect("failed reload completes after running its lifecycle hooks");
+        .expect("failed reload completes its shell hooks without evaluating GHCi hooks");
+    assert!(!session.path("after-reload-ghci-ran").exists());
+
+    session
+        .fs()
+        .replace(
+            session.path("src/MyLib.hs"),
+            "example = ()",
+            "example = \"example\"",
+        )
+        .await
+        .expect("can repair the compilation error");
+    ghci_hook(&mut session, "after-reload", "ghci").await;
+    session
+        .fs()
+        .wait_for_path(
+            Duration::from_secs(10),
+            &session.path("after-reload-ghci-ran"),
+        )
+        .await
+        .expect("successful follow-up executes GHCi after-hooks");
 }
 
 fn hook_timeout(session: &GhciWatch, hook: &str) -> Duration {
@@ -297,7 +316,7 @@ async fn hooks_can_observe_error_log() {
             "--after-restart-shell",
             &after_restart,
         ])
-        .with_log_filter_json("ghciwatch::ghci[run_hooks]=trace")
+        .with_log_filter_json("ghciwatch::hooks[run_shell_hooks]=trace")
         .start()
         .await
         .expect("ghciwatch starts");
@@ -312,7 +331,7 @@ async fn hooks_can_observe_error_log() {
     session
         .wait_for_startup_log(
             BaseMatcher::message("grep finished successfully")
-                .in_spans([SpanMatcher::new("run_hooks").with_field("event", "after-startup")]),
+                .in_spans([SpanMatcher::new("run_shell_hooks").with_field("event", "after-startup")]),
         )
         .await
         .unwrap();
@@ -338,7 +357,7 @@ async fn hooks_can_observe_error_log() {
     session
         .wait_for_log(
             BaseMatcher::message("grep finished successfully")
-                .in_spans([SpanMatcher::new("run_hooks").with_field("event", "after-reload")]),
+                .in_spans([SpanMatcher::new("run_shell_hooks").with_field("event", "after-reload")]),
         )
         .await
         .unwrap();
@@ -375,7 +394,7 @@ async fn hooks_can_observe_error_log() {
     session
         .wait_for_log(
             BaseMatcher::message("grep finished successfully")
-                .in_spans([SpanMatcher::new("run_hooks").with_field("event", "after-restart")]),
+                .in_spans([SpanMatcher::new("run_shell_hooks").with_field("event", "after-restart")]),
         )
         .await
         .unwrap();
