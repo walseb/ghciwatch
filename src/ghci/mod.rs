@@ -105,18 +105,18 @@ use crate::StringCase;
 
 /// Maximum time an initial compiling GHCi command may produce no `Compiling` progress before it is
 /// considered wedged. Other stdout does not reset this timeout.
-const COMPILATION_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(90);
+const COMPILATION_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
-/// A recovery reload gets a shorter inactivity allowance before the untrustworthy
+/// A recovery reload gets a three-minute inactivity allowance before the untrustworthy
 /// session is replaced. Compilation progress resets this timeout too.
-const RECOVERY_COMPILATION_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(60);
+const RECOVERY_COMPILATION_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(3 * 60);
 
 /// Capturing diagnostics after SIGINT is part of prompt recovery and must not block indefinitely.
 const INTERRUPT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// GHCi hooks should normally return immediately. A bounded wait prevents an interrupted parallel
 /// compilation from leaving the manager permanently blocked on a superficially recovered prompt.
-const GHCI_HOOK_TIMEOUT: Duration = Duration::from_secs(90);
+const GHCI_HOOK_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 /// Print a conspicuous diagnostic which remains visible even when tracing is filtered out.
 pub(crate) fn print_ghciwatch_error(summary: &str, details: &str) {
@@ -920,7 +920,7 @@ impl Ghci {
 
         // Once the before-hooks start, always balance them with after-hooks. A protocol or
         // bookkeeping error may make GHCi unavailable, but shell hooks can still publish the
-        // completed attempt and GHCi hooks are attempted whenever the prompt remains usable.
+        // completed attempt. GHCi after-hooks require a successful, current compilation.
         let reload_result: eyre::Result<()> = async {
             if !actions.needs_add.is_empty() && self.opts.replace_auto_add_shell.is_some() {
                 let command = self
@@ -2032,17 +2032,20 @@ impl Ghci {
             Err(error) => Err(error),
         };
 
-        let mut hooks_have_ghci = ghci_available;
+        let compilation_succeeded = snapshot_current
+            && operation_succeeded
+            && ghci_available
+            && !matches!(log.result(), Some(CompilationResult::Err));
+        // A responsive prompt is not enough: failed/interrupted reloads can unload the
+        // modules referenced by hooks. Superseded snapshots must not publish live state.
+        let mut hooks_have_ghci = compilation_succeeded;
         let mut hook_result = Ok(());
         for event in events {
             let result = if hooks_have_ghci {
-                // Lifecycle hooks describe the attempt, not only successful compilation. GHCi may
-                // have unloaded modules after a failure, but hook diagnostics are isolated by
-                // `run_hooks`, so unavailable module-based hooks do not suppress remaining hooks.
                 self.run_hooks(event, log).await
             } else {
-                // The configured command can fail before GHCi provides a prompt (for example while
-                // Cabal builds a plugin). Shell hooks still apply, but GHCi hooks cannot be sent.
+                // Shell completion hooks still balance every attempt, including failures
+                // and superseded snapshots, so external waiters are not left blocked.
                 self.opts
                     .hooks
                     .run_shell_hooks(event, &mut self.command_handles)
@@ -2059,10 +2062,6 @@ impl Ghci {
         }
 
         let event = events[N - 1];
-        let compilation_succeeded = snapshot_current
-            && operation_succeeded
-            && ghci_available
-            && !matches!(log.result(), Some(CompilationResult::Err));
 
         if !snapshot_current {
             tracing::info!(

@@ -35,7 +35,7 @@ use super::GhciReloadKind;
 const CRASH_RESTART_DELAY: Duration = Duration::from_secs(10);
 const MEMORY_WATCHDOG_INTERVAL: Duration = Duration::from_secs(30);
 /// Resident-memory limit for the persistent interactive GHC and its immediate Cabal parent.
-const GHCI_MEMORY_LIMIT_BYTES: u64 = 40 * 1024 * 1024 * 1024;
+const GHCI_MEMORY_LIMIT_BYTES: u64 = 20 * 1024 * 1024 * 1024;
 
 /// An event sent to [`Ghci`] by the watcher.
 #[derive(Debug, Clone)]
@@ -863,7 +863,7 @@ impl GhciManager {
             interactive_ghc_bytes = usage.interactive_ghc.map(|(_, bytes)| bytes),
             "Checked GHCi repl resident memory"
         );
-        if usage.bytes <= GHCI_MEMORY_LIMIT_BYTES {
+        if usage.bytes < GHCI_MEMORY_LIMIT_BYTES {
             return Ok(false);
         }
 

@@ -341,6 +341,7 @@ impl HookOpts {
         self.hooks.iter().filter(move |hook| hook.event == event)
     }
 
+    #[tracing::instrument(skip(self, handles), fields(%event), level = "trace")]
     pub async fn run_shell_hooks(
         &self,
         event: LifecycleEvent,
