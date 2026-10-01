@@ -103,6 +103,79 @@ async fn can_synchronize_targets_without_auto_reload() {
         .expect("ghciwatch finishes removing the deleted module");
 }
 
+/// A superseded compilation must not lose its test hook when --no-auto-reload makes the
+/// mandatory follow-up a no-op. Ordinary no-op edits must still leave the hook alone.
+#[test(current)]
+async fn superseded_test_hook_runs_on_no_op_follow_up() {
+    let mut session = GhciWatchBuilder::new("tests/data/simple")
+        .with_args([
+            "--no-auto-reload",
+            "--no-interrupt-reloads",
+            "--before-reload-ghci",
+            ":! touch compilation-started; sleep 2",
+            "--test-ghci",
+            ":! echo x >> hook-count",
+        ])
+        .with_startup_timeout(std::time::Duration::from_secs(25))
+        .start()
+        .await
+        .expect("ghciwatch starts");
+    session
+        .wait_until_ready()
+        .await
+        .expect("ghciwatch is ready");
+    let count = session.path("hook-count");
+    session
+        .fs()
+        .remove(&count)
+        .await
+        .expect("can reset startup hook count");
+
+    let source = session.path("src/NewModule.hs");
+    session
+        .fs()
+        .write(&source, "module NewModule where\nnewValue = ()\n")
+        .await
+        .expect("can trigger compilation");
+    session
+        .fs()
+        .wait_for_path(
+            session.startup_timeout,
+            &session.path("compilation-started"),
+        )
+        .await
+        .expect("compilation reaches its delayed hook");
+    session
+        .fs()
+        .append(&source, "anotherValue = ()\n")
+        .await
+        .expect("can supersede compilation");
+    session
+        .wait_for_log(BaseMatcher::message(
+            "Compilation finished for a superseded source snapshot",
+        ))
+        .await
+        .expect("the compilation is superseded");
+    session
+        .fs()
+        .wait_for_path(session.startup_timeout, &count)
+        .await
+        .expect("the no-op follow-up runs the deferred test hook");
+    assert_eq!(session.fs().read(&count).await.unwrap(), "x\n");
+
+    session.clear_events();
+    session
+        .fs()
+        .append(&source, "lastEdit = ()\n")
+        .await
+        .unwrap();
+    session
+        .wait_for_log(BaseMatcher::message("Finished dispatching ghci event"))
+        .await
+        .expect("ordinary edit is processed");
+    assert_eq!(session.fs().read(&count).await.unwrap(), "x\n");
+}
+
 /// Test that `ghciwatch` can reload a module that fails to compile.
 #[test]
 async fn can_reload_after_error() {

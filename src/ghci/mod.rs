@@ -367,6 +367,8 @@ pub struct Ghci {
     known_haskell_files: BTreeSet<NormalPath>,
     /// Snapshot and watcher channel used to validate a watcher-triggered compilation at publication.
     publication_snapshot: Option<(SourceSnapshot, mpsc::Sender<WatcherCommand>)>,
+    /// A successful compilation was superseded before its test hook could run.
+    pending_test_hook: bool,
     /// A replacement may return to its prompt after failing to compile. Retain that failure so a
     /// `--no-auto-reload` session can restart on the next relevant edit; normal sessions recover by
     /// reloading the still-usable GHCi process.
@@ -618,6 +620,7 @@ impl Ghci {
             targets: Default::default(),
             known_haskell_files: Default::default(),
             publication_snapshot: None,
+            pending_test_hook: false,
             initialization_failure: None,
             eval_commands: Default::default(),
             search_paths: ShowPaths {
@@ -2091,12 +2094,24 @@ impl Ghci {
                 "Memory diagnostic aborted: compilation failed; no memory sample recorded"
             );
         }
-        if compilation_succeeded && run_post_actions {
-            // Run the eval commands, if any.
-            self.eval(log).await?;
-            // Run the user-provided test command, if any.
-            self.test(log).await?;
-            if self.opts.debug_mem.is_some() {
+        if !operation_succeeded
+            || !ghci_available
+            || matches!(log.result(), Some(CompilationResult::Err))
+        {
+            self.pending_test_hook = false;
+        } else if !snapshot_current && run_post_actions {
+            // The follow-up may be a no-op under --no-auto-reload. It still owes this hook.
+            self.pending_test_hook = true;
+        }
+        if compilation_succeeded {
+            if run_post_actions {
+                self.eval(log).await?;
+            }
+            if run_post_actions || self.pending_test_hook {
+                self.test(log).await?;
+                self.pending_test_hook = false;
+            }
+            if self.opts.debug_mem.is_some() && run_post_actions {
                 eyre::ensure!(!log.failed_for_memory_diagnostic(),
                     "Memory diagnostic aborted: eval/test command failed; no memory sample recorded");
             }
