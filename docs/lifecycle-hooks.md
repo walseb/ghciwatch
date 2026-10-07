@@ -54,6 +54,14 @@ If a shell lifecycle hook fails (exits with a non-zero status code), a message
 indicating the command that failed and the contents of its standard output and
 standard error streams will be printed.
 
+If a GHCi lifecycle hook reports an error (including a failed `:module` command
+without a compilation summary), remaining GHCi hooks for that event are skipped.
+Shell hooks and the compilation attempt still run, allowing recovery from failed
+loads and preserving completion notifications. Before-reload hooks should use
+package modules that survive failed loads, not application modules that may be
+unavailable. A timed-out hook instead makes the session unusable and forces
+process replacement.
+
 [sh-quoting]: https://pubs.opengroup.org/onlinepubs/9699919799/utilities/V3_chap02.html
 
 

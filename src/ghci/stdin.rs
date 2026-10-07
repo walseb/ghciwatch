@@ -36,8 +36,11 @@ impl GhciStdin {
         find: FindAt,
         log: &mut CompilationLog,
     ) -> eyre::Result<()> {
+        stdout.command_phase = "clearing stderr buffer before command submission";
         stdout.clear_stderr_buffer().await?;
+        stdout.command_phase = "writing command to GHCi stdin";
         self.stdin.write_all(line.as_bytes()).await?;
+        stdout.command_phase = "waiting for command stdout prompt";
         stdout.prompt(&mut self.stdin, find, log).await
     }
 

@@ -37,6 +37,9 @@ pub struct GhciStdout {
     pub buffer: Vec<u8>,
     /// Nonce used to make stderr synchronization markers unique within this session.
     pub stderr_sync_nonce: u64,
+    /// Last command-protocol phase, retained when a timeout cancels the operation.
+    /// A hook can finish in GHCi yet stall during the following stderr marker exchange.
+    pub command_phase: &'static str,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,6 +62,7 @@ impl GhciStdout {
         // command and read stderr through it before parsing the operation's output.
         let stderr_data = self.stderr_buffer_through_marker(stdin).await?;
         log.append_stderr(&stderr_data);
+        super::memory_log::capture(data, &mut log.memory_sample);
         log.extend_stdout(parse_ghc_messages(data).wrap_err("Failed to parse compiler output")?);
         log.extend(parse_ghc_messages(&stderr_data).wrap_err("Failed to parse compiler output")?);
         Ok(())
@@ -76,6 +80,7 @@ impl GhciStdout {
         self.stderr_sync_nonce = self.stderr_sync_nonce.wrapping_add(1);
         let (ready_sender, ready_receiver) = oneshot::channel();
         let (sender, receiver) = oneshot::channel();
+        self.command_phase = "requesting stderr marker collection";
         self.stderr_sender
             .send(StderrEvent::GetBufferThrough {
                 marker: marker.clone(),
@@ -83,13 +88,16 @@ impl GhciStdout {
                 sender,
             })
             .await?;
+        self.command_phase = "waiting for stderr marker collector acknowledgement";
         ready_receiver.await?;
 
+        self.command_phase = "writing stderr marker command";
         stdin
             .write_all(format!(":! printf '%s\\n' '{marker}' >&2\n").as_bytes())
             .await?;
         // Consume the marker command's stdout prompt. The shell command emits no stdout, so GHCi
         // may print this prompt directly after the previously consumed prompt, without a newline.
+        self.command_phase = "waiting for stderr marker command stdout prompt";
         let _ = self
             .reader
             .read_until(&mut ReadOpts {
@@ -99,6 +107,7 @@ impl GhciStdout {
                 buffer: &mut self.buffer,
             })
             .await?;
+        self.command_phase = "waiting for stderr marker on stderr";
         Ok(receiver.await?)
     }
 

@@ -33,8 +33,6 @@ async fn can_run_hooks() {
             ":! sleep 0.02",
             // ---
             "--before-reload-ghci",
-            "Definitely.Not.In.Scope.beforeReload",
-            "--before-reload-ghci",
             "putStrLn \"before-reload-1\"",
             "--before-reload-ghci",
             "putStrLn \"before-reload-2\"",

@@ -50,6 +50,15 @@ impl FileClassifier {
         NormalPath::new(path, &self.cwd)
     }
 
+    /// Watched package sources can require restarts without being GHCi home targets.
+    /// Apply this to snapshot reconciliation too, not only individual file events.
+    pub(crate) fn is_target_source(&self, path: &NormalPath) -> bool {
+        is_haskell_source_file(path)
+            && !self.restart_globs.matched(path).is_whitelist()
+            && !self.reload_globs.matched(path).is_ignore()
+            && !path.file_name().is_some_and(|name| name.starts_with('.'))
+    }
+
     /// Return whether a filesystem event can produce a reload or restart action.
     ///
     /// This conservative check is used by the watcher before manager lifecycle hooks run. Removed

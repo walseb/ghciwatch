@@ -54,6 +54,12 @@ pub struct Opts {
     #[arg(long, alias = "outputfile", alias = "errors")]
     pub error_file: Option<Utf8PathBuf>,
 
+    /// Append per-compilation memory records as JSON lines, preserving history across restarts.
+    /// RTS statistics come from GHCIWATCH_MEMORY JSON emitted by an existing lifecycle hook;
+    /// without that hook they are explicitly unavailable. No GC or extra GHCi command is issued.
+    #[arg(long, value_name = "PATH")]
+    pub memory_file: Option<Utf8PathBuf>,
+
     /// Evaluate Haskell code in comments.
     ///
     /// This parses line commands starting with `-- $>` or multiline commands delimited by `{- $>`

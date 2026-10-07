@@ -16,11 +16,16 @@ pub struct CompilationLog {
     pub stdout_diagnostics: Vec<GhcDiagnostic>,
     /// Raw stderr captured for this compilation operation.
     pub stderr: String,
+    /// Sample emitted by the current compilation's completion hooks only.
+    pub(crate) memory_sample: Option<super::memory_log::RtsSample>,
+    /// Keep hook failure separate from the compiler summary for memory history.
+    pub(crate) hook_failed: bool,
+    pub(crate) workload: super::memory_log::Workload,
 }
 
 impl CompilationLog {
-    /// Diagnostic mode also rejects errors without a compilation summary (e.g. hook expressions).
-    pub(crate) fn failed_for_memory_diagnostic(&self) -> bool {
+    /// Also reject errors without a compilation summary (e.g. failed :module hooks).
+    pub(crate) fn failed(&self) -> bool {
         matches!(self.result(), Some(CompilationResult::Err))
             || self
                 .diagnostics
@@ -137,6 +142,7 @@ impl Extend<GhcMessage> for CompilationLog {
         for message in iter {
             match message {
                 GhcMessage::Compiling(progress) => {
+                    self.workload.module_compile_attempts += 1;
                     tracing::debug!(
                         module = %progress.module.name,
                         path = %progress.module.path,

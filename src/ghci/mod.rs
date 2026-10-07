@@ -46,6 +46,7 @@ use stderr::GhciStderr;
 pub(crate) use stderr::StderrEvent;
 
 mod memory;
+mod memory_log;
 mod process;
 use process::kill_process_tree;
 use process::GhciProcess;
@@ -116,7 +117,7 @@ const INTERRUPT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// GHCi hooks should normally return immediately. A bounded wait prevents an interrupted parallel
 /// compilation from leaving the manager permanently blocked on a superficially recovered prompt.
-const GHCI_HOOK_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const GHCI_HOOK_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 /// Print a conspicuous diagnostic which remains visible even when tracing is filtered out.
 pub(crate) fn print_ghciwatch_error(summary: &str, details: &str) {
@@ -157,6 +158,8 @@ pub struct GhciOpts {
     pub command: ClonableCommand,
     /// A path to write `ghci` errors to.
     pub error_path: Option<Utf8PathBuf>,
+    /// Append-only memory history, shared safely across sessions.
+    pub memory_path: Option<Utf8PathBuf>,
     /// Enable running eval commands in files.
     pub enable_eval: bool,
     /// Unix socket path used for executable eval requests.
@@ -278,6 +281,7 @@ impl GhciOpts {
             Self {
                 command,
                 error_path: opts.error_file.clone(),
+                memory_path: opts.memory_file.clone(),
                 enable_eval: opts.enable_eval,
                 eval_socket: opts.eval_socket.clone(),
                 extra_search_paths: opts
@@ -353,6 +357,7 @@ pub struct Ghci {
     exited_sender: mpsc::Sender<ExitStatus>,
     /// Writer for `ghcid`-compatible output, useful for editor integration for diagnostics.
     error_log: ErrorLog,
+    memory_log: memory_log::MemoryLog,
     /// Classifies file events into reload actions based on glob patterns.
     classifier: FileClassifier,
     /// The set of targets for this `ghci` session, from `:show targets`.
@@ -560,6 +565,7 @@ impl Ghci {
             buffer: vec![0; LINE_BUFFER_CAPACITY],
             prompt_patterns: AhoCorasick::from_anchored_patterns([PROMPT]),
             stderr_sync_nonce: 0,
+            command_phase: "initializing",
         };
 
         let stdin = GhciStdin { stdin };
@@ -603,6 +609,7 @@ impl Ghci {
         let classifier =
             FileClassifier::new(opts.restart_globs.clone(), opts.reload_globs.clone())?;
         let extra_search_paths = opts.extra_search_paths.clone();
+        let memory_log = memory_log::MemoryLog::new(opts.memory_path.clone(), process_id.as_raw());
 
         Ok(Ghci {
             opts,
@@ -614,6 +621,7 @@ impl Ghci {
             restart_sender,
             exited_sender,
             error_log,
+            memory_log,
             classifier,
             targets: Default::default(),
             known_haskell_files: Default::default(),
@@ -773,12 +781,18 @@ impl Ghci {
         // repeatedly adding command-provided targets whose Cabal-relative paths GHCi reports
         // differently from the watched path.
         for path in haskell_files.difference(&self.known_haskell_files) {
-            if !self.targets.contains_source_path(path) && !actions.needs_add.contains(path) {
+            if self.classifier.is_target_source(path)
+                && !self.targets.contains_source_path(path)
+                && !actions.needs_add.contains(path)
+            {
                 actions.needs_add.push(path.clone());
             }
         }
         for path in self.known_haskell_files.difference(haskell_files) {
-            if self.targets.contains_source_path(path) && !actions.needs_remove.contains(path) {
+            if self.classifier.is_target_source(path)
+                && self.targets.contains_source_path(path)
+                && !actions.needs_remove.contains(path)
+            {
                 actions.needs_remove.push(path.clone());
             }
         }
@@ -810,7 +824,7 @@ impl Ghci {
         self.run_hook_command(&GhciCommand(":set -fforce-recomp".into()), &mut log)
             .await?;
         eyre::ensure!(
-            !log.failed_for_memory_diagnostic(),
+            !log.failed(),
             "Cannot enable full recompilation for memory diagnostic"
         );
         self.reload_from_eval().await
@@ -877,6 +891,10 @@ impl Ghci {
             .into_iter()
             .map(|path| self.classifier.relative_path(path))
             .collect::<eyre::Result<BTreeSet<_>>>()?;
+        let changed_paths = events
+            .iter()
+            .map(|event| event.as_path().to_string())
+            .collect();
         let mut actions = self.get_reload_actions(events, &haskell_files)?;
 
         if actions.needs_restart() {
@@ -888,7 +906,7 @@ impl Ghci {
             );
             // Carry the snapshot through the restart. A fresh GHCi initially knows
             // only the command's targets; synchronize before after-hooks run.
-            self.restart(haskell_files, true).await?;
+            self.restart(haskell_files, true, changed_paths).await?;
             return Ok(());
         }
 
@@ -896,6 +914,7 @@ impl Ghci {
             let _ = kind_sender.send(GhciReloadKind::None);
             self.known_haskell_files = haskell_files;
             let mut log = CompilationLog::default();
+            log.workload.changed_paths = changed_paths;
             // The manager has already run before-reload shell hooks for this accepted event. Even
             // when classification finds no GHCi work, publish a fresh result and complete the
             // reload lifecycle so external consumers cannot remain in a pending state. Eval and
@@ -915,6 +934,7 @@ impl Ghci {
         }
 
         let mut log = CompilationLog::default();
+        log.workload.changed_paths = changed_paths;
         let mut synchronized_haskell_files = haskell_files.clone();
         self.opts.clear();
 
@@ -922,19 +942,7 @@ impl Ghci {
         // bookkeeping error may make GHCi unavailable, but shell hooks can still publish the
         // completed attempt. GHCi after-hooks require a successful, current compilation.
         let reload_result: eyre::Result<()> = async {
-            if !actions.needs_add.is_empty() && self.opts.replace_auto_add_shell.is_some() {
-                let command = self
-                    .opts
-                    .replace_auto_add_shell
-                    .clone()
-                    .expect("replacement command was checked above");
-                tracing::info!(%command, "Running replacement for automatic module addition");
-                crate::maybe_async_command::MaybeAsyncCommand {
-                    is_async: false,
-                    command,
-                }
-                .run_on(&mut self.command_handles)
-                .await?;
+            if !actions.needs_add.is_empty() && self.run_add_replacement().await? {
                 // The generator is expected to make these paths reachable from an existing target.
                 // Force `:reload` and never submit `:add` for this batch.
                 actions.needs_reload.append(&mut actions.needs_add);
@@ -1170,8 +1178,10 @@ impl Ghci {
         &mut self,
         haskell_files: BTreeSet<NormalPath>,
         before_reload_shell_ran: bool,
+        changed_paths: Vec<String>,
     ) -> eyre::Result<()> {
         let mut log = CompilationLog::default();
+        log.workload.changed_paths = changed_paths;
 
         let before_reload_result = if before_reload_shell_ran {
             self.run_ghci_hooks(LifecycleEvent::Reload(hooks::When::Before))
@@ -1265,6 +1275,7 @@ impl Ghci {
         let needs_remove = self
             .known_haskell_files
             .difference(&haskell_files)
+            .filter(|path| self.classifier.is_target_source(path))
             .filter(|path| self.targets.contains_source_path(*path))
             .cloned()
             .collect::<Vec<_>>();
@@ -1272,6 +1283,7 @@ impl Ghci {
         // target set rather than relying on bookkeeping inherited from the previous process.
         let needs_add = haskell_files
             .iter()
+            .filter(|path| self.classifier.is_target_source(path))
             .filter(|path| !self.targets.contains_source_path(*path))
             .cloned()
             .collect::<Vec<_>>();
@@ -1281,6 +1293,11 @@ impl Ghci {
         }
         let unresolved_adds = if needs_add.is_empty() {
             Vec::new()
+        } else if self.run_add_replacement().await? {
+            // Startup reconciliation must obey the same no-:add policy as live edits.
+            self.reload_targets(log, &format_bulleted_list(&needs_add))
+                .await?;
+            Vec::new()
         } else {
             self.add_modules(&needs_add, log).await?
         };
@@ -1289,6 +1306,21 @@ impl Ghci {
             .filter(|path| !unresolved_adds.contains(path))
             .collect();
         Ok(())
+    }
+
+    /// Apply the same replacement policy during restart synchronization and ordinary edits.
+    async fn run_add_replacement(&mut self) -> eyre::Result<bool> {
+        let Some(command) = self.opts.replace_auto_add_shell.clone() else {
+            return Ok(false);
+        };
+        tracing::info!(%command, "Running replacement for automatic module addition");
+        crate::maybe_async_command::MaybeAsyncCommand {
+            is_async: false,
+            command,
+        }
+        .run_on(&mut self.command_handles)
+        .await?;
+        Ok(true)
     }
 
     /// Run the user provided test command.
@@ -2038,6 +2070,10 @@ impl Ghci {
             && !matches!(log.result(), Some(CompilationResult::Err));
         // A responsive prompt is not enough: failed/interrupted reloads can unload the
         // modules referenced by hooks. Superseded snapshots must not publish live state.
+        // Only completion hooks may supply this attempt's sample. Compilation logs can
+        // be reused during recovery; never attribute a preceding generation's RTS data.
+        log.memory_sample = None;
+        log.hook_failed = false;
         let mut hooks_have_ghci = compilation_succeeded;
         let mut hook_result = Ok(());
         for event in events {
@@ -2059,6 +2095,30 @@ impl Ghci {
                     hook_result = Err(err);
                 }
             }
+        }
+
+        let outcome = if !snapshot_current {
+            "superseded"
+        } else if compilation_succeeded && hook_result.is_ok() && !log.failed() && !log.hook_failed
+        {
+            "success"
+        } else {
+            "failed"
+        };
+        log.workload.duration_seconds = compilation_start.elapsed().as_secs_f64();
+        if let Err(error) = self
+            .memory_log
+            .write(
+                self.process_id.as_raw(),
+                self.process_group_id.as_raw(),
+                outcome,
+                log.memory_sample.take(),
+                std::mem::take(&mut log.workload),
+            )
+            .await
+        {
+            // Telemetry failure must not prevent lifecycle completion or restart recovery.
+            tracing::warn!(%error, "Failed to append compilation memory record");
         }
 
         let event = events[N - 1];
@@ -2086,7 +2146,7 @@ impl Ghci {
         hook_result?;
         if self.opts.debug_mem.is_some() {
             eyre::ensure!(
-                compilation_succeeded && !log.failed_for_memory_diagnostic(),
+                compilation_succeeded && !log.failed(),
                 "Memory diagnostic aborted: compilation failed; no memory sample recorded"
             );
         }
@@ -2096,7 +2156,7 @@ impl Ghci {
             // Run the user-provided test command, if any.
             self.test(log).await?;
             if self.opts.debug_mem.is_some() {
-                eyre::ensure!(!log.failed_for_memory_diagnostic(),
+                eyre::ensure!(!log.failed(),
                     "Memory diagnostic aborted: eval/test command failed; no memory sample recorded");
             }
         }
@@ -2135,9 +2195,12 @@ impl Ghci {
                 .await?;
         }
 
+        let mut ghci_failed = false;
         let hooks = self.opts.hooks.select(event).cloned().collect::<Vec<_>>();
         for hook in hooks {
-            if shell_first && matches!(&hook.command, hooks::Command::Shell(_)) {
+            if (shell_first && matches!(&hook.command, hooks::Command::Shell(_)))
+                || (ghci_failed && matches!(&hook.command, hooks::Command::Ghci(_)))
+            {
                 continue;
             }
             tracing::info!(command = %hook.command, "Running {hook} command");
@@ -2149,19 +2212,22 @@ impl Ghci {
                             .run_command(&mut self.stdout, command, log)
                             .await?;
                     } else {
-                        // Hook diagnostics are advisory and must not turn the surrounding reload
-                        // into a failed compilation or suppress its after-hooks.
+                        // Preserve compilation recovery and shell notifications, but never execute
+                        // dependent GHCi hooks after a failed prerequisite such as :module.
                         let mut hook_log = CompilationLog::default();
                         self.run_hook_command(command, &mut hook_log).await?;
-                        if matches!(hook_log.result(), Some(CompilationResult::Err))
-                            || (self.opts.debug_mem.is_some()
-                                && hook_log.failed_for_memory_diagnostic())
-                        {
+                        if let Some(sample) = hook_log.memory_sample.take() {
+                            log.memory_sample = Some(sample);
+                        }
+                        if hook_log.failed() {
+                            log.hook_failed = true;
+                            log.memory_sample = None;
                             eyre::ensure!(
                                 self.opts.debug_mem.is_none(),
                                 "Memory diagnostic aborted: {hook} command failed: {command}"
                             );
-                            tracing::error!(%command, "Ignoring {hook} command error");
+                            ghci_failed = true;
+                            tracing::error!(%command, "Skipping remaining {hook} GHCi commands after hook error");
                         }
                     }
                     hook.event.log_completion(start_time, command);
@@ -2200,8 +2266,9 @@ impl Ghci {
             let start_time = Instant::now();
             let mut hook_log = CompilationLog::default();
             self.run_hook_command(command, &mut hook_log).await?;
-            if matches!(hook_log.result(), Some(CompilationResult::Err)) {
-                tracing::error!(%command, "Ignoring {hook} command error");
+            if hook_log.failed() {
+                tracing::error!(%command, "Skipping remaining {hook} GHCi commands after hook error");
+                break;
             }
             hook.event.log_completion(start_time, command);
         }
@@ -2246,8 +2313,8 @@ impl Ghci {
                 print_ghciwatch_error(
                     "GHCi lifecycle hook timed out",
                     &format!(
-                        "Command: {command}\nTimeout: {GHCI_HOOK_TIMEOUT:?}\nProcess group ID: {}\nWorking directory: {}\nRecovery: force-killing the unresponsive GHCi process tree; the manager will immediately initialize a fresh session",
-                        self.process_group_id, self.search_paths.cwd,
+                        "Command: {command}\nTimeout: {GHCI_HOOK_TIMEOUT:?}\nProtocol phase: {}\nProcess group ID: {}\nWorking directory: {}\nRecovery: force-killing the unresponsive GHCi process tree; the manager will immediately initialize a fresh session",
+                        self.stdout.command_phase, self.process_group_id, self.search_paths.cwd,
                     ),
                 );
                 self.force_kill_for_recovery(eyre!(

@@ -32,6 +32,9 @@ struct Process {
 #[derive(Debug)]
 pub(super) struct MemoryUsage {
     pub(super) bytes: u64,
+    pub(super) lazy_free_bytes: u64,
+    /// Optional telemetry only: missing swap data must not change watchdog accounting.
+    pub(super) swap_bytes: Option<u64>,
     pub(super) command_pid: i32,
     pub(super) cabal_parent: Option<(i32, u64)>,
     pub(super) interactive_ghc: Option<(i32, u64)>,
@@ -55,6 +58,11 @@ pub(super) fn format_bytes(bytes: u64) -> String {
 }
 
 impl MemoryUsage {
+    /// MADV_FREE pages remain in RSS but are reclaimable without swapping live data.
+    pub(super) fn charged_bytes(&self) -> u64 {
+        self.bytes.saturating_sub(self.lazy_free_bytes)
+    }
+
     pub(super) fn details(&self) -> String {
         match (self.cabal_parent, self.interactive_ghc) {
             (Some((cabal_pid, cabal_bytes)), Some((ghc_pid, ghc_bytes))) => format!(
@@ -91,17 +99,56 @@ fn tree_bytes(root: i32, processes: &BTreeMap<i32, Process>) -> u64 {
         })
 }
 
-/// Read RSS for the interactive GHC and its immediate Cabal parent.
+/// Read RSS minus LazyFree for exactly the selected persistent processes.
 pub(super) fn repl_resident_memory(
     command_pid: i32,
     process_group_id: i32,
 ) -> io::Result<MemoryUsage> {
     let processes = process_snapshot()?;
-    Ok(select_repl_processes(
-        command_pid,
-        process_group_id,
-        &processes,
-    ))
+    let mut usage = select_repl_processes(command_pid, process_group_id, &processes);
+    usage.bytes = 0;
+    // Read only these two rollups, not every process's page tables. RSS and LazyFree
+    // must come from the same report, never from separate status/rollup snapshots.
+    for selected in [&mut usage.cabal_parent, &mut usage.interactive_ghc] {
+        if let Some((pid, rss)) = selected.as_mut() {
+            let path = format!("/proc/{pid}/smaps_rollup");
+            let report = fs::read_to_string(&path)?;
+            let (resident, lazy_free) = parse_rollup(&report).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Invalid RSS/LazyFree in {path}"),
+                )
+            })?;
+            *rss = resident;
+            usage.swap_bytes = usage
+                .swap_bytes
+                .zip(rollup_bytes(&report, "Swap:"))
+                .and_then(|(sum, swap)| sum.checked_add(swap));
+            usage.bytes = usage.bytes.saturating_add(resident);
+            usage.lazy_free_bytes = usage.lazy_free_bytes.saturating_add(lazy_free);
+        }
+    }
+    Ok(usage)
+}
+
+fn parse_rollup(report: &str) -> Option<(u64, u64)> {
+    let rss = rollup_bytes(report, "Rss:")?;
+    let lazy_free = rollup_bytes(report, "LazyFree:")?;
+    // A changing address space can make a procfs walk inconsistent. Skip that
+    // sample rather than subtracting another process's resident memory.
+    (lazy_free <= rss).then_some((rss, lazy_free))
+}
+
+fn rollup_bytes(report: &str, name: &str) -> Option<u64> {
+    let mut fields = report
+        .lines()
+        .find_map(|line| line.strip_prefix(name))?
+        .split_whitespace();
+    let kib = fields.next()?.parse::<u64>().ok()?;
+    if fields.next()? != "kB" || fields.next().is_some() {
+        return None;
+    }
+    kib.checked_mul(1024)
 }
 
 fn process_snapshot() -> io::Result<BTreeMap<i32, Process>> {
@@ -183,6 +230,8 @@ fn select_repl_processes(
     });
     MemoryUsage {
         bytes,
+        lazy_free_bytes: 0,
+        swap_bytes: Some(0),
         command_pid,
         cabal_parent,
         interactive_ghc,
@@ -262,6 +311,48 @@ mod tests {
     use super::*;
 
     #[test]
+    fn excludes_lazy_pages_without_exempting_live_resident_memory() {
+        let (rss, lazy) = parse_rollup("Rss: 29325512 kB\nLazyFree: 13572992 kB\n").unwrap();
+        let mut usage = MemoryUsage {
+            bytes: rss,
+            lazy_free_bytes: lazy,
+            swap_bytes: Some(0),
+            command_pid: 1,
+            cabal_parent: None,
+            interactive_ghc: None,
+        };
+        let limit = 25 * 1024_u64.pow(3);
+        assert!(usage.bytes > limit);
+        assert!(usage.charged_bytes() < limit);
+        assert_eq!(usage.charged_bytes(), (29325512 - 13572992) * 1024);
+        usage.lazy_free_bytes = 0;
+        assert!(usage.charged_bytes() > limit);
+        usage.bytes = limit;
+        assert_eq!(usage.charged_bytes(), limit);
+    }
+
+    #[test]
+    fn rejects_missing_malformed_or_inconsistent_rollups() {
+        assert_eq!(rollup_bytes("Swap: 17 kB\n", "Swap:"), Some(17 * 1024));
+        assert_eq!(rollup_bytes("Swap: 17 MB\n", "Swap:"), None);
+        assert_eq!(rollup_bytes("Rss: 17 kB\n", "Swap:"), None);
+        for report in [
+            "Rss: 1 kB\n",
+            "LazyFree: 0 kB\n",
+            "Rss: 1 MB\nLazyFree: 0 kB\n",
+            "Rss: 1 kB\nLazyFree: invalid kB\n",
+            "Rss: 1 kB\nLazyFree: 2 kB\n",
+            "Rss: 18446744073709551615 kB\nLazyFree: 0 kB\n",
+        ] {
+            assert_eq!(parse_rollup(report), None, "{report}");
+        }
+        assert_eq!(
+            parse_rollup("Rss: 12 kB\nLazyFree: 0 kB\n"),
+            Some((12288, 0))
+        );
+    }
+
+    #[test]
     fn formats_memory_sizes_with_binary_units() {
         assert_eq!(format_bytes(1023), "1023 bytes");
         assert_eq!(format_bytes(1024), "1.00 KiB");
@@ -272,6 +363,8 @@ mod tests {
 
         let usage = MemoryUsage {
             bytes: 22_809_096_192,
+            lazy_free_bytes: 0,
+            swap_bytes: Some(0),
             command_pid: 1_572_392,
             cabal_parent: Some((1_572_421, 104_857_600)),
             interactive_ghc: Some((1_572_439, 22_704_238_592)),

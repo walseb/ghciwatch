@@ -34,8 +34,8 @@ use super::GhciReloadKind;
 /// an immediate hot loop while still recovering implementation/toolchain failures without an edit.
 const CRASH_RESTART_DELAY: Duration = Duration::from_secs(10);
 const MEMORY_WATCHDOG_INTERVAL: Duration = Duration::from_secs(30);
-/// Resident-memory limit for the persistent interactive GHC and its immediate Cabal parent.
-const GHCI_MEMORY_LIMIT_BYTES: u64 = 20 * 1024 * 1024 * 1024;
+/// RSS minus LazyFree limit for the interactive GHC and its immediate Cabal parent.
+const GHCI_MEMORY_LIMIT_BYTES: u64 = 30 * 1024 * 1024 * 1024;
 
 /// An event sent to [`Ghci`] by the watcher.
 #[derive(Debug, Clone)]
@@ -855,6 +855,8 @@ impl GhciManager {
         };
         tracing::debug!(
             bytes = usage.bytes,
+            lazy_free_bytes = usage.lazy_free_bytes,
+            charged_bytes = usage.charged_bytes(),
             limit = GHCI_MEMORY_LIMIT_BYTES,
             command_pid = usage.command_pid,
             cabal_parent_pid = usage.cabal_parent.map(|(pid, _)| pid),
@@ -863,21 +865,25 @@ impl GhciManager {
             interactive_ghc_bytes = usage.interactive_ghc.map(|(_, bytes)| bytes),
             "Checked GHCi repl resident memory"
         );
-        if usage.bytes < GHCI_MEMORY_LIMIT_BYTES {
+        if usage.charged_bytes() < GHCI_MEMORY_LIMIT_BYTES {
             return Ok(false);
         }
 
         print_ghciwatch_error(
             "GHCi exceeded its resident-memory limit",
             &format!(
-                "Component: GHCi and immediate Cabal parent\n{}\nCombined resident memory: {}\nLimit: {}\nRecovery: restarting GHCi through the normal lifecycle-hook and target-synchronization machinery",
+                "Component: GHCi and immediate Cabal parent\n{}\nCombined resident memory: {}\nExcluded LazyFree: {}\nCharged resident memory (RSS - LazyFree): {}\nLimit (charged memory): {}\nRecovery: restarting GHCi through the normal lifecycle-hook and target-synchronization machinery",
                 usage.details(),
                 format_bytes(usage.bytes),
+                format_bytes(usage.lazy_free_bytes),
+                format_bytes(usage.charged_bytes()),
                 format_bytes(GHCI_MEMORY_LIMIT_BYTES),
             ),
         );
         tracing::warn!(
             bytes = usage.bytes,
+            lazy_free_bytes = usage.lazy_free_bytes,
+            charged_bytes = usage.charged_bytes(),
             limit = GHCI_MEMORY_LIMIT_BYTES,
             "GHCi memory watchdog is restarting the session"
         );
