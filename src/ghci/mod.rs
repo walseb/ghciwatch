@@ -408,14 +408,6 @@ impl Ghci {
         )
     }
 
-    pub(crate) fn process_id(&self) -> Pid {
-        self.process_id
-    }
-
-    pub(crate) fn process_group_id(&self) -> Pid {
-        self.process_group_id
-    }
-
     pub(crate) fn recovery_restart_required(&self) -> bool {
         self.recovery_restart_required
     }
@@ -430,32 +422,6 @@ impl Ghci {
 }
 
 impl Ghci {
-    /// Restart a leaking session through lifecycle hooks that remain valid after a failed reload.
-    pub(crate) async fn restart_for_memory_watchdog(&mut self) -> eyre::Result<()> {
-        let haskell_files = self.known_haskell_files.clone();
-        let mut log = CompilationLog::default();
-        self.opts.clear();
-        // A watchdog commonly fires after a failed reload has already cleared GHCi's module
-        // scope. Before-reload GHCi hooks can therefore reference modules that are no longer
-        // loaded. The replacement process has fresh plugin state, so only the external shell
-        // notification and restart hooks are meaningful before replacing it.
-        self.run_shell_lifecycle_events([LifecycleEvent::Reload(hooks::When::Before)])
-            .await?;
-        self.run_hooks(LifecycleEvent::Restart(hooks::When::Before), &mut log)
-            .await?;
-        self.restart_inner(
-            &mut log,
-            [
-                LifecycleEvent::Startup(hooks::When::After),
-                LifecycleEvent::Restart(hooks::When::After),
-                LifecycleEvent::Reload(hooks::When::After),
-            ],
-            Some(haskell_files),
-            true,
-        )
-        .await
-    }
-
     /// Start a replacement after failed SIGINT recovery. The old session is dead, so
     /// before-restart GHCi hooks cannot run; after hooks and watched-target sync still do.
     pub(crate) async fn restart_after_recovery_kill(
@@ -599,6 +565,7 @@ impl Ghci {
                     process_group_id,
                     exited_sender: exited_sender.clone(),
                     before_kill: opts.before_kill.clone(),
+                    memory_watchdog_enabled: opts.debug_mem.is_none(),
                 }
                 .run(group)
             })
@@ -2153,23 +2120,6 @@ impl Ghci {
                 "Memory diagnostic aborted: compilation failed; no memory sample recorded"
             );
         }
-<<<<<<< HEAD
-        if compilation_succeeded && run_post_actions {
-            // Run the eval commands, if any.
-            self.eval(log).await?;
-            // Run the user-provided test command, if any.
-            self.test(log).await?;
-            if self.opts.debug_mem.is_some() {
-                eyre::ensure!(!log.failed(),
-||||||| c59dfa4
-        if compilation_succeeded && run_post_actions {
-            // Run the eval commands, if any.
-            self.eval(log).await?;
-            // Run the user-provided test command, if any.
-            self.test(log).await?;
-            if self.opts.debug_mem.is_some() {
-                eyre::ensure!(!log.failed_for_memory_diagnostic(),
-=======
         if !operation_succeeded
             || !ghci_available
             || matches!(log.result(), Some(CompilationResult::Err))
@@ -2188,9 +2138,10 @@ impl Ghci {
                 self.pending_test_hook = false;
             }
             if self.opts.debug_mem.is_some() && run_post_actions {
-                eyre::ensure!(!log.failed_for_memory_diagnostic(),
->>>>>>> refs/remotes/origin/main
-                    "Memory diagnostic aborted: eval/test command failed; no memory sample recorded");
+                eyre::ensure!(
+                    !log.failed(),
+                    "Memory diagnostic aborted: eval/test command failed; no memory sample recorded"
+                );
             }
         }
 

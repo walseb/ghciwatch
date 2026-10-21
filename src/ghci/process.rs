@@ -24,6 +24,10 @@ use tokio::sync::oneshot;
 
 pub(super) const BEFORE_SIGNAL_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 
+use super::memory::{
+    format_bytes, repl_resident_memory, GHCI_MEMORY_LIMIT_BYTES, MEMORY_WATCHDOG_INTERVAL,
+};
+
 pub struct GhciProcess {
     pub shutdown: ShutdownHandle,
     pub process_group_id: Pid,
@@ -41,15 +45,38 @@ pub struct GhciProcess {
     pub exited_sender: mpsc::Sender<ExitStatus>,
     /// Commands to run before an intentional SIGKILL.
     pub before_kill: Vec<ClonableCommand>,
+    /// Diagnostic measurements deliberately disable automatic memory replacement.
+    pub memory_watchdog_enabled: bool,
 }
 
 impl GhciProcess {
     #[instrument(skip_all, name = "ghci_process", level = "debug")]
-    pub async fn run(mut self, mut process: AsyncGroupChild) -> eyre::Result<()> {
-        // We can only call `wait()` once at a time, so we store the future and pass it into the
-        // `stop()` handler.
+    pub async fn run(self, process: AsyncGroupChild) -> eyre::Result<()> {
+        let pid = self.process_id.as_raw();
+        let pgid = self.process_group_id.as_raw();
+        self.run_with_watchdog(process, async move {
+            let mut interval = tokio::time::interval(MEMORY_WATCHDOG_INTERVAL);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                if Self::memory_limit_exceeded(pid, pgid).await {
+                    break;
+                }
+            }
+        })
+        .await
+    }
+
+    async fn run_with_watchdog(
+        mut self,
+        mut process: AsyncGroupChild,
+        watchdog: impl Future<Output = ()>,
+    ) -> eyre::Result<()> {
+        // Neither sampling nor enforcement takes EvalBarrier or the GHCi mutex.
+        // Keep the monitor in select so shutdown can also cancel a pending sample.
         let mut wait = std::pin::pin!(process.wait());
         tokio::select! {
+            biased;
             _ = self.shutdown.on_shutdown_requested() => {
                 self.stop(wait).await?;
             }
@@ -66,15 +93,57 @@ impl GhciProcess {
                 self.exited(status).await;
                 let _ = self.exited_sender.send(status).await;
             }
+            _ = watchdog, if self.memory_watchdog_enabled => {
+                let status = self.stop(wait).await?;
+                // Use ordinary exit recovery, including retry and crash-loop
+                // protection if the replacement is also too large.
+                let _ = self.exited_sender.send(status).await;
+            }
         }
         Ok(())
+    }
+
+    async fn memory_limit_exceeded(pid: i32, pgid: i32) -> bool {
+        let usage = match tokio::task::spawn_blocking(move || repl_resident_memory(pid, pgid)).await
+        {
+            Ok(Ok(usage)) => usage,
+            result => {
+                tracing::warn!(?result, "Failed to read GHCi process-watchdog memory");
+                return false;
+            }
+        };
+        tracing::debug!(
+            command_pid = pid,
+            bytes = usage.bytes,
+            swap_bytes = usage.swap_bytes,
+            lazy_free_bytes = usage.lazy_free_bytes,
+            charged_bytes = usage.charged_bytes(),
+            limit = GHCI_MEMORY_LIMIT_BYTES,
+            "Checked GHCi memory (RSS + Swap - LazyFree)",
+        );
+        if usage.charged_bytes() < GHCI_MEMORY_LIMIT_BYTES {
+            return false;
+        }
+        super::print_ghciwatch_error(
+            "GHCi exceeded its memory limit",
+            &format!(
+                "{}\nCombined RSS: {}\nCombined swap: {}\nExcluded LazyFree: {}\nCharged memory (RSS + Swap - LazyFree): {}\nLimit: {}\nRecovery: killing the command tree; normal exit recovery will replace the session",
+                usage.details(),
+                format_bytes(usage.bytes),
+                format_bytes(usage.swap_bytes),
+                format_bytes(usage.lazy_free_bytes),
+                format_bytes(usage.charged_bytes()),
+                format_bytes(GHCI_MEMORY_LIMIT_BYTES),
+            ),
+        );
+        true
     }
 
     #[instrument(skip_all, level = "debug")]
     async fn stop(
         &self,
         wait: Pin<&mut impl Future<Output = Result<ExitStatus, std::io::Error>>>,
-    ) -> eyre::Result<()> {
+    ) -> eyre::Result<ExitStatus> {
         run_before_signal_commands(
             &self.before_kill,
             self.process_id,
@@ -88,7 +157,7 @@ impl GhciProcess {
         let status = wait.await?;
 
         self.exited(status).await;
-        Ok(())
+        Ok(status)
     }
 
     async fn exited(&self, status: ExitStatus) {
@@ -439,6 +508,47 @@ mod tests {
     use super::parse_process_stat;
     use super::process_tree;
     use super::ProcessStat;
+
+    #[tokio::test]
+    async fn watchdog_kills_a_pre_prompt_process_and_notifies_recovery() {
+        use command_group::AsyncCommandGroup;
+        use std::os::unix::process::ExitStatusExt;
+        use std::time::Duration;
+        use tokio::sync::{mpsc, oneshot};
+
+        // This command never produces a GHCi prompt or completes initialization.
+        let mut command = tokio::process::Command::new("sleep");
+        command.arg("60").kill_on_drop(true);
+        let child = command.group_spawn().unwrap();
+        let pid = Pid::from_raw(child.id().unwrap() as i32);
+        let (_restart_sender, restart_receiver) = mpsc::channel(1);
+        let (exited_sender, mut exited_receiver) = mpsc::channel(1);
+        let (trip, tripped) = oneshot::channel();
+        let mut shutdown = crate::shutdown::ShutdownManager::with_timeout(Duration::from_secs(5));
+        shutdown
+            .spawn("watchdog-test", move |shutdown| async move {
+                super::GhciProcess {
+                    shutdown,
+                    process_id: pid,
+                    process_group_id: pid,
+                    restart_receiver,
+                    exited_sender,
+                    before_kill: Vec::new(),
+                    memory_watchdog_enabled: true,
+                }
+                .run_with_watchdog(child, async { tripped.await.unwrap() })
+                .await
+            })
+            .await;
+        // Inject an exceeded-memory notification, without allocating 40 GiB.
+        trip.send(()).unwrap();
+        let status = tokio::time::timeout(Duration::from_secs(5), exited_receiver.recv())
+            .await
+            .expect("watchdog must not wait for a prompt")
+            .expect("watchdog must notify the manager so it can recover");
+        assert_eq!(status.signal(), Some(nix::libc::SIGKILL));
+        shutdown.wait_for_shutdown().await.unwrap();
+    }
 
     #[test]
     fn parses_proc_stat_with_difficult_command_name() {
