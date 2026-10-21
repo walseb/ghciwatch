@@ -24,7 +24,6 @@ use crate::shutdown::ShutdownHandle;
 use crate::watcher::WatcherCommand;
 
 use super::memory::format_bytes;
-use super::memory::repl_resident_memory;
 use super::print_ghciwatch_error;
 use super::Ghci;
 use super::GhciOpts;
@@ -33,9 +32,6 @@ use super::GhciReloadKind;
 /// Delay before retrying a crashed command. This makes one automatic retry visible and prevents
 /// an immediate hot loop while still recovering implementation/toolchain failures without an edit.
 const CRASH_RESTART_DELAY: Duration = Duration::from_secs(10);
-const MEMORY_WATCHDOG_INTERVAL: Duration = Duration::from_secs(30);
-/// RSS minus LazyFree limit for the interactive GHC and its immediate Cabal parent.
-const GHCI_MEMORY_LIMIT_BYTES: u64 = 30 * 1024 * 1024 * 1024;
 
 /// An event sent to [`Ghci`] by the watcher.
 #[derive(Debug, Clone)]
@@ -309,8 +305,6 @@ pub async fn run_ghci(
     let ghci = Arc::new(Mutex::new(ghci));
     let eval_barrier = crate::my::EvalBarrier::new();
     crate::my::spawn(ghci.clone(), eval_barrier.clone(), eval_socket).await?;
-    let mut memory_watchdog = tokio::time::interval(MEMORY_WATCHDOG_INTERVAL);
-    memory_watchdog.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut manager = GhciManager {
         ghci,
         eval_barrier,
@@ -322,7 +316,6 @@ pub async fn run_ghci(
         restart_on_exit,
         hooks,
         command_handles: Vec::new(),
-        memory_watchdog,
         applied_states: BTreeMap::new(),
         applied_source_snapshot: None,
     };
@@ -408,7 +401,6 @@ struct GhciManager {
     hooks: crate::hooks::HookOpts,
     /// Background `async:` before-reload shell hooks owned by the manager.
     command_handles: Vec<tokio::task::JoinHandle<eyre::Result<ExitStatus>>>,
-    memory_watchdog: tokio::time::Interval,
     /// Event-path states represented by the last successfully completed dispatch.
     applied_states: BTreeMap<Utf8PathBuf, FileState>,
     /// Complete watched-source contents represented by the last completed dispatch.
@@ -463,7 +455,6 @@ impl GhciManager {
     async fn wait_for_event(&mut self) -> eyre::Result<WaitResult> {
         enum Wake {
             GhciExited(ExitStatus),
-            MemoryWatchdog,
         }
 
         loop {
@@ -473,7 +464,6 @@ impl GhciManager {
                     ref mut handle,
                     ref mut watcher_receiver,
                     ref mut exited_receiver,
-                    ref mut memory_watchdog,
                     ref applied_states,
                     ref applied_source_snapshot,
                     ..
@@ -509,17 +499,11 @@ impl GhciManager {
                         }
                     }
                     Some(status) = exited_receiver.recv() => Wake::GhciExited(status),
-                    _ = memory_watchdog.tick() => Wake::MemoryWatchdog,
                 }
             };
             // self is no longer partially borrowed, so lock ordering remains the same
             // as eval/reload: operation barrier first, GHCi mutex second.
             match wake {
-                Wake::MemoryWatchdog => {
-                    if self.run_memory_watchdog().await? {
-                        return Ok(WaitResult::Restarted);
-                    }
-                }
                 Wake::GhciExited(status) => {
                     // Failed SIGINT recovery immediately replaces a session that was killed while
                     // restoring protocol synchronization. Other exits use the common delayed retry
@@ -598,9 +582,6 @@ impl GhciManager {
         // Events that arrive while we're waiting for a non-interruptible dispatch
         // (e.g. a restart) to complete. Returned as `Interrupted` for retry.
         let mut pending_event: Option<WatcherEvent> = None;
-        // A due check waits for this serialized reload/restart to finish; it never
-        // aborts a pipe protocol or takes the GHCi mutex out of lock order.
-        let mut memory_watchdog_due = false;
         // Failed prompt recovery force-kills GHCi and must trigger an immediate
         // replacement, rather than the unexpected-exit policy of waiting for a file change.
         let mut restart_after_recovery_kill = false;
@@ -611,7 +592,6 @@ impl GhciManager {
                 ref mut handle,
                 ref mut watcher_receiver,
                 ref mut exited_receiver,
-                ref mut memory_watchdog,
                 interrupt_reloads,
                 ref mut applied_states,
                 ref mut applied_source_snapshot,
@@ -653,10 +633,6 @@ impl GhciManager {
                         preserve_recovery_event(&event, &mut pending_event);
                     }
                     Some(status)
-                }
-                _ = memory_watchdog.tick() => {
-                    memory_watchdog_due = true;
-                    continue;
                 }
                 Some(mut new_event) = watcher_receiver.recv() => {
                     // Drain any other events already queued up so we treat a burst
@@ -811,12 +787,6 @@ impl GhciManager {
             }
         }
 
-        if ghci_exited.is_none() && memory_watchdog_due {
-            // The operation permit is still held here, and the dispatch task has released
-            // the GHCi mutex. Check and restart without reacquiring the non-reentrant barrier.
-            self.run_memory_watchdog_with_operation_permit().await?;
-        }
-
         // Merge events that arrived while dispatch was running. Retry only if their latest
         // captured state or authoritative filesystem snapshot differs from what just completed.
         if let Some(mut pending_event) = pending_event {
@@ -830,67 +800,6 @@ impl GhciManager {
         }
 
         Ok(HandleResult::Done)
-    }
-
-    async fn run_memory_watchdog(&self) -> eyre::Result<bool> {
-        let _operation_guard = self.eval_barrier.begin_operation().await;
-        self.run_memory_watchdog_with_operation_permit().await
-    }
-
-    async fn run_memory_watchdog_with_operation_permit(&self) -> eyre::Result<bool> {
-        let mut ghci = self.ghci.lock().await;
-        let process_id = ghci.process_id();
-        let process_group_id = ghci.process_group_id();
-        let usage = tokio::task::spawn_blocking(move || {
-            repl_resident_memory(process_id.as_raw(), process_group_id.as_raw())
-        })
-        .await
-        .wrap_err("GHCi memory watchdog task failed")?;
-        let usage = match usage {
-            Ok(usage) => usage,
-            Err(error) => {
-                tracing::warn!(%error, "Failed to read GHCi repl memory usage");
-                return Ok(false);
-            }
-        };
-        tracing::debug!(
-            bytes = usage.bytes,
-            lazy_free_bytes = usage.lazy_free_bytes,
-            charged_bytes = usage.charged_bytes(),
-            limit = GHCI_MEMORY_LIMIT_BYTES,
-            command_pid = usage.command_pid,
-            cabal_parent_pid = usage.cabal_parent.map(|(pid, _)| pid),
-            cabal_parent_bytes = usage.cabal_parent.map(|(_, bytes)| bytes),
-            interactive_ghc_pid = usage.interactive_ghc.map(|(pid, _)| pid),
-            interactive_ghc_bytes = usage.interactive_ghc.map(|(_, bytes)| bytes),
-            "Checked GHCi repl resident memory"
-        );
-        if usage.charged_bytes() < GHCI_MEMORY_LIMIT_BYTES {
-            return Ok(false);
-        }
-
-        print_ghciwatch_error(
-            "GHCi exceeded its resident-memory limit",
-            &format!(
-                "Component: GHCi and immediate Cabal parent\n{}\nCombined resident memory: {}\nExcluded LazyFree: {}\nCharged resident memory (RSS - LazyFree): {}\nLimit (charged memory): {}\nRecovery: restarting GHCi through the normal lifecycle-hook and target-synchronization machinery",
-                usage.details(),
-                format_bytes(usage.bytes),
-                format_bytes(usage.lazy_free_bytes),
-                format_bytes(usage.charged_bytes()),
-                format_bytes(GHCI_MEMORY_LIMIT_BYTES),
-            ),
-        );
-        tracing::warn!(
-            bytes = usage.bytes,
-            lazy_free_bytes = usage.lazy_free_bytes,
-            charged_bytes = usage.charged_bytes(),
-            limit = GHCI_MEMORY_LIMIT_BYTES,
-            "GHCi memory watchdog is restarting the session"
-        );
-        ghci.restart_for_memory_watchdog()
-            .await
-            .wrap_err("Failed to restart GHCi after exceeding its memory limit")?;
-        Ok(true)
     }
 
     /// Retry a crashed session once, then wait for a watched change if it crashes again.
