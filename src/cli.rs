@@ -124,9 +124,11 @@ pub struct Opts {
     #[arg(long)]
     pub restart_on_exit: bool,
 
-    /// Force N full-graph reloads after startup, report total process-tree RSS, then exit.
+    /// Force N full-graph reloads after startup, report memory, then exit.
     ///
-    /// Linux only. Includes ghciwatch and all descendants; shared pages may be counted twice.
+    /// Linux only. Reports process-tree RSS (shared pages may overlap), plus the watchdog's
+    /// persistent GHC/Cabal RSS, LazyFree, swap, and charged RSS - LazyFree + swap.
+    /// Diagnostic mode does not enforce the watchdog limit or restart the measured process.
     #[arg(long, value_name = "N")]
     pub debug_mem: Option<u32>,
 

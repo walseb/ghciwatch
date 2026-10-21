@@ -36,6 +36,15 @@ async fn run_command(
 ) -> (std::process::Output, String) {
     let dir = TestDir::new();
     std::fs::write(dir.path().join("Example.hs"), source).unwrap();
+    std::fs::write(
+        dir.path().join("cabal.project"),
+        "packages: .\noffline: True\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("memory-fixture.cabal"),
+        "cabal-version: 2.4\nname: memory-fixture\nversion: 0.0.0\nbuild-type: Simple\nlibrary\n  exposed-modules: Example\n  build-depends: base\n  default-language: Haskell2010\n",
+    ).unwrap();
     let log = dir.path().join("diagnostic.log");
     let output = tokio::time::timeout(
         Duration::from_secs(60),
@@ -48,7 +57,12 @@ async fn run_command(
             .output(),
     )
     .await
-    .expect("diagnostic run must exit, not wait for a fixing edit")
+    .unwrap_or_else(|_| {
+        panic!(
+            "diagnostic run must exit, not wait for a fixing edit: {}",
+            std::fs::read_to_string(&log).unwrap_or_default()
+        )
+    })
     .unwrap();
     (output, std::fs::read_to_string(log).unwrap())
 }
@@ -60,7 +74,40 @@ async fn recompiles_unchanged_source_and_persists_samples() {
     assert_eq!(log.matches("Compiling Example").count(), 3, "{log}");
     for iteration in 0..=2 {
         assert!(log.contains(&format!("DEBUG-MEM {iteration}/2:")), "{log}");
+        assert!(
+            log.contains(&format!(
+                "DEBUG-MEM {iteration}/2: REPL RAM+swap unavailable"
+            )),
+            "{log}"
+        );
     }
+}
+
+#[tokio::test]
+async fn cabal_diagnostic_reports_watchdog_ram_plus_swap() {
+    let (output, log) = run_command(
+        "module Example where\nx = 1\n",
+        "cabal repl --offline --repl-options=-ignore-dot-ghci",
+        &[],
+    )
+    .await;
+    assert!(output.status.success(), "{log}");
+    for iteration in 0..=2 {
+        let prefix = format!("DEBUG-MEM {iteration}/2: REPL RSS ");
+        let line = log
+            .lines()
+            .find(|line| line.starts_with(&prefix))
+            .expect(&log);
+        let counts: Vec<u64> = line
+            .split('(')
+            .skip(1)
+            .map(|field| field.split_whitespace().next().unwrap().parse().unwrap())
+            .collect();
+        assert_eq!(counts.len(), 4, "{line}");
+        assert_eq!(counts[3], counts[0] - counts[1] + counts[2], "{line}");
+        assert!(counts[0] > 0, "{line}");
+    }
+    assert!(!log.contains("RAM+swap unavailable"), "{log}");
 }
 
 #[tokio::test]

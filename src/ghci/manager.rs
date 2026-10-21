@@ -288,7 +288,14 @@ pub async fn run_ghci(
                     "Memory diagnostic command exited: {status}; no memory sample recorded"
                 );
             }
-            let bytes = tokio::task::spawn_blocking(super::memory::tree_resident_memory).await??;
+            let command_pid = ghci.process_id.as_raw();
+            let process_group_id = ghci.process_group_id.as_raw();
+            let (bytes, usage) = tokio::task::spawn_blocking(move || {
+                let tree = super::memory::tree_resident_memory()?;
+                let repl = super::memory::repl_resident_memory(command_pid, process_group_id)?;
+                Ok::<_, std::io::Error>((tree, repl))
+            })
+            .await??;
             use std::io::Write;
             let mut stdout = std::io::stdout().lock();
             writeln!(
@@ -296,6 +303,21 @@ pub async fn run_ghci(
                 "DEBUG-MEM {iteration}/{reloads}: process-tree RSS {} ({bytes} bytes)",
                 format_bytes(bytes)
             )?;
+            // Match the watchdog's scope and charge swapped pages too. With zram,
+            // RSS alone can fall even as the session's retained address space grows.
+            if usage.interactive_ghc.is_some() {
+                writeln!(
+                    stdout,
+                    "DEBUG-MEM {iteration}/{reloads}: REPL RSS {} ({} bytes), LazyFree {} ({} bytes), swap {} ({} bytes), charged {} ({} bytes; RSS - LazyFree + swap)\n{}",
+                    format_bytes(usage.bytes), usage.bytes,
+                    format_bytes(usage.lazy_free_bytes), usage.lazy_free_bytes,
+                    format_bytes(usage.swap_bytes), usage.swap_bytes,
+                    format_bytes(usage.charged_bytes()), usage.charged_bytes(),
+                    usage.details(),
+                )?;
+            } else {
+                writeln!(stdout, "DEBUG-MEM {iteration}/{reloads}: REPL RAM+swap unavailable (persistent GHC/Cabal pair not found)")?;
+            }
             stdout.flush()?;
         }
         handle.request_shutdown()?;
