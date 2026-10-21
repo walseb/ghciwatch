@@ -2,7 +2,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use eyre::Context;
@@ -213,37 +213,66 @@ fn is_reload_command(command: &str) -> bool {
     matches!(command.trim(), ":r" | ":reload")
 }
 
+// A launch timeout can be a GHCi command, stdout framing, or stderr barrier stall.
+// Retain the exact phase without changing deadlines or assuming work has started.
+#[derive(Clone, Copy, Debug)]
+enum EvalPhase {
+    ClearStderr,
+    WriteInput(usize),
+    ReadInputPrompt(usize),
+    RegisterStderrMarker,
+    WriteStderrMarker,
+    ReadStderrPrompt,
+    ReadStderrMarker,
+}
+
+impl std::fmt::Display for EvalPhase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::WriteInput(line) => write!(f, "writing input line {line}"),
+            Self::ReadInputPrompt(line) => {
+                write!(f, "waiting for input line {line}'s stdout prompt")
+            }
+            phase => write!(f, "{phase:?}"),
+        }
+    }
+}
+
 async fn eval_socket_command(ghci: &mut Ghci, command: &str) -> eyre::Result<String> {
     let command = command.trim_end();
     eyre::ensure!(!command.is_empty(), "Eval socket command is empty");
 
     // Time the complete pipe protocol, not only the main stdout read. A wedged
     // stderr clear/barrier is just as capable of blocking reloads indefinitely.
-    let mut evaluation = Box::pin(eval_socket_command_inner(ghci, command));
+    let progress = StdMutex::new(EvalPhase::ClearStderr);
+    let mut evaluation = Box::pin(eval_socket_command_inner(ghci, command, &progress));
     match tokio::time::timeout(EVAL_WARNING_AFTER, &mut evaluation).await {
         Ok(result) => result,
         Err(_) => {
             tracing::error!(
+                phase = %*progress.lock().expect("eval progress mutex poisoned"),
                 "Ghciwatch executable eval error: Command \"{command}\" has taken more than 30 seconds! Waiting 30 more then I will attempt to interrupt it."
             );
             match tokio::time::timeout(EVAL_TIMEOUT_AFTER_WARNING, &mut evaluation).await {
                 Ok(result) => result,
                 Err(_) => {
                     tracing::error!(
+                        phase = %*progress.lock().expect("eval progress mutex poisoned"),
                         "Ghciwatch executable eval error: Command \"{command}\" has taken more than 60 seconds! Killing eval."
                     );
                     // Cancel every pending pipe/channel operation first. In particular,
                     // this closes the stderr marker response channel so that its task
                     // stops waiting for a marker which may never be emitted.
                     drop(evaluation);
+                    let phase = *progress.lock().expect("eval progress mutex poisoned");
                     ghci.send_sigint()
                         .await
-                        .wrap_err("Failed to restore GHCi after timed-out executable eval")?;
+                        .wrap_err_with(|| format!("Failed to restore GHCi after timed-out executable eval (protocol phase: {phase})"))?;
                     tracing::info!(
                         "Ghciwatch executable eval: Successfully interrupted command \"{command}\" and restored the underlying ghciwatch GHCi session."
                     );
                     Err(eyre::eyre!(
-                        "Executable eval command timed out after 60 seconds: {command}"
+                        "Executable eval command timed out after 60 seconds (protocol phase: {phase}): {command}"
                     ))
                 }
             }
@@ -251,7 +280,11 @@ async fn eval_socket_command(ghci: &mut Ghci, command: &str) -> eyre::Result<Str
     }
 }
 
-async fn eval_socket_command_inner(ghci: &mut Ghci, command: &str) -> eyre::Result<String> {
+async fn eval_socket_command_inner(
+    ghci: &mut Ghci,
+    command: &str,
+    progress: &StdMutex<EvalPhase>,
+) -> eyre::Result<String> {
     // Synchronize the clear before writing: otherwise a fast syntax error could
     // be buffered and then erased by a delayed clear event.
     let (sender, receiver) = oneshot::channel();
@@ -266,11 +299,22 @@ async fn eval_socket_command_inner(ghci: &mut Ghci, command: &str) -> eyre::Resu
     // continuation early, leaving prompts buffered and desynchronizing every later
     // operation on this GHCi session.
     let mut output = String::new();
-    for line in command.lines() {
+    let mut in_block = false;
+    for (index, line) in command.lines().enumerate() {
+        // Inside :{ ... :}, even :module-looking text is Haskell source. A stderr
+        // marker injected there becomes source too, so waiting for it would deadlock.
+        match line.trim() {
+            ":{" => in_block = true,
+            ":}" => in_block = false,
+            _ => {}
+        }
+        *progress.lock().expect("eval progress mutex poisoned") = EvalPhase::WriteInput(index + 1);
         ghci.stdin
             .stdin
             .write_all(format!("{line}\n").as_bytes())
             .await?;
+        *progress.lock().expect("eval progress mutex poisoned") =
+            EvalPhase::ReadInputPrompt(index + 1);
         output.push_str(
             &ghci
                 .stdout
@@ -287,8 +331,8 @@ async fn eval_socket_command_inner(ghci: &mut Ghci, command: &str) -> eyre::Resu
         // A failed `:module` means later imports and expressions can only add
         // misleading "not in scope" errors. Synchronize stderr now and stop the
         // request at the primary load failure instead.
-        if matches!(line.split_whitespace().next(), Some(":m" | ":module")) {
-            let stderr = stderr_through_marker(ghci).await?;
+        if !in_block && matches!(line.split_whitespace().next(), Some(":m" | ":module")) {
+            let stderr = stderr_through_marker(ghci, progress).await?;
             let mut log = CompilationLog::default();
             log.extend(parse_ghc_messages(&stderr)?);
             log.fill_empty_summary();
@@ -300,6 +344,7 @@ async fn eval_socket_command_inner(ghci: &mut Ghci, command: &str) -> eyre::Resu
 
             // The synchronized output has already been copied into the response.
             // Start a fresh stderr segment for the remaining request lines.
+            *progress.lock().expect("eval progress mutex poisoned") = EvalPhase::ClearStderr;
             let (sender, receiver) = oneshot::channel();
             ghci.stdout
                 .stderr_sender
@@ -309,12 +354,16 @@ async fn eval_socket_command_inner(ghci: &mut Ghci, command: &str) -> eyre::Resu
         }
     }
 
-    output.push_str(&stderr_through_marker(ghci).await?);
+    output.push_str(&stderr_through_marker(ghci, progress).await?);
     Ok(output)
 }
 
 /// Drain stderr through a marker emitted after all preceding GHCi work.
-async fn stderr_through_marker(ghci: &mut Ghci) -> eyre::Result<String> {
+async fn stderr_through_marker(
+    ghci: &mut Ghci,
+    progress: &StdMutex<EvalPhase>,
+) -> eyre::Result<String> {
+    *progress.lock().expect("eval progress mutex poisoned") = EvalPhase::RegisterStderrMarker;
     // stdout and stderr are independent pipes. Seeing the prompt on stdout does
     // not prove that the stderr task has consumed the diagnostic yet.
     let nonce = EVAL_NONCE.fetch_add(1, Ordering::Relaxed);
@@ -332,6 +381,7 @@ async fn stderr_through_marker(ghci: &mut Ghci) -> eyre::Result<String> {
     // Do not emit the marker until the stderr task is definitely waiting for it.
     ready_receiver.await?;
 
+    *progress.lock().expect("eval progress mutex poisoned") = EvalPhase::WriteStderrMarker;
     ghci.stdin
         .stdin
         .write_all(format!(":! printf '%s\\n' '{marker}' >&2\n").as_bytes())
@@ -339,6 +389,7 @@ async fn stderr_through_marker(ghci: &mut Ghci) -> eyre::Result<String> {
     // Consume the marker command's stdout prompt as well as its stderr marker. The shell
     // command intentionally emits no stdout, so GHCi may print this prompt immediately after
     // the previously consumed prompt with no intervening newline.
+    *progress.lock().expect("eval progress mutex poisoned") = EvalPhase::ReadStderrPrompt;
     let _ = ghci
         .stdout
         .reader
@@ -349,5 +400,6 @@ async fn stderr_through_marker(ghci: &mut Ghci) -> eyre::Result<String> {
             buffer: &mut ghci.stdout.buffer,
         })
         .await?;
+    *progress.lock().expect("eval progress mutex poisoned") = EvalPhase::ReadStderrMarker;
     Ok(receiver.await?)
 }

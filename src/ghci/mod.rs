@@ -2153,23 +2153,6 @@ impl Ghci {
                 "Memory diagnostic aborted: compilation failed; no memory sample recorded"
             );
         }
-<<<<<<< HEAD
-        if compilation_succeeded && run_post_actions {
-            // Run the eval commands, if any.
-            self.eval(log).await?;
-            // Run the user-provided test command, if any.
-            self.test(log).await?;
-            if self.opts.debug_mem.is_some() {
-                eyre::ensure!(!log.failed(),
-||||||| c59dfa4
-        if compilation_succeeded && run_post_actions {
-            // Run the eval commands, if any.
-            self.eval(log).await?;
-            // Run the user-provided test command, if any.
-            self.test(log).await?;
-            if self.opts.debug_mem.is_some() {
-                eyre::ensure!(!log.failed_for_memory_diagnostic(),
-=======
         if !operation_succeeded
             || !ghci_available
             || matches!(log.result(), Some(CompilationResult::Err))
@@ -2188,8 +2171,7 @@ impl Ghci {
                 self.pending_test_hook = false;
             }
             if self.opts.debug_mem.is_some() && run_post_actions {
-                eyre::ensure!(!log.failed_for_memory_diagnostic(),
->>>>>>> refs/remotes/origin/main
+                eyre::ensure!(!log.failed(),
                     "Memory diagnostic aborted: eval/test command failed; no memory sample recorded");
             }
         }
