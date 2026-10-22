@@ -145,8 +145,9 @@ pub struct Opts {
 
     /// Run a synchronous setup command before every GHCi launch, before before-startup hooks.
     ///
-    /// On failure, write its output to --error-file and wait for a watched file's contents
-    /// or existence to change before retrying. Touches and identical rewrites are ignored.
+    /// On failure, write its output to --error-file, run after-reload shell hooks, then wait
+    /// for a watched file's contents or existence to change before retrying.
+    /// GHCi hooks are skipped. Touches and identical rewrites are ignored.
     /// Commands run in order and stop at the first failure. Repeatable.
     /// Unlike lifecycle hooks, this does not support the async: prefix.
     #[arg(long, value_name = "SHELL_COMMAND")]

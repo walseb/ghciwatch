@@ -1,14 +1,19 @@
 //! Failure-gating shell commands, separate from advisory lifecycle hooks.
-use std::process::Stdio;
+use std::process::{ExitStatus, Stdio};
 
 use eyre::Context;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::task::JoinHandle;
 
 use super::{CompilationLog, ErrorLog, GhciOpts, GhciWriter};
 use crate::clonable_command::ClonableCommand;
+use crate::hooks::{LifecycleEvent, When};
 use crate::normal_path::NormalPath;
 
-pub(super) async fn run(opts: &GhciOpts) -> eyre::Result<()> {
+pub(super) async fn run(
+    opts: &GhciOpts,
+    command_handles: &mut Vec<JoinHandle<eyre::Result<ExitStatus>>>,
+) -> eyre::Result<()> {
     if opts.setup_shell.is_empty() {
         return Ok(());
     }
@@ -48,6 +53,12 @@ pub(super) async fn run(opts: &GhciOpts) -> eyre::Result<()> {
         let mut log = CompilationLog::default();
         log.mark_failed_with_diagnostic(&message);
         error_log.write(&log).await?;
+        // No GHCi exists yet, but external consumers still need the failed attempt's
+        // completion notification, with the diagnostic already available to read.
+        command_handles.retain(|handle| !handle.is_finished());
+        opts.hooks
+            .run_shell_hooks(LifecycleEvent::Reload(When::After), command_handles)
+            .await?;
         eyre::ensure!(
             opts.debug_mem.is_none(),
             "Memory diagnostic setup failed: {message}"

@@ -14,6 +14,10 @@ async fn setup_failure_gates_launch_and_retries_on_watched_update() {
             "sh -c 'echo attempt >> attempts; test -f src/ready.txt || { echo setup-stdout; echo setup-stderr >&2; exit 1; }'",
             "--setup-shell", "touch second-setup",
             "--before-startup-shell", "touch before-startup",
+            "--after-reload-shell",
+            "sh -c 'grep -q setup-stderr src/compile.txt && echo failure >> published'",
+            "--after-reload-ghci", ":! touch ghci-hook-ran",
+            "--after-startup-shell", "touch after-startup",
         ])
         .before_start(|path| async move {
             test_harness::Fs::new().write(path.join("src/setup-input.txt"), "unchanged").await
@@ -33,6 +37,12 @@ async fn setup_failure_gates_launch_and_retries_on_watched_update() {
     assert!(!session.path("launched").exists());
     assert!(!session.path("second-setup").exists());
     assert!(!session.path("before-startup").exists());
+    assert!(!session.path("after-startup").exists());
+    assert!(!session.path("ghci-hook-ran").exists());
+    assert_eq!(
+        session.fs().read(session.path("published")).await.unwrap(),
+        "failure\n"
+    );
 
     // Setup uses the same content-only rule, even for non-Haskell files.
     session
@@ -51,6 +61,10 @@ async fn setup_failure_gates_launch_and_retries_on_watched_update() {
     assert_eq!(
         session.fs().read(session.path("attempts")).await.unwrap(),
         "attempt\n"
+    );
+    assert_eq!(
+        session.fs().read(session.path("published")).await.unwrap(),
+        "failure\n"
     );
     session
         .fs()
@@ -91,6 +105,10 @@ async fn setup_failure_gates_launch_and_retries_on_watched_update() {
         .await
         .unwrap();
     assert!(!session.path("launched").exists());
+    assert_eq!(
+        session.fs().read(session.path("published")).await.unwrap(),
+        "failure\nfailure\n"
+    );
     session
         .fs()
         .write(session.path("src/ready.txt"), "ready again")
@@ -112,6 +130,12 @@ async fn setup_spawn_failure_is_written_to_error_file() {
             "./missing-setup-command",
             "--error-file",
             "compile.txt",
+            "--after-reload-shell",
+            "sh -c 'grep -q missing-setup-command compile.txt && touch published'",
+            "--after-reload-shell",
+            "async:touch async-published",
+            "--after-reload-ghci",
+            ":! touch ghci-hook-ran",
         ])
         .start()
         .await
@@ -126,5 +150,12 @@ async fn setup_spawn_failure_is_written_to_error_file() {
         .await
         .unwrap();
     assert!(errors.contains("missing-setup-command"));
+    assert!(session.path("published").exists());
+    session
+        .fs()
+        .wait_for_path(session.startup_timeout, &session.path("async-published"))
+        .await
+        .unwrap();
+    assert!(!session.path("ghci-hook-ran").exists());
     assert!(!session.path("launched").exists());
 }

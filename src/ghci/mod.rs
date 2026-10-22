@@ -472,11 +472,11 @@ impl Ghci {
         opts: GhciOpts,
         exited_sender: mpsc::Sender<ExitStatus>,
     ) -> eyre::Result<Self> {
+        let mut command_handles = Vec::new();
         tokio::select! {
             _ = shutdown.on_shutdown_requested() => eyre::bail!("Shutdown during setup"),
-            result = setup::run(&opts) => result?,
+            result = setup::run(&opts, &mut command_handles) => result?,
         }
-        let mut command_handles = Vec::new();
         {
             let span = tracing::debug_span!("before_startup_shell");
             let _enter = span.enter();
