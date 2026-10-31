@@ -46,6 +46,105 @@ async fn eval_socket_reload_uses_reload_lifecycle() {
     }
 }
 
+/// The launch reply must precede the worker's work, including with object code
+/// and GHCi's sandbox disabled, as in the native Root launcher.
+#[test]
+async fn socket_launch_returns_before_background_work() {
+    let mut session = GhciWatchBuilder::new("tests/data/simple")
+        .with_repl_command("ghci -ignore-dot-ghci -fno-ghci-sandbox -fobject-code -O1 src/MyLib.hs")
+        .start()
+        .await
+        .expect("ghciwatch starts");
+    session
+        .wait_until_ready()
+        .await
+        .expect("GHCi becomes ready");
+    let path = session.path("ghciwatch-eval.sock");
+    let launched = socket_command(
+        &path,
+        indoc! {r#"
+        :m + Control.Monad
+        import qualified Control.Concurrent
+        :{
+        void $ Control.Concurrent.forkIO $ do
+          Control.Concurrent.threadDelay 10000000
+        :}
+    "#},
+    )
+    .await;
+    assert_eq!(launched, "⋳");
+    assert_eq!(
+        socket_command(&path, "print (42 :: Int)").await.trim(),
+        "42"
+    );
+    let failed = socket_command(
+        &path,
+        ":m Missing.Socket.Module\nerror \"must not execute\"",
+    )
+    .await;
+    assert!(failed.contains("Missing.Socket.Module"), "{failed}");
+    assert!(!failed.contains("must not execute"), "{failed}");
+    assert_eq!(
+        socket_command(&path, "print (43 :: Int)").await.trim(),
+        "43"
+    );
+}
+
+#[test]
+async fn socket_block_text_is_not_a_ghci_command() {
+    let mut session = GhciWatchBuilder::new("tests/data/simple")
+        .with_repl_command("ghci -ignore-dot-ghci -fno-ghci-sandbox -fobject-code -O1 src/MyLib.hs")
+        .start()
+        .await
+        .expect("ghciwatch starts");
+    session
+        .wait_until_ready()
+        .await
+        .expect("GHCi becomes ready");
+    let path = session.path("ghciwatch-eval.sock");
+    let output = socket_command(
+        &path,
+        indoc! {r#"
+        :m + Prelude
+        :{
+        {-
+        :m This.Is.A.Comment
+        :module This.Is.Also.A.Comment
+        -}
+        print (44 :: Int)
+        :}
+        :m + Control.Monad
+        print (45 :: Int)
+    "#},
+    )
+    .await;
+    assert_eq!(output.trim(), "44\n45");
+    assert_eq!(
+        socket_command(&path, "print (46 :: Int)").await.trim(),
+        "46"
+    );
+}
+
+async fn socket_command(path: &std::path::Path, command: &str) -> String {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let mut socket = UnixStream::connect(path)
+            .await
+            .expect("connects to eval socket");
+        socket
+            .write_all(format!("{command}⋳").as_bytes())
+            .await
+            .expect("writes eval request");
+        let mut response = String::new();
+        socket
+            .read_to_string(&mut response)
+            .await
+            .expect("reads eval response");
+        response
+    })
+    .await
+    .expect("socket command responds within the fixture deadline")
+}
+
 /// Test that `ghciwatch` can eval commands and invalidate its cache of eval commands.
 #[test]
 async fn can_eval_commands() {
