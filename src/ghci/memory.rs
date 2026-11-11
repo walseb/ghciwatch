@@ -18,7 +18,7 @@ use std::fs;
 use std::io;
 
 pub(super) const MEMORY_WATCHDOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
-pub(super) const GHCI_MEMORY_LIMIT_BYTES: u64 = 40 * 1024 * 1024 * 1024;
+pub(super) const GHCI_MEMORY_LIMIT_BYTES: u64 = 60 * 1024 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 struct Process {
@@ -354,7 +354,7 @@ mod tests {
         usage.swap_bytes += gib;
         assert_eq!(usage.charged_bytes(), charged);
         usage.bytes = 20 * gib;
-        usage.swap_bytes = 25 * gib;
+        usage.swap_bytes = GHCI_MEMORY_LIMIT_BYTES - 15 * gib;
         usage.lazy_free_bytes = 5 * gib;
         assert_eq!(usage.charged_bytes(), GHCI_MEMORY_LIMIT_BYTES);
         usage.swap_bytes -= 1;
